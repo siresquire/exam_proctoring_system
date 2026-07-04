@@ -108,9 +108,16 @@ begin
     end if;
   end if;
 
-  -- super_admin is universal: any column except role (guarded above) may
-  -- be updated on any row. Everyone else falls through to the
-  -- column-level checks below.
+  -- created_at is registry metadata: once profile rows become evidence
+  -- (audit trails, enrollment disputes), backdating must be impossible for
+  -- everyone — including super_admin.
+  if new.created_at is distinct from old.created_at then
+    raise exception 'created_at cannot be changed';
+  end if;
+
+  -- super_admin is universal: any column except role and created_at
+  -- (guarded above) may be updated on any row. Everyone else falls through
+  -- to the column-level checks below.
   if public.current_user_role() = 'super_admin' then
     return new;
   end if;

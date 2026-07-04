@@ -82,9 +82,15 @@ end;
 $$;
 
 comment on function public.log_audit(text, text, text, jsonb) is
-  'Append-only write path for audit_log. actor_id is always auth.uid(), never client-supplied.';
+  'Append-only write path for audit_log. actor_id is always auth.uid(), never client-supplied. Not callable by clients — only from other security-definer functions or the service role, so a client cannot inject forged entries (e.g. a fake set_user_role action) into the integrity record.';
 
-grant execute on function public.log_audit(text, text, text, jsonb) to authenticated;
+-- Clients must NOT be able to call this directly: otherwise any student
+-- could pollute the audit trail with forged action strings/metadata via a
+-- bare RPC call. Definer functions (e.g. set_user_role) still work — they
+-- execute as the function owner, which retains EXECUTE — and trusted
+-- server-side code uses the service role.
+revoke execute on function public.log_audit(text, text, text, jsonb) from public, anon, authenticated;
+grant execute on function public.log_audit(text, text, text, jsonb) to service_role;
 
 -- set_user_role is defined in 20260704000005_rls_policies.sql, once the
 -- profiles_guard_update trigger it needs to cooperate with exists — see
