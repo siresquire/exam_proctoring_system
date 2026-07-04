@@ -179,9 +179,11 @@ timeline with clickable flag markers → per-flag reviewer verdict → session v
 | Create/schedule exams | ✔ | ✔ | ✔ (own classes) | — |
 | Monitor live sessions / review flags | ✔ | ✔ | ✔ (own exams) | — |
 | Grade & override | ✔ | ✔ | ✔ (own) | — |
-| Take exams / view own results / appeal | — | — | — | ✔ |
+| Take exams / view own results / appeal | ✔ | — | — | ✔ |
 
-Modeled on Moodle's capability system. **Append-only audit log** (actor, action,
+**Super admin is universal by design (user decision, 2026-07-04): it passes every
+permission check in the system — anything an admin, lecturer, or student can do,
+super admin can do.** Modeled on Moodle's capability system. **Append-only audit log** (actor, action,
 target, timestamp, IP) on every grade change, role change, exam edit, and review
 verdict is a hard requirement for defensible integrity decisions.
 

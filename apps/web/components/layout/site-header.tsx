@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import { ThemeToggle } from "@/components/layout/theme-toggle";
+import { UserMenu } from "@/components/layout/user-menu";
 
 const NAV_LINKS = [
   { href: "/", label: "Home" },
@@ -29,7 +30,11 @@ export function SiteHeader() {
             </Link>
           ))}
         </nav>
-        <ThemeToggle />
+        <div className="flex items-center gap-2">
+          {/* Hidden when signed out (UserMenu renders null). */}
+          <UserMenu />
+          <ThemeToggle />
+        </div>
       </div>
     </header>
   );

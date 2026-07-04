@@ -1,0 +1,44 @@
+import { NextResponse, type NextRequest } from "next/server";
+import type { EmailOtpType } from "@supabase/supabase-js";
+
+import { createClient } from "@/lib/supabase/server";
+
+/**
+ * Auth callback for magic links and email confirmations.
+ *
+ * Handles both link styles Supabase sends:
+ * - PKCE flow: `?code=...` -> exchangeCodeForSession
+ * - Email OTP flow: `?token_hash=...&type=magiclink|signup|...` -> verifyOtp
+ *
+ * On success, sends the user to `next` (default /dashboard, which routes
+ * them to their role's dashboard). On failure, back to /login with an
+ * error code the login page surfaces via notify.error.
+ */
+export async function GET(request: NextRequest) {
+  const { searchParams, origin } = new URL(request.url);
+  const code = searchParams.get("code");
+  const tokenHash = searchParams.get("token_hash");
+  const type = searchParams.get("type") as EmailOtpType | null;
+  const rawNext = searchParams.get("next") ?? "/dashboard";
+  // Only allow same-origin relative redirects — never a foreign URL.
+  const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/dashboard";
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return NextResponse.redirect(`${origin}/login?error=not_configured`);
+  }
+
+  if (code) {
+    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    if (!error) {
+      return NextResponse.redirect(`${origin}${next}`);
+    }
+  } else if (tokenHash && type) {
+    const { error } = await supabase.auth.verifyOtp({ token_hash: tokenHash, type });
+    if (!error) {
+      return NextResponse.redirect(`${origin}${next}`);
+    }
+  }
+
+  return NextResponse.redirect(`${origin}/login?error=auth_callback`);
+}

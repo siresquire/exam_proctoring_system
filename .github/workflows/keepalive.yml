@@ -2,7 +2,12 @@ name: Keepalive
 
 # Supabase free-tier projects pause after 7 days of inactivity. Ping every 3
 # days to stay well inside that window, and again to pre-warm before exam
-# windows (Phase 6). Part 2 (Supabase layer) wires the real ping in.
+# windows (Phase 6).
+#
+# Requires two repository secrets (Settings -> Secrets and variables ->
+# Actions), from the Supabase dashboard's Project Settings -> API:
+#   SUPABASE_URL       e.g. https://abcdefgh.supabase.co
+#   SUPABASE_ANON_KEY  the anon (public) API key
 on:
   schedule:
     - cron: "0 6 */3 * *"
@@ -12,6 +17,28 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Supabase
+      - name: Ping Supabase (keepalive table)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
-          echo "TODO: ping Supabase"
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::error::SUPABASE_URL and/or SUPABASE_ANON_KEY repo secrets are not set."
+            exit 1
+          fi
+
+          # SELECT on the keepalive table is allowed for the anon role by
+          # RLS (supabase/migrations). Fail loudly on anything but 200 so a
+          # paused/broken project shows up as a red workflow run.
+          status=$(curl -s -o /tmp/keepalive-body -w "%{http_code}" \
+            "$SUPABASE_URL/rest/v1/keepalive?select=id" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY")
+
+          echo "HTTP $status"
+          cat /tmp/keepalive-body
+
+          if [ "$status" -ne 200 ]; then
+            echo "::error::Supabase keepalive ping failed with HTTP $status."
+            exit 1
+          fi
