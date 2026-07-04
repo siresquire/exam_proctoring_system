@@ -119,6 +119,110 @@ supabase gen types typescript --linked > apps/web/lib/supabase/types.ts
 pnpm dev          # starts apps/web on http://localhost:3000
 ```
 
+## Local development & testing
+
+Everything below runs against a local Supabase stack in Docker — no cloud
+project, no network calls out. This is the recommended way to develop and
+test Phase 0+ before anything touches a hosted project.
+
+### Prerequisites
+
+- Docker Desktop running (`docker info` should succeed)
+- Supabase CLI (`supabase --version`)
+
+### Start / stop the stack
+
+```bash
+supabase start    # first run pulls images, can take 5-15 min
+supabase status    # prints URLs + keys again later
+supabase stop      # stop containers (add --no-backup to also drop volumes)
+```
+
+`supabase start` applies every migration in `supabase/migrations/` and then
+`supabase/seed.sql` automatically. Key local endpoints (from `supabase
+status`):
+
+| Service | URL |
+|---|---|
+| API (`NEXT_PUBLIC_SUPABASE_URL`) | http://127.0.0.1:54321 |
+| Studio (browse/edit data) | http://127.0.0.1:54323 |
+| Postgres | postgresql://postgres:postgres@127.0.0.1:54322/postgres |
+| Mailpit (magic-link emails) | http://127.0.0.1:54324 |
+
+The anon key and service_role key change per machine/checkout — copy them
+from `supabase status -o env` into `apps/web/.env.local` (see
+`apps/web/.env.example`; `.env.local` is gitignored, never commit it).
+
+For a completely clean slate (drops and recreates the local DB, reapplies
+every migration + `seed.sql`):
+
+```bash
+supabase db reset
+```
+
+### Test users
+
+Bootstrapped once via the Auth admin API (`POST /auth/v1/admin/users` with
+`email_confirm: true`) and then promoted with direct SQL as `postgres` inside
+a transaction that sets `usted.allow_role_change = 'on'` (the same escape
+hatch `supabase/seed.sql` uses to bootstrap the first super_admin — see the
+comment in that file). All other role changes go through the `set_user_role`
+RPC.
+
+| Email | Password | Role |
+|---|---|---|
+| `superadmin@usted.test` | `Usted!Test2026` | `super_admin` |
+| `admin@usted.test` | `Usted!Test2026` | `admin` |
+| `lecturer@usted.test` | `Usted!Test2026` | `lecturer` |
+| `student@usted.test` | `Usted!Test2026` | `student` |
+
+Recreate them any time with:
+
+```bash
+# (from repo root, stack running)
+curl -s -X POST http://127.0.0.1:54321/auth/v1/admin/users \
+  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"student@usted.test","password":"Usted!Test2026","email_confirm":true,"user_metadata":{"full_name":"Student Test"}}'
+```
+
+(`handle_new_user` auto-creates the `profiles` row on signup with the
+default `student` role and the `full_name` from metadata; promote the other
+three with the GUC-guarded SQL above, or with `set_user_role` once you have
+one authenticated super_admin/admin session.)
+
+### RLS / security smoke test
+
+`scripts/rls-smoke-test.mjs` signs in as each of the four test users against
+the **local** stack and asserts what RLS policies, guard triggers, and RPCs
+should allow or reject — profile visibility, column-level update
+restrictions, `log_audit`/`set_user_role` permission checks, admin/
+super_admin escalation rules, audit log immutability, and anon access. It
+prints PASS/FAIL per check, restores any role changes it makes so it's safe
+to re-run, and exits non-zero if anything fails.
+
+```bash
+node scripts/rls-smoke-test.mjs
+```
+
+It reads Supabase URL/keys from `apps/web/.env.local` automatically (or from
+the environment if you prefer — `NEXT_PUBLIC_SUPABASE_URL`,
+`NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`). It refuses to
+run against a non-`127.0.0.1`/`localhost` URL as a guardrail against
+accidentally pointing it at a hosted project.
+
+### App smoke test
+
+```bash
+pnpm dev   # from repo root, or `cd apps/web && pnpm dev`
+```
+
+Then confirm: `/` and `/login` return 200; `/dashboard` redirects
+(307) to `/login` when signed out. Full sign-in flows are easiest to verify
+by hand in the browser with the test users above — open
+http://localhost:3000/login, sign in, and confirm you land on the
+role-appropriate `/dashboard/*` screen.
+
 ## Verification
 
 ```bash

@@ -1,0 +1,543 @@
+#!/usr/bin/env node
+// Phase 0.3: repeatable RLS / security smoke test against a LOCAL Supabase
+// stack (never point this at a hosted project — it creates role churn and
+// prints service-role-derived state).
+//
+// What it does: signs in as each of the four seeded test users
+// (scripts/rls-smoke-test.mjs expects them to already exist — see
+// README.md "Local development & testing") and asserts, from the client's
+// point of view, exactly what RLS/triggers/RPCs should allow or reject.
+// Prints PASS/FAIL per check and exits non-zero if anything fails.
+//
+// Env vars (read from apps/web/.env.local if present, overridable):
+//   NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
+//   SUPABASE_SERVICE_ROLE_KEY
+//
+// Usage: node scripts/rls-smoke-test.mjs
+
+import { readFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { createClient } from "@supabase/supabase-js";
+
+// --- env loading -----------------------------------------------------------
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const envLocalPath = path.resolve(__dirname, "..", "apps", "web", ".env.local");
+
+function loadEnvLocal(filePath) {
+  if (!existsSync(filePath)) return;
+  const content = readFileSync(filePath, "utf8");
+  for (const rawLine of content.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1).trim();
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+loadEnvLocal(envLocalPath);
+
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !ANON_KEY || !SERVICE_ROLE_KEY) {
+  console.error(
+    "Missing env. Need NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY " +
+      `(checked ${envLocalPath} and process env).`,
+  );
+  process.exit(1);
+}
+
+if (!/^https?:\/\/(127\.0\.0\.1|localhost)/.test(SUPABASE_URL)) {
+  console.error(
+    `Refusing to run: NEXT_PUBLIC_SUPABASE_URL (${SUPABASE_URL}) is not a local address. ` +
+      "This script mutates roles and reads service-role data — local only.",
+  );
+  process.exit(1);
+}
+
+const PASSWORD = "Usted!Test2026";
+const USERS = {
+  super_admin: "superadmin@usted.test",
+  admin: "admin@usted.test",
+  lecturer: "lecturer@usted.test",
+  student: "student@usted.test",
+};
+
+// --- test harness ------------------------------------------------------
+
+const results = [];
+
+function record(name, pass, detail) {
+  results.push({ name, pass, detail });
+  const tag = pass ? "PASS" : "FAIL";
+  const line = `[${tag}] ${name}`;
+  console.log(detail ? `${line} — ${detail}` : line);
+}
+
+/** True when a PostgREST/RPC error looks like an RLS/permission rejection. */
+function isDenied(error) {
+  if (!error) return false;
+  const msg = `${error.message ?? ""} ${error.details ?? ""} ${error.hint ?? ""}`.toLowerCase();
+  return (
+    error.code === "42501" || // insufficient_privilege
+    error.code === "PGRST301" ||
+    msg.includes("permission denied") ||
+    msg.includes("row-level security") ||
+    msg.includes("row level security") ||
+    msg.includes("policy") ||
+    msg.includes("may only be changed") ||
+    msg.includes("cannot be changed") ||
+    msg.includes("only be changed via") ||
+    msg.includes("can only be changed by") ||
+    msg.includes("only super_admin") ||
+    msg.includes("admin may only") ||
+    msg.includes("may not change your own role") ||
+    msg.includes("only admin or super_admin") ||
+    msg.includes("is append-only") ||
+    msg.includes("no function matches") // revoked execute -> not found for role
+  );
+}
+
+async function signIn(email) {
+  const client = createClient(SUPABASE_URL, ANON_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+  const { data, error } = await client.auth.signInWithPassword({ email, password: PASSWORD });
+  if (error) throw new Error(`sign-in failed for ${email}: ${error.message}`);
+  return { client, userId: data.user.id };
+}
+
+const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+  auth: { autoRefreshToken: false, persistSession: false },
+});
+
+async function getProfileRole(userId) {
+  const { data, error } = await admin.from("profiles").select("role").eq("id", userId).single();
+  if (error) throw error;
+  return data.role;
+}
+
+// --- main ----------------------------------------------------------------
+
+async function main() {
+  console.log(`Target: ${SUPABASE_URL}\n`);
+
+  const sessions = {};
+  for (const [role, email] of Object.entries(USERS)) {
+    sessions[role] = await signIn(email);
+  }
+
+  const studentId = sessions.student.userId;
+  const lecturerId = sessions.lecturer.userId;
+  const adminId = sessions.admin.userId;
+  const superAdminId = sessions.super_admin.userId;
+
+  // Snapshot roles up front so we can restore at the end regardless of
+  // what the test body does to them.
+  const originalRoles = {
+    student: await getProfileRole(studentId),
+    lecturer: await getProfileRole(lecturerId),
+    admin: await getProfileRole(adminId),
+    super_admin: await getProfileRole(superAdminId),
+  };
+
+  // === (a) student: own profile visible, others not ========================
+  {
+    const { client } = sessions.student;
+    const { data, error } = await client.from("profiles").select("*").eq("id", studentId);
+    record(
+      "a1. student SELECT own profile returns 1 row",
+      !error && data?.length === 1,
+      error?.message ?? `rows=${data?.length}`,
+    );
+
+    const { data: allRows, error: allErr } = await client.from("profiles").select("*");
+    record(
+      "a2. student SELECT profiles (no filter) returns only own row",
+      !allErr && allRows?.length === 1 && allRows[0].id === studentId,
+      allErr?.message ?? `rows=${allRows?.length}`,
+    );
+
+    const { data: otherRows, error: otherErr } = await client
+      .from("profiles")
+      .select("*")
+      .eq("id", lecturerId);
+    record(
+      "a3. student SELECT another user's profile returns 0 rows",
+      !otherErr && otherRows?.length === 0,
+      otherErr?.message ?? `rows=${otherRows?.length}`,
+    );
+  }
+
+  // === (b) student self-update column restrictions =========================
+  {
+    const { client } = sessions.student;
+
+    const { error: nameErr } = await client
+      .from("profiles")
+      .update({ full_name: "Student Test (Updated)" })
+      .eq("id", studentId);
+    record("b1. student UPDATE own full_name succeeds", !nameErr, nameErr?.message);
+    // revert immediately
+    await client.from("profiles").update({ full_name: "Student Test" }).eq("id", studentId);
+
+    const { error: roleErr } = await client
+      .from("profiles")
+      .update({ role: "admin" })
+      .eq("id", studentId);
+    record(
+      "b2. student UPDATE own role FAILS",
+      isDenied(roleErr),
+      roleErr?.message ?? "no error raised",
+    );
+
+    const { error: snErr } = await client
+      .from("profiles")
+      .update({ student_number: "S9999999" })
+      .eq("id", studentId);
+    record(
+      "b3. student UPDATE own student_number FAILS",
+      isDenied(snErr),
+      snErr?.message ?? "no error raised",
+    );
+
+    const { error: accErr } = await client
+      .from("profiles")
+      .update({ accommodations: { notes: "self-granted" } })
+      .eq("id", studentId);
+    record(
+      "b4. student UPDATE own accommodations FAILS",
+      isDenied(accErr),
+      accErr?.message ?? "no error raised",
+    );
+
+    const { error: caErr } = await client
+      .from("profiles")
+      .update({ created_at: "2000-01-01T00:00:00Z" })
+      .eq("id", studentId);
+    record(
+      "b5. student UPDATE own created_at FAILS",
+      isDenied(caErr),
+      caErr?.message ?? "no error raised",
+    );
+  }
+
+  // === (c) student cannot call log_audit ====================================
+  {
+    const { client } = sessions.student;
+    const { error } = await client.rpc("log_audit", {
+      action: "forged_action",
+      target_type: "profile",
+      target_id: studentId,
+      metadata: {},
+    });
+    record(
+      "c1. student rpc log_audit FAILS (permission denied)",
+      isDenied(error),
+      error?.message ?? "no error raised — SECURITY: forged audit entries are possible",
+    );
+  }
+
+  // === (d) student cannot call set_user_role ================================
+  {
+    const { client } = sessions.student;
+    const { error } = await client.rpc("set_user_role", {
+      target: lecturerId,
+      new_role: "admin",
+    });
+    record(
+      "d1. student rpc set_user_role FAILS",
+      isDenied(error),
+      error?.message ?? "no error raised",
+    );
+  }
+
+  // === (e) lecturer: same restrictions as student (own profile only) =======
+  {
+    const { client } = sessions.lecturer;
+
+    const { data: ownRows, error: ownErr } = await client.from("profiles").select("*");
+    record(
+      "e1. lecturer SELECT profiles returns only own row",
+      !ownErr && ownRows?.length === 1 && ownRows[0].id === lecturerId,
+      ownErr?.message ?? `rows=${ownRows?.length}`,
+    );
+
+    const { error: otherErr } = await client.from("profiles").select("*").eq("id", studentId);
+    const { data: otherData } = await client.from("profiles").select("*").eq("id", studentId);
+    record(
+      "e2. lecturer SELECT another user's profile returns 0 rows",
+      !otherErr && otherData?.length === 0,
+      otherErr?.message ?? `rows=${otherData?.length}`,
+    );
+
+    const { error: roleErr } = await client
+      .from("profiles")
+      .update({ role: "admin" })
+      .eq("id", lecturerId);
+    record(
+      "e3. lecturer UPDATE own role FAILS",
+      isDenied(roleErr),
+      roleErr?.message ?? "no error raised",
+    );
+
+    const { error: accErr } = await client
+      .from("profiles")
+      .update({ accommodations: { notes: "self-granted" } })
+      .eq("id", lecturerId);
+    record(
+      "e4. lecturer UPDATE own accommodations FAILS",
+      isDenied(accErr),
+      accErr?.message ?? "no error raised",
+    );
+
+    const { error: logErr } = await client.rpc("log_audit", { action: "forged" });
+    record(
+      "e5. lecturer rpc log_audit FAILS",
+      isDenied(logErr),
+      logErr?.message ?? "no error raised",
+    );
+
+    const { error: setRoleErr } = await client.rpc("set_user_role", {
+      target: studentId,
+      new_role: "lecturer",
+    });
+    record(
+      "e6. lecturer rpc set_user_role FAILS",
+      isDenied(setRoleErr),
+      setRoleErr?.message ?? "no error raised",
+    );
+  }
+
+  // === (f) admin ============================================================
+  {
+    const { client } = sessions.admin;
+
+    const { data: allRows, error: allErr } = await client.from("profiles").select("*");
+    record(
+      "f1. admin SELECT all profiles returns 4+ rows",
+      !allErr && allRows?.length >= 4,
+      allErr?.message ?? `rows=${allRows?.length}`,
+    );
+
+    const { error: accErr } = await client
+      .from("profiles")
+      .update({ accommodations: { extra_time_multiplier: 1.5, notes: "smoke test" } })
+      .eq("id", studentId);
+    record("f2. admin UPDATE another user's accommodations succeeds", !accErr, accErr?.message);
+    // revert
+    await admin.from("profiles").update({ accommodations: {} }).eq("id", studentId);
+
+    const { error: fullNameErr } = await client
+      .from("profiles")
+      .update({ full_name: "Hijacked Name" })
+      .eq("id", studentId);
+    record(
+      "f3. admin UPDATE another user's full_name FAILS",
+      isDenied(fullNameErr),
+      fullNameErr?.message ?? "no error raised",
+    );
+
+    const { error: promoteErr } = await client.rpc("set_user_role", {
+      target: studentId,
+      new_role: "lecturer",
+    });
+    record(
+      "f4. admin set_user_role(student -> lecturer) succeeds",
+      !promoteErr,
+      promoteErr?.message,
+    );
+    // revert student back to student for idempotency, using admin RPC (admin can set lecturer/student)
+    const { error: revertErr } = await client.rpc("set_user_role", {
+      target: studentId,
+      new_role: "student",
+    });
+    record(
+      "f4b. admin can revert set_user_role(lecturer -> student) [cleanup]",
+      !revertErr,
+      revertErr?.message,
+    );
+
+    const { error: escalateErr } = await client.rpc("set_user_role", {
+      target: studentId,
+      new_role: "admin",
+    });
+    record(
+      "f5. admin set_user_role(-> admin) FAILS (escalation blocked)",
+      isDenied(escalateErr),
+      escalateErr?.message ?? "no error raised — SECURITY: admin escalated a user to admin",
+    );
+
+    const { error: selfErr } = await client.rpc("set_user_role", {
+      target: adminId,
+      new_role: "lecturer",
+    });
+    record(
+      "f6. admin set_user_role on own account FAILS",
+      isDenied(selfErr),
+      selfErr?.message ?? "no error raised",
+    );
+  }
+
+  // === (g) super_admin =======================================================
+  {
+    const { client } = sessions.super_admin;
+
+    const { data: allRows, error: allErr } = await client.from("profiles").select("*");
+    record(
+      "g1. super_admin SELECT all profiles returns 4+ rows",
+      !allErr && allRows?.length >= 4,
+      allErr?.message ?? `rows=${allRows?.length}`,
+    );
+
+    const { error: promoteErr } = await client.rpc("set_user_role", {
+      target: lecturerId,
+      new_role: "admin",
+    });
+    record(
+      "g2. super_admin set_user_role(lecturer -> admin) succeeds",
+      !promoteErr,
+      promoteErr?.message,
+    );
+
+    const { data: auditRows, error: auditErr } = await client
+      .from("audit_log")
+      .select("*")
+      .eq("action", "set_user_role")
+      .eq("target_id", lecturerId)
+      .order("id", { ascending: false })
+      .limit(1);
+    const auditRow = auditRows?.[0];
+    const auditLooksRight =
+      !auditErr &&
+      auditRow &&
+      auditRow.actor_id === superAdminId &&
+      auditRow.action === "set_user_role" &&
+      auditRow.metadata?.new_role === "admin";
+    record(
+      "g3. audit_log SELECT shows the set_user_role entry with correct actor_id/action/metadata",
+      Boolean(auditLooksRight),
+      auditErr?.message ??
+        `actor_id=${auditRow?.actor_id} action=${auditRow?.action} metadata=${JSON.stringify(auditRow?.metadata)}`,
+    );
+
+    // revert lecturer back to lecturer
+    const { error: revertErr } = await client.rpc("set_user_role", {
+      target: lecturerId,
+      new_role: "lecturer",
+    });
+    record(
+      "g3b. super_admin can revert set_user_role(admin -> lecturer) [cleanup]",
+      !revertErr,
+      revertErr?.message,
+    );
+
+    if (auditRow) {
+      const { error: updErr } = await client
+        .from("audit_log")
+        .update({ action: "tampered" })
+        .eq("id", auditRow.id);
+      record(
+        "g4. audit_log UPDATE FAILS",
+        isDenied(updErr),
+        updErr?.message ?? "no error raised — SECURITY: audit log is mutable",
+      );
+
+      const { error: delErr } = await client.from("audit_log").delete().eq("id", auditRow.id);
+      record(
+        "g5. audit_log DELETE FAILS",
+        isDenied(delErr),
+        delErr?.message ?? "no error raised — SECURITY: audit log entries can be deleted",
+      );
+    } else {
+      record("g4. audit_log UPDATE FAILS", false, "skipped — no audit row found to test against");
+      record("g5. audit_log DELETE FAILS", false, "skipped — no audit row found to test against");
+    }
+  }
+
+  // === (h) anon client =======================================================
+  {
+    const anon = createClient(SUPABASE_URL, ANON_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: keepaliveRows, error: keepaliveErr } = await anon.from("keepalive").select("*");
+    record(
+      "h1. anon SELECT keepalive succeeds",
+      !keepaliveErr && (keepaliveRows?.length ?? 0) >= 1,
+      keepaliveErr?.message ?? `rows=${keepaliveRows?.length}`,
+    );
+
+    const { data: profileRows, error: profileErr } = await anon.from("profiles").select("*");
+    record(
+      "h2. anon SELECT profiles returns 0 rows or is denied",
+      Boolean(profileErr) || (profileRows?.length ?? 0) === 0,
+      profileErr ? profileErr.message : `rows=${profileRows?.length}`,
+    );
+  }
+
+  // === cleanup / idempotency: restore original roles ========================
+  // set_user_role needs auth.uid(), so cleanup must go through an
+  // authenticated session's RPC call, not the service role directly (the
+  // service role bypasses RLS policies but NOT the profiles_guard_update
+  // trigger, which gates on the transaction-local GUC that only
+  // set_user_role sets). super_admin's session can fix any non-self target,
+  // which covers every role this script ever touches (student, lecturer,
+  // admin-as-target). The test body already reverts student (f4b) and
+  // lecturer (g3b) — this is a defensive second pass in case an earlier
+  // assertion failed before its own revert ran.
+  console.log("\nRestoring original roles...");
+  const superAdminClient = sessions.super_admin.client;
+  for (const [role, email] of Object.entries(USERS)) {
+    const userId = sessions[role].userId;
+    const desiredRole = originalRoles[role];
+    const currentRole = await getProfileRole(userId);
+    if (currentRole !== desiredRole) {
+      if (userId === superAdminId) {
+        console.warn(
+          `  ${email} drifted to ${currentRole} (expected ${desiredRole}) but nobody may change their own role — fix manually via 'supabase db reset' or direct SQL.`,
+        );
+      } else {
+        const { error } = await superAdminClient.rpc("set_user_role", {
+          target: userId,
+          new_role: desiredRole,
+        });
+        if (error) {
+          console.warn(`  could not revert ${email} to ${desiredRole} via RPC: ${error.message}`);
+        }
+      }
+    }
+    const finalRole = await getProfileRole(userId);
+    console.log(`  ${email}: ${finalRole} (expected ${desiredRole})`);
+  }
+
+  // sign out all sessions
+  for (const { client } of Object.values(sessions)) {
+    await client.auth.signOut().catch(() => {});
+  }
+
+  // === summary ===============================================================
+  const failed = results.filter((r) => !r.pass);
+  console.log(
+    `\n${results.length} checks, ${results.length - failed.length} passed, ${failed.length} failed.`,
+  );
+  if (failed.length > 0) {
+    console.log("\nFAILED CHECKS:");
+    for (const f of failed) {
+      console.log(`  - ${f.name}${f.detail ? `: ${f.detail}` : ""}`);
+    }
+    process.exit(1);
+  }
+  console.log("All checks passed.");
+}
+
+main().catch((err) => {
+  console.error("\nSmoke test crashed:", err);
+  process.exit(1);
+});
