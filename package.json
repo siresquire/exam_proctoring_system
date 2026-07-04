@@ -1,0 +1,19 @@
+{
+  "name": "exam-proctoring-system",
+  "version": "0.0.1",
+  "private": true,
+  "description": "USTED exam proctoring & anti-cheat platform monorepo.",
+  "packageManager": "pnpm@11.10.0",
+  "scripts": {
+    "dev": "pnpm --filter web dev",
+    "build": "pnpm --filter web build",
+    "lint": "pnpm --filter web lint",
+    "typecheck": "pnpm -r typecheck",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "^3.4.2",
+    "prettier-plugin-tailwindcss": "^0.6.11"
+  }
+}

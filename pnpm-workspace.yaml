@@ -1,0 +1,14 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Explicitly allow install/postinstall scripts for these trusted deps
+# (Next.js image optimization + eslint native resolver). Required because
+# pnpm blocks arbitrary lifecycle scripts by default (supply-chain safety).
+allowBuilds:
+  sharp: true
+  unrs-resolver: true
+
+onlyBuiltDependencies:
+  - sharp
+  - unrs-resolver
