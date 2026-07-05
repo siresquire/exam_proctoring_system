@@ -102,6 +102,22 @@ client is never trusted): `super_admin`, `admin`, `lecturer`, `student`.
   role. All role changes go through the `set_user_role` RPC and land in the
   append-only `audit_log`.
 
+### Sign-in: email or index number (Phase 1.6)
+
+The password tab accepts **either** a university email **or** a 10-digit USTED
+index number (e.g. `5201040845`). Index resolution happens entirely
+server-side in the `signIn` server action (`apps/web/app/login/actions.ts`):
+if the identifier is 10 digits it is looked up via a **service-role** client
+(`apps/web/lib/supabase/admin.ts`, server-only — the key is never shipped to
+the browser and the index→email mapping is never exposed) and the resolved
+email is used for the real password sign-in. Every failure returns one generic
+"Invalid email/index number or password" so the form is not an
+account-enumeration oracle. This exists because student onboarding must not
+depend on email deliverability before a domain is purchased (see PLAN.md
+"Student onboarding without a domain"): admins hand out index + temp password;
+the magic-link tab remains but is labelled as needing a configured sending
+domain.
+
 ### Regenerating DB types
 
 `apps/web/lib/supabase/types.ts` is hand-written to match the migrations.
@@ -208,10 +224,14 @@ auto-termination (3 high-severity events → `terminated` + a
 `proctor_reports` row the owner and any lecturer can read but other
 students cannot), `start_proctor_session` refusing unattested sessions,
 `identity_mismatch` logging on a claimed/registry index-number mismatch,
-`attach_identity_portrait`'s one-shot + owner-only enforcement, and the
-`profiles.student_number` 10-digit `CHECK` constraint. It prints PASS/FAIL
-per check, restores any role changes it makes so it's safe to re-run, and
-exits non-zero if anything fails.
+`attach_identity_portrait`'s one-shot + owner-only enforcement, the
+`profiles.student_number` 10-digit `CHECK` constraint, and (Phase 1.7) the
+server-assigned-severity anti-tamper property (a client-claimed severity is
+overridden by the session's policy), custom-policy overrides (an event set to
+`counts: false` does not terminate), `violation_policy` validation, and
+`display_configuration_changed` counting by default. It prints PASS/FAIL per
+check (90 checks as of Phase 1.7), restores any role changes it makes so it's
+safe to re-run, and exits non-zero if anything fails.
 
 ```bash
 node scripts/rls-smoke-test.mjs
@@ -265,8 +285,10 @@ severity level.
 ### Violation threshold & auto-termination (Phase 1.5)
 
 Every `proctor_sessions` row carries a `violation_limit` (default 3) and a
-`violation_count`. The **server** — never the client — counts high-severity
-events inside the `log_proctor_events` RPC; once the count reaches the
+`violation_count`. The **server** — never the client — counts violations
+inside the `log_proctor_events` RPC (which events count, and their severity,
+comes from a per-session policy as of Phase 1.7 — see below); once the count
+reaches the
 limit, the RPC atomically terminates the session (`status = 'terminated'`),
 appends a `session_terminated` event, and files a `proctor_reports` row
 (`reason = 'violation_limit_reached'`, a summary of event counts by
@@ -381,6 +403,50 @@ aria-live status update, and the student stays on the retake step — glasses
 are never blocked (only advisory text), since eyewear detection isn't
 attempted.
 
+### Configurable violation policy, server-assigned severity & display detection (Phase 1.7)
+
+**Anti-tamper fix.** Before Phase 1.7 the client reported each event's
+severity, so a hacked client could label everything `info` and never
+accumulate a strike. Now severity **and** whether an event counts toward the
+limit are assigned **server-side** from a policy snapshot stored on the
+session (`proctor_sessions.violation_policy`, a jsonb map of
+`event_type -> { severity, counts }`). `log_proctor_events` reads that snapshot
+and ignores the client's claimed severity entirely — verified by the RLS smoke
+test (a client sending `severity: info` for a `tab_hidden` still gets stored
+`high` and still counts).
+
+- **Default policy** (`public.default_violation_policy()`, the single source of
+  truth): **every** violation-type signal counts toward the 3-strike
+  termination by default (user directive — students stay on screen and answer);
+  only benign lifecycle/observation events (heartbeat, snapshots, tab_visible,
+  focus regained, `multi_monitor_detected` start-of-session observation, …) are
+  exempt. `connection_lost` counts by default, but the policy editor carries a
+  fairness note recommending lecturers exempt it for low-bandwidth/mobile
+  cohorts (it collides with autosave/resume otherwise).
+- **Configurable** by lecturer/admin/super_admin: `start_proctor_session` takes
+  an optional `violation_policy` of partial overrides, strictly validated
+  (unknown event types, bad severity values, non-boolean `counts` all raise)
+  and merged over the default. The demo exposes this as a
+  `ViolationPolicyEditor` step (`apps/web/components/proctor/violation-policy-editor.tsx`);
+  Phase 3/4 will set it per exam and have server code pass it in when a student
+  begins their attempt (the signature already supports that call shape).
+- **Display-change detection**: `display_configuration_changed` fires when a
+  monitor is plugged in / unplugged / the layout changes mid-session — detected
+  via `screen.addEventListener('change')`, an opportunistic
+  `getScreenDetails().screenschange` listener (only if the `window-management`
+  permission is already granted — never prompts), and a permission-free ~10s
+  poll of `isExtended`/geometry, de-duped so it emits once per change.
+  `multi_monitor_detected` remains the one-shot start-of-session observation.
+
+**Honest limits (documented, not hidden).** A browser cannot see everything:
+- **Mirrored splitters / capture cards** are invisible — the OS reports a
+  single display, so no web API can detect them.
+- **Remote-control software** (TeamViewer, AnyDesk, …) cannot be enumerated by
+  a browser at all.
+These are exactly what **Tier 4 + Safe Exam Browser** (Phase 6) exists for;
+in-browser we catch only their side effects (focus flapping, display changes),
+and the webcam/face layer covers the rest.
+
 ## Design system review
 
 Run the dev server and open `/design` — it exercises every notification
@@ -407,8 +473,9 @@ issue.)
   only via the `log_audit()` SQL function. `proctor_events`, `proctor_media`,
   and `proctor_reports` follow the same append-only posture (revoked direct
   DML + a trigger that rejects UPDATE/DELETE outright).
-- Cloudflare R2 (proctoring media) is wired up in Phase 1 — the `R2_*` env
-  vars in `.env.example` are placeholders until then.
+- Cloudflare R2 (proctoring media) replaces local Supabase Storage at deploy
+  time via the storage adapter seam — the `R2_*` env vars in `.env.example`
+  are placeholders until then; local/dev uses the Supabase `proctoring` bucket.
 - `packages/proctor-core` must stay framework-agnostic: no React, no
   `@supabase/*` import anywhere in that package. New signals/adapters go
   through the existing `ProctorTransportAdapter`/`ProctorStorageAdapter`
