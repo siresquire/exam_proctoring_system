@@ -14,8 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { createClient } from "@/lib/supabase/client";
-import type { Profile, UserRole } from "@/lib/supabase/types";
+import type { UserRole } from "@/lib/supabase/types";
 
 const ROLE_LABELS: Record<UserRole, string> = {
   super_admin: "Super Admin",
@@ -24,58 +23,33 @@ const ROLE_LABELS: Record<UserRole, string> = {
   student: "Student",
 };
 
+export interface UserMenuProps {
+  role: UserRole;
+  fullName: string | null;
+  email: string | null;
+}
+
 /**
  * Signed-in user affordance in the site header: name, role badge, and
  * sign-out (server action). Renders nothing when signed out or when
  * Supabase isn't configured, so the header stays clean on public pages.
+ *
+ * Takes the session as props from the server (`SiteHeader`, via
+ * `getSessionProfile`) instead of fetching it itself. A prior version called
+ * `supabase.auth.getUser()` from a browser-side `useEffect`, which spun up a
+ * SECOND, independent GoTrue client next to the one the SSR middleware
+ * (`lib/supabase/middleware.ts`) already runs on every request. When the
+ * access token expired, both clients raced to redeem the same refresh token;
+ * the loser got `Invalid Refresh Token: Already Used` from GoTrue's
+ * reuse-detection, cleared its local session, and the next navigation's
+ * `requireRole` server-side check saw a dead cookie and bounced to /login —
+ * i.e. "logged out on refresh" even though the session was perfectly valid
+ * seconds earlier. Server-only session resolution removes the race.
  */
-export function UserMenu() {
-  const [profile, setProfile] = React.useState<Profile | null>(null);
-  const [email, setEmail] = React.useState<string | null>(null);
+export function UserMenu({ role, fullName, email }: UserMenuProps) {
   const [signingOut, setSigningOut] = React.useState(false);
 
-  React.useEffect(() => {
-    const supabase = createClient();
-    if (!supabase) return;
-    // Non-null binding so the nested async closure keeps the narrowing.
-    const client = supabase;
-
-    let cancelled = false;
-
-    async function load() {
-      const {
-        data: { user },
-      } = await client.auth.getUser();
-      if (cancelled) return;
-
-      if (!user) {
-        setProfile(null);
-        setEmail(null);
-        return;
-      }
-
-      setEmail(user.email ?? null);
-      const { data } = await client.from("profiles").select("*").eq("id", user.id).single();
-      if (!cancelled) setProfile(data ?? null);
-    }
-
-    void load();
-
-    const {
-      data: { subscription },
-    } = client.auth.onAuthStateChange(() => {
-      void load();
-    });
-
-    return () => {
-      cancelled = true;
-      subscription.unsubscribe();
-    };
-  }, []);
-
-  if (!profile) return null;
-
-  const displayName = profile.full_name || email || "Signed in";
+  const displayName = fullName || email || "Signed in";
 
   return (
     <DropdownMenu>
@@ -83,14 +57,14 @@ export function UserMenu() {
         <Button variant="outline" size="sm" className="gap-2">
           <UserRound aria-hidden="true" className="size-4" />
           <span className="max-w-40 truncate">{displayName}</span>
-          <Badge variant="secondary">{ROLE_LABELS[profile.role]}</Badge>
+          <Badge variant="secondary">{ROLE_LABELS[role]}</Badge>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-56">
         <DropdownMenuLabel>
           <span className="text-foreground block truncate text-sm font-medium">{displayName}</span>
           {email ? <span className="block truncate font-normal">{email}</span> : null}
-          <span className="block font-normal">Role: {ROLE_LABELS[profile.role]}</span>
+          <span className="block font-normal">Role: {ROLE_LABELS[role]}</span>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuItem

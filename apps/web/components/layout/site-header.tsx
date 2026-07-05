@@ -4,6 +4,7 @@ import Link from "next/link";
 import { FontSizeControl } from "@/components/layout/font-size-control";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { UserMenu } from "@/components/layout/user-menu";
+import { getSessionProfile } from "@/lib/auth";
 
 const NAV_LINKS = [
   { href: "/", label: "Home" },
@@ -15,7 +16,13 @@ const NAV_LINKS = [
   { href: "/design", label: "Design system" },
 ];
 
-export function SiteHeader() {
+// Server component: resolves the session exactly once per request (reusing
+// the same cookie-bound server client the page/layout already used) and
+// passes it down as props. See UserMenu's doc comment for why this must not
+// be re-fetched client-side.
+export async function SiteHeader() {
+  const session = await getSessionProfile();
+
   return (
     <header className="bg-background border-b">
       <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-4 py-4 sm:px-6">
@@ -42,8 +49,14 @@ export function SiteHeader() {
           ))}
         </nav>
         <div className="flex items-center gap-2">
-          {/* Hidden when signed out (UserMenu renders null). */}
-          <UserMenu />
+          {/* Hidden when signed out. */}
+          {session ? (
+            <UserMenu
+              role={session.profile.role}
+              fullName={session.profile.full_name}
+              email={session.user.email ?? null}
+            />
+          ) : null}
           <FontSizeControl />
           <ThemeToggle />
         </div>
