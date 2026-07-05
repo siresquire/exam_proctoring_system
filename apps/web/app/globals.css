@@ -29,6 +29,8 @@
   --color-border: var(--border);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -57,16 +59,24 @@
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
+  /* AAMUSTED brand maroon, sampled from the crest (docs/DESIGN.md §1 brand
+     palette row) — white text on it measures 8.89:1 (scripts/derive-brand-palette.mjs). */
+  --primary: oklch(0.4276 0.1494 8.18);
   --primary-foreground: oklch(0.985 0 0);
   --secondary: oklch(0.97 0 0);
   --secondary-foreground: oklch(0.205 0 0);
   --muted: oklch(0.97 0 0);
   --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
+  /* AAMUSTED brand gold, sampled from the crest disc — black text on it
+     measures 13.41:1. */
+  --accent: oklch(0.8548 0.1717 89.23);
+  --accent-foreground: oklch(0.145 0 0);
   --destructive: oklch(0.577 0.245 27.325);
   --destructive-foreground: oklch(0.985 0 0);
+  /* AAMUSTED brand green, sampled from the crest torch/lettering — white
+     text on it measures 6.78:1; also usable as text-on-white at the same ratio. */
+  --success: oklch(0.4591 0.112 153.01);
+  --success-foreground: oklch(0.985 0 0);
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
@@ -93,16 +103,25 @@
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
+  /* AAMUSTED brand maroon, lightened for dark-background legibility (same
+     hue as the light theme, lightness raised until it clears 4.5:1 against
+     both the dark background and dark foreground text — 4.55:1 / 5.32:1). */
+  --primary: oklch(0.6611 0.1649 2.83);
   --primary-foreground: oklch(0.205 0 0);
   --secondary: oklch(0.269 0 0);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.269 0 0);
   --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
+  /* AAMUSTED brand gold — already light enough for the dark background
+     unchanged (9.79:1 as text, 13.41:1 for black text on it as a bg). */
+  --accent: oklch(0.8548 0.1717 89.23);
+  --accent-foreground: oklch(0.145 0 0);
   --destructive: oklch(0.704 0.191 22.216);
   --destructive-foreground: oklch(0.145 0 0);
+  /* AAMUSTED brand green, lightened for dark-background legibility (4.68:1
+     as text on the dark background, 5.47:1 for dark text on it as a bg). */
+  --success: oklch(0.6292 0.158 152.43);
+  --success-foreground: oklch(0.205 0 0);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
@@ -134,19 +153,26 @@
   --card-foreground: oklch(0 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0 0 0);
-  --primary: oklch(0 0 0);
+  /* AAMUSTED brand maroon — same swatch as the light theme (8.89:1 white
+     text), well clear of high-contrast's already-elevated bar. Structure
+     (borders/focus rings) carries the "high contrast" intent here, not hue. */
+  --primary: oklch(0.4276 0.1494 8.18);
   --primary-foreground: oklch(1 0 0);
   --secondary: oklch(0.94 0 0);
   --secondary-foreground: oklch(0 0 0);
   --muted: oklch(0.94 0 0);
   --muted-foreground: oklch(0.2 0 0);
-  --accent: oklch(0.3 0.18 264);
-  --accent-foreground: oklch(1 0 0);
+  /* AAMUSTED brand gold — 13.41:1 black text on it. */
+  --accent: oklch(0.8548 0.1717 89.23);
+  --accent-foreground: oklch(0 0 0);
   --destructive: oklch(0.4 0.22 27);
   --destructive-foreground: oklch(1 0 0);
+  /* AAMUSTED brand green — 6.78:1 white text on it. */
+  --success: oklch(0.4591 0.112 153.01);
+  --success-foreground: oklch(1 0 0);
   --border: oklch(0 0 0);
   --input: oklch(0 0 0);
-  --ring: oklch(0.3 0.18 264);
+  --ring: oklch(0.4276 0.1494 8.18);
   --chart-1: oklch(0 0 0);
   --chart-2: oklch(0.3 0.18 264);
   --chart-3: oklch(0.4 0.22 27);

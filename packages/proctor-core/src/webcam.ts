@@ -43,7 +43,9 @@ export async function startWebcam(emit?: Emit): Promise<WebcamHandle> {
     track.addEventListener("ended", () => emit("camera_lost"));
   }
 
-  async function captureSnapshot(options: { maxWidth?: number; quality?: number } = {}): Promise<Blob | null> {
+  async function captureSnapshot(
+    options: { maxWidth?: number; quality?: number } = {},
+  ): Promise<Blob | null> {
     const maxWidth = options.maxWidth ?? DEFAULT_MAX_WIDTH;
     const quality = options.quality ?? DEFAULT_QUALITY;
 

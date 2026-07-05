@@ -160,31 +160,36 @@ every migration + `seed.sql`):
 supabase db reset
 ```
 
+`db reset` wipes `auth.users` (test users are bootstrapped separately, see
+below — they are **not** part of any migration or `seed.sql`), so re-run
+`node scripts/seed-test-users.mjs` afterward. If `db reset` restarts
+containers and the very next Auth admin API call 502s with "invalid
+response was received from the upstream server", Kong's cached upstream IP
+for the `auth` container is stale — `supabase stop && supabase start` (not
+just `db reset`) fixes it.
+
 ### Test users
-
-Bootstrapped once via the Auth admin API (`POST /auth/v1/admin/users` with
-`email_confirm: true`) and then promoted with direct SQL as `postgres` inside
-a transaction that sets `usted.allow_role_change = 'on'` (the same escape
-hatch `supabase/seed.sql` uses to bootstrap the first super_admin — see the
-comment in that file). All other role changes go through the `set_user_role`
-RPC.
-
-| Email | Password | Role |
-|---|---|---|
-| `superadmin@usted.test` | `Usted!Test2026` | `super_admin` |
-| `admin@usted.test` | `Usted!Test2026` | `admin` |
-| `lecturer@usted.test` | `Usted!Test2026` | `lecturer` |
-| `student@usted.test` | `Usted!Test2026` | `student` |
-
-Recreate them any time with:
 
 ```bash
 # (from repo root, stack running)
-curl -s -X POST http://127.0.0.1:54321/auth/v1/admin/users \
-  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"student@usted.test","password":"Usted!Test2026","email_confirm":true,"user_metadata":{"full_name":"Student Test"}}'
+node scripts/seed-test-users.mjs
 ```
+
+Idempotently (re)creates the four test users below via the Auth admin API
+(`email_confirm: true`) and promotes their roles + seeds the student's
+`student_number` with direct SQL as `postgres` inside a transaction that
+sets `usted.allow_role_change = 'on'` (the same escape hatch
+`supabase/seed.sql` uses to bootstrap the first super_admin — see the
+comment in that file). Safe to re-run any time (e.g. after `db reset`); it
+refuses to run against a non-local Supabase URL. All other, non-seed role
+changes go through the `set_user_role` RPC.
+
+| Email | Password | Role | student_number |
+|---|---|---|---|
+| `superadmin@usted.test` | `Usted!Test2026` | `super_admin` | — |
+| `admin@usted.test` | `Usted!Test2026` | `admin` | — |
+| `lecturer@usted.test` | `Usted!Test2026` | `lecturer` | — |
+| `student@usted.test` | `Usted!Test2026` | `student` | `5201040845` |
 
 (`handle_new_user` auto-creates the `profiles` row on signup with the
 default `student` role and the `full_name` from metadata; promote the other
@@ -197,9 +202,16 @@ one authenticated super_admin/admin session.)
 the **local** stack and asserts what RLS policies, guard triggers, and RPCs
 should allow or reject — profile visibility, column-level update
 restrictions, `log_audit`/`set_user_role` permission checks, admin/
-super_admin escalation rules, audit log immutability, and anon access. It
-prints PASS/FAIL per check, restores any role changes it makes so it's safe
-to re-run, and exits non-zero if anything fails.
+super_admin escalation rules, audit log immutability, anon access, the
+proctoring session/event/media RPCs and RLS, and (Phase 1.5) violation
+auto-termination (3 high-severity events → `terminated` + a
+`proctor_reports` row the owner and any lecturer can read but other
+students cannot), `start_proctor_session` refusing unattested sessions,
+`identity_mismatch` logging on a claimed/registry index-number mismatch,
+`attach_identity_portrait`'s one-shot + owner-only enforcement, and the
+`profiles.student_number` 10-digit `CHECK` constraint. It prints PASS/FAIL
+per check, restores any role changes it makes so it's safe to re-run, and
+exits non-zero if anything fails.
 
 ```bash
 node scripts/rls-smoke-test.mjs
@@ -233,6 +245,87 @@ pnpm format       # Prettier write
 pnpm format:check # Prettier check (CI-safe)
 ```
 
+## Proctoring engine & demo
+
+`packages/proctor-core` is the framework-agnostic engine shared by System 1
+(Forms wrapper, Phase 2) and System 2 (platform exam room, Phase 4): a
+heartbeat/event-capture pipeline (tab switches, window blur, fullscreen
+exit, clipboard use, right-click, connection loss), an offline-buffered
+batched event queue, and webcam snapshot capture. It has zero framework
+coupling — `apps/web/lib/proctor/supabase-adapters.ts` is the only place
+Supabase-specific code touches it (implements the `ProctorTransportAdapter`
+and `ProctorStorageAdapter` interfaces the engine expects).
+
+Open `/proctor-demo` (any signed-in role) for a live walkthrough: consent →
+identity verification → camera check → a monitored session running a
+5-question sample quiz. Try switching tabs, exiting fullscreen, copying
+text, or going offline — each appears in the live event feed with a
+severity level.
+
+### Violation threshold & auto-termination (Phase 1.5)
+
+Every `proctor_sessions` row carries a `violation_limit` (default 3) and a
+`violation_count`. The **server** — never the client — counts high-severity
+events inside the `log_proctor_events` RPC; once the count reaches the
+limit, the RPC atomically terminates the session (`status = 'terminated'`),
+appends a `session_terminated` event, and files a `proctor_reports` row
+(`reason = 'violation_limit_reached'`, a summary of event counts by
+severity/type, `status = 'pending_review'`). The RPC's return value
+(`{ accepted, session_status, violation_count, violation_limit }`) is how
+the client learns about termination — `packages/proctor-core`'s
+`ProctorEngine.onTerminated()` fires from that response, not from a
+client-side count, so a hostile client cannot dodge it by simply not
+reporting events truthfully (the events it *does* report are what triggers
+termination, and refusing to report at all just stalls the exam, which is
+its own signal). Before termination, each high-severity violation shows a
+calm `notify.examWarning` toast ("Violation N recorded — …"); on
+termination the demo locks the quiz UI and shows a "submitted for review"
+summary. `proctor_reports` is append-only and readable by the session owner
+and any `lecturer`-or-higher role; the review workflow (setting
+`verdict`/`reviewed_by`/`reviewed_at`) is Phase 4.
+
+### Identity verification (Phase 1.5)
+
+Before a session can start, the student goes through `IdentityCheck`
+(`apps/web/components/proctor/identity-check.tsx`): a 10-digit USTED index
+number field, a live camera capture with a face-outline guide overlay (no
+ML/face matching — the photo is evidence for a human reviewer), and an
+explicit attestation checkbox naming the academic-integrity consequences of
+impersonation. `start_proctor_session` refuses to create a session unless
+`attested = true`; the entered index number is cross-checked against
+`profiles.student_number` when that column is set — a mismatch logs a
+high-severity `identity_mismatch` event but does **not** block session
+creation (registry data can lag reality; the portrait is the primary
+evidence). The portrait itself is uploaded to the `proctoring` bucket after
+the session is created, then linked with the one-shot
+`attach_identity_portrait(session_id, storage_path)` RPC (owner-only, own
+active session, only while no portrait is already attached).
+`profiles.student_number` has a `CHECK (student_number ~ '^\d{10}$')`
+constraint (USTED index numbers, e.g. `5201040845`); the local seed data
+sets it for `student@usted.test` only — staff profiles stay `NULL`.
+
+### Branding & accessibility extras (Phase 1.5)
+
+- AAMUSTED's crest+wordmark (`apps/web/public/aamusted-logo.png`) is in the
+  site header (~40px), and larger on `/login` and the home page, each with a
+  descriptive `alt`. The home page footer credits AAMUSTED. The favicon was
+  **not** replaced — see the comment in `apps/web/app/layout.tsx`'s
+  `metadata` for why (the full logo doesn't survive being shrunk to a
+  16–32px square; cropping just the crest needs real image processing this
+  repo doesn't have).
+- The brand palette (maroon primary / gold accent / green success) was
+  sampled programmatically from the logo file — see
+  `scripts/derive-brand-palette.mjs` (run it yourself:
+  `node scripts/derive-brand-palette.mjs`) — and applied to
+  `apps/web/app/globals.css` across all three themes, each pairing
+  re-verified ≥ 4.5:1 contrast. See docs/DESIGN.md §1 for the exact hex
+  values and ratios.
+- A text-size control (100% / 112.5% / 125% / 150%) sits next to the theme
+  toggle in the header and on `/design`. It scales `<html>`'s font-size —
+  the whole app is `rem`-based, so every screen scales with it — and is
+  persisted + applied before first paint (no flash of unscaled text), the
+  same technique `next-themes` uses for color scheme.
+
 ## Design system review
 
 Run the dev server and open `/design` — it exercises every notification
@@ -256,6 +349,13 @@ issue.)
   `supabase/migrations/`). `requireRole()` in the app is UX-level routing,
   not security.
 - The `audit_log` table is append-only (enforced in the DB); write to it
-  only via the `log_audit()` SQL function.
+  only via the `log_audit()` SQL function. `proctor_events`, `proctor_media`,
+  and `proctor_reports` follow the same append-only posture (revoked direct
+  DML + a trigger that rejects UPDATE/DELETE outright).
 - Cloudflare R2 (proctoring media) is wired up in Phase 1 — the `R2_*` env
   vars in `.env.example` are placeholders until then.
+- `packages/proctor-core` must stay framework-agnostic: no React, no
+  `@supabase/*` import anywhere in that package. New signals/adapters go
+  through the existing `ProctorTransportAdapter`/`ProctorStorageAdapter`
+  interfaces; identity-verification UI lives entirely in `apps/web` — the
+  engine only exposes the generic `onTerminated()` hook it needs.

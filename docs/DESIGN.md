@@ -13,7 +13,9 @@
 | Typography | **Inter** (variable, self-hosted via `next/font` — no CDN: privacy + Ghana bandwidth). **JetBrains Mono** for codes/IDs/timers. Base 16px, `rem` units everywhere, line-height ≥ 1.5 |
 | Popups & notifications | **SweetAlert2** for all alerts, confirmations, and toasts — wrapped in a single `lib/notify.ts` utility (see §4). shadcn/Radix `Dialog` for in-flow modal forms |
 | Color | Tailwind CSS variables (shadcn theming). All pairs ≥ 4.5:1 contrast (3:1 for large text/UI parts). Semantic tokens: `success/warning/destructive/info` never conveyed by color alone (icon + text always) |
-| Themes | Light (default), dark, and high-contrast — user-switchable, persisted, respects `prefers-color-scheme` |
+| Brand palette | AAMUSTED crest colors, sampled programmatically from `cropped-AAMUSTED-NEW-LOGO-26.png` via `scripts/derive-brand-palette.mjs` (`pngjs` decode + WCAG relative-luminance contrast check, lightness-adjusted per theme, hue held constant). `primary` = maroon `#8d1b3f` (light/high-contrast) / `#e16089` (dark, lightened for the dark background); `accent` = gold `#fcc815` (unchanged across all three themes — already light enough); `success` = green `#0f6938` (light/high-contrast) / `#17a357` (dark). Every foreground/background pairing re-verified ≥ 4.5:1 (see `apps/web/app/globals.css` — each theme block comments its ratio) |
+| Themes | Light (default), dark, and high-contrast — user-switchable, persisted, respects `prefers-color-scheme`. Brand palette above applies identically across all three |
+| Text scaling | User-adjustable 100% / 112.5% / 125% / 150% root font-size control (WCAG 1.4.4, beyond browser zoom), next to the theme toggle and on `/design`. Persisted in `localStorage`, applied pre-paint by an inline `<script>` (`components/layout/font-size-script.tsx`, same technique as next-themes) to avoid a flash of unscaled text. Rem-based layout means every screen scales without a per-component change |
 | Motion | All animation behind `prefers-reduced-motion` guard, incl. SweetAlert2 (`showClass/hideClass` disabled when reduced) |
 
 ## 2. Interaction design principles (mapped to Nielsen heuristics)

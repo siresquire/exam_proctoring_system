@@ -2,6 +2,7 @@ import { Download, Pencil, Trash2 } from "lucide-react";
 
 import { AccessibleFormDemo } from "@/components/design/accessible-form-demo";
 import { NotifyDemo } from "@/components/design/notify-demo";
+import { FontSizeControl } from "@/components/layout/font-size-control";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -142,9 +143,29 @@ export default function DesignSystemPage() {
             <CardDescription>
               Use the &quot;Theme&quot; control in the header to switch. High-contrast swaps in pure
               black/white with heavier borders and a 3px focus ring, rather than just inverting dark
-              mode.
+              mode. Brand colors (AAMUSTED maroon/gold/green — docs/DESIGN.md §1) carry across all
+              three themes, each pair re-verified to clear 4.5:1 contrast.
             </CardDescription>
           </CardHeader>
+        </Card>
+      </section>
+
+      <section aria-labelledby="text-size-heading" className="space-y-4">
+        <h2 id="text-size-heading" className="text-xl font-semibold tracking-tight">
+          Text size
+        </h2>
+        <Card>
+          <CardHeader>
+            <CardTitle>100% – 150% scaling (WCAG 1.4.4)</CardTitle>
+            <CardDescription>
+              Also available in the header, next to the theme toggle. Scales the root font size, so
+              every rem-based measurement on the page grows with it. Persisted per browser and
+              applied before first paint (no flash of unscaled text).
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <FontSizeControl />
+          </CardContent>
         </Card>
       </section>
     </div>

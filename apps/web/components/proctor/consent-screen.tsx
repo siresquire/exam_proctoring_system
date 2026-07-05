@@ -1,21 +1,17 @@
 "use client";
 
-import { useId, useRef, useState } from "react";
-import { isWebcamSupported, startWebcam, type WebcamHandle } from "@proctor/core";
-import { AlertCircle, Camera, CheckCircle2, ShieldCheck } from "lucide-react";
+import { useState } from "react";
+import { ShieldCheck } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { notify } from "@/lib/notify";
 
-type CameraStatus = "idle" | "checking" | "ok" | "denied" | "unsupported";
-
 interface ConsentScreenProps {
-  /** Called once consent is affirmed AND the camera check has passed. */
-  onConsent: (webcam: WebcamHandle) => void;
+  /** Called once consent is affirmed. The identity step (camera + attestation) follows next. */
+  onConsent: () => void;
 }
 
 /**
@@ -23,30 +19,14 @@ interface ConsentScreenProps {
  * consent flow: states purpose, exactly what is collected, retention, and
  * who can view, before any capture happens; requires an explicit
  * affirmative action (an unchecked checkbox, never pre-checked); is fully
- * keyboard/screen-reader navigable; and gives non-visual feedback for the
- * camera-check step ("Camera detected: OK") rather than relying on the
- * live video preview alone.
+ * keyboard/screen-reader navigable. The camera check itself now lives in
+ * the identity-verification step (IdentityCheck) that follows this screen —
+ * Phase 1.5 moved it there so the camera is only ever opened once, for the
+ * identity portrait, rather than twice (a bare "check" here, then again to
+ * capture the portrait).
  */
 export function ConsentScreen({ onConsent }: ConsentScreenProps) {
   const [agreed, setAgreed] = useState(false);
-  const [cameraStatus, setCameraStatus] = useState<CameraStatus>("idle");
-  const webcamRef = useRef<WebcamHandle | null>(null);
-  const statusId = useId();
-
-  async function handleCheckCamera() {
-    if (!isWebcamSupported()) {
-      setCameraStatus("unsupported");
-      return;
-    }
-    setCameraStatus("checking");
-    try {
-      const handle = await startWebcam();
-      webcamRef.current = handle;
-      setCameraStatus("ok");
-    } catch {
-      setCameraStatus("denied");
-    }
-  }
 
   async function handleContinue() {
     if (!agreed) {
@@ -56,20 +36,8 @@ export function ConsentScreen({ onConsent }: ConsentScreenProps) {
       );
       return;
     }
-    if (cameraStatus !== "ok" || !webcamRef.current) {
-      await notify.warning("Camera check required", "Run the camera check before continuing.");
-      return;
-    }
-    onConsent(webcamRef.current);
+    onConsent();
   }
-
-  const cameraStatusText: Record<CameraStatus, string> = {
-    idle: "Camera not yet checked.",
-    checking: "Requesting camera access…",
-    ok: "Camera detected: OK.",
-    denied: "Camera access was denied or is unavailable. Grant camera permission and try again.",
-    unsupported: "This browser does not support camera access. A different browser is required.",
-  };
 
   return (
     <Card className="mx-auto max-w-2xl">
@@ -99,9 +67,20 @@ export function ConsentScreen({ onConsent }: ConsentScreenProps) {
             What is collected
           </h2>
           <ul className="text-muted-foreground list-inside list-disc space-y-1 text-sm">
-            <li>Browser events: tab switches, window focus loss, fullscreen exits, copy/paste, right-click, and connection drops.</li>
-            <li>Periodic webcam snapshots (still JPEG images, not continuous video) while the session is active.</li>
-            <li>Timestamps for every event and snapshot, and your browser&apos;s user-agent string.</li>
+            <li>
+              Browser events: tab switches, window focus loss, fullscreen exits, copy/paste,
+              right-click, and connection drops.
+            </li>
+            <li>
+              Periodic webcam snapshots (still JPEG images, not continuous video) while the session
+              is active.
+            </li>
+            <li>
+              One identity portrait and your entered index number, captured just after this screen.
+            </li>
+            <li>
+              Timestamps for every event and snapshot, and your browser&apos;s user-agent string.
+            </li>
           </ul>
         </section>
 
@@ -127,66 +106,20 @@ export function ConsentScreen({ onConsent }: ConsentScreenProps) {
           </p>
         </section>
 
-        <section aria-labelledby="camera-heading" className="space-y-3 border-t pt-4">
-          <h2 id="camera-heading" className="font-medium">
-            Camera check
-          </h2>
-          <p className="text-muted-foreground text-sm">
-            Confirm your camera works before continuing. This does not start recording — it only
-            verifies access.
-          </p>
-          <div className="flex items-center gap-3">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={handleCheckCamera}
-              disabled={cameraStatus === "checking"}
-            >
-              <Camera aria-hidden="true" />
-              {cameraStatus === "ok" ? "Re-check camera" : "Check camera"}
-            </Button>
-            {cameraStatus === "ok" && (
-              <Badge variant="secondary">
-                <CheckCircle2 aria-hidden="true" />
-                Camera detected: OK
-              </Badge>
-            )}
-            {(cameraStatus === "denied" || cameraStatus === "unsupported") && (
-              <Badge variant="destructive">
-                <AlertCircle aria-hidden="true" />
-                Camera not available
-              </Badge>
-            )}
-          </div>
-          {/* Non-visual feedback: announced to screen readers even though the
-              badge above also conveys it visually (icon + text, never color
-              alone — DESIGN.md §1). polite: this isn't an emergency, no need
-              to interrupt. */}
-          <p id={statusId} role="status" aria-live="polite" className="sr-only">
-            {cameraStatusText[cameraStatus]}
-          </p>
-        </section>
-
         <div className="flex items-start gap-3 border-t pt-4">
           <Checkbox
             id="consent-checkbox"
             checked={agreed}
             onCheckedChange={(checked) => setAgreed(checked === true)}
-            aria-describedby={statusId}
           />
-          <Label htmlFor="consent-checkbox" className="text-sm leading-normal font-normal">
+          <Label htmlFor="consent-checkbox" className="text-sm font-normal leading-normal">
             I understand what is collected and how it will be used, and I consent to being monitored
             for the duration of this session.
           </Label>
         </div>
 
-        <Button
-          type="button"
-          className="w-full"
-          onClick={handleContinue}
-          disabled={!agreed || cameraStatus !== "ok"}
-        >
-          Continue to session start
+        <Button type="button" className="w-full" onClick={handleContinue} disabled={!agreed}>
+          Continue to identity verification
         </Button>
       </CardContent>
     </Card>

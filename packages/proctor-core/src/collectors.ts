@@ -46,7 +46,9 @@ export function collectFullscreen(emit: Emit): Detach {
 }
 
 /** Requests fullscreen on the given element (defaults to documentElement). Rejects silently if unsupported/denied — caller decides what that means. */
-export async function requestFullscreen(element: Element = document.documentElement): Promise<boolean> {
+export async function requestFullscreen(
+  element: Element = document.documentElement,
+): Promise<boolean> {
   try {
     if (!element.requestFullscreen) return false;
     await element.requestFullscreen();

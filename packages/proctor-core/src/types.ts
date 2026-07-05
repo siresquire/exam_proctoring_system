@@ -31,7 +31,11 @@ export type ProctorEvent =
   | "heartbeat"
   | "session_start"
   | "session_end"
-  | "concurrent_session_detected";
+  | "concurrent_session_detected"
+  /** Phase 1.5: server-logged when a claimed index number differs from profiles.student_number. Client never emits this itself — it's surfaced for display only if a host app reads it back via SELECT. */
+  | "identity_mismatch"
+  /** Phase 1.5: server-appended when violation_count reaches violation_limit (log_proctor_events). The engine surfaces this as a local signal (see ProctorEngine.onTerminated) rather than the client emitting/queuing it itself — the server already recorded it. */
+  | "session_terminated";
 
 export type ProctorSeverity = "info" | "low" | "medium" | "high";
 
@@ -51,12 +55,29 @@ export interface ProctorEventPayload {
 export interface ProctorEngineEvent extends ProctorEventPayload {}
 
 /**
+ * Server's response to a log_proctor_events batch (Phase 1.5) — the RPC
+ * always returns this shape now, so the client learns whether *this* batch
+ * pushed the session over its violation_limit without a second round-trip.
+ */
+export interface ProctorLogResult {
+  accepted: boolean | number;
+  session_status: string;
+  violation_count: number;
+  violation_limit: number;
+}
+
+/**
  * Transport adapter: how batched events leave the browser. Implemented in
  * apps/web (Supabase RPC) — the engine itself never imports @supabase/*.
  */
 export interface ProctorTransportAdapter {
-  /** Send a batch of events for a session. Throwing means "retry me". */
-  sendEvents(sessionId: string, events: ProctorEventPayload[]): Promise<void>;
+  /**
+   * Send a batch of events for a session. Throwing means "retry me".
+   * Resolves with the server's ProctorLogResult when the transport can
+   * surface one (Supabase RPC); a void-returning adapter (e.g. in tests)
+   * is still valid — the engine only acts on a result when present.
+   */
+  sendEvents(sessionId: string, events: ProctorEventPayload[]): Promise<ProctorLogResult | void>;
 }
 
 export interface SnapshotMeta {
@@ -102,10 +123,20 @@ export interface ProctorEngineConfig {
 
 export type ProctorEventListener = (event: ProctorEngineEvent) => void;
 
+export type ProctorTerminationListener = (result: ProctorLogResult) => void;
+
 export interface ProctorEngine {
   start(): void;
   stop(): void;
   on(listener: ProctorEventListener): () => void;
+  /**
+   * Phase 1.5: called when a log_proctor_events batch response reports
+   * session_status === "terminated" (violation_limit reached). The server
+   * has already recorded session_terminated as a proctor_events row — this
+   * is purely a local notification so the host app can lock its UI; it is
+   * never itself queued/re-sent.
+   */
+  onTerminated(listener: ProctorTerminationListener): () => void;
   /** Manually enqueue+emit an event (used by webcam snapshot capture, or a host app's own signal). */
   report(event: ProctorEvent, severity: ProctorSeverity, meta?: Record<string, unknown>): void;
   /** Best-effort immediate flush (e.g. before navigating away). */
@@ -145,6 +176,8 @@ export function defaultSeverity(event: ProctorEvent, tier: ProctorTier = 2): Pro
     case "page_unload":
       return "medium";
     case "concurrent_session_detected":
+    case "identity_mismatch":
+    case "session_terminated":
       return "high";
     default:
       return "info";

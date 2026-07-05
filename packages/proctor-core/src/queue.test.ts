@@ -94,7 +94,11 @@ describe("createEventQueue", () => {
     // Simulate a page refresh: a brand new queue for the same session id
     // reads the same localStorage key and should recover the buffered event.
     const sendEvents2 = vi.fn().mockResolvedValue(undefined);
-    const queueB = createEventQueue("session-refresh", { sendEvents: sendEvents2 }, { batchIntervalMs: 60000 });
+    const queueB = createEventQueue(
+      "session-refresh",
+      { sendEvents: sendEvents2 },
+      { batchIntervalMs: 60000 },
+    );
     expect(queueB.pendingCount()).toBe(1);
 
     await queueB.flush();
@@ -133,5 +137,41 @@ describe("createEventQueue", () => {
     const queue = createEventQueue("session-empty", { sendEvents });
     await queue.flush();
     expect(sendEvents).not.toHaveBeenCalled();
+  });
+
+  it("invokes onResult with the server's ProctorLogResult after a successful flush (Phase 1.5)", async () => {
+    const logResult = {
+      accepted: true,
+      session_status: "terminated",
+      violation_count: 3,
+      violation_limit: 3,
+    };
+    const sendEvents = vi.fn().mockResolvedValue(logResult);
+    const onResult = vi.fn();
+    const queue = createEventQueue(
+      "session-1",
+      { sendEvents },
+      { batchIntervalMs: 60000, onResult },
+    );
+
+    queue.enqueue(makeEvent());
+    await queue.flush();
+
+    expect(onResult).toHaveBeenCalledWith(logResult);
+  });
+
+  it("does not call onResult when the transport resolves void (adapter without a result)", async () => {
+    const sendEvents = vi.fn().mockResolvedValue(undefined);
+    const onResult = vi.fn();
+    const queue = createEventQueue(
+      "session-1",
+      { sendEvents },
+      { batchIntervalMs: 60000, onResult },
+    );
+
+    queue.enqueue(makeEvent());
+    await queue.flush();
+
+    expect(onResult).not.toHaveBeenCalled();
   });
 });

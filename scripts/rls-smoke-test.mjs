@@ -494,6 +494,7 @@ async function main() {
     const { data: sessionId, error: startErr } = await studentClient.rpc("start_proctor_session", {
       context,
       tier: 2,
+      attested: true,
     });
     record(
       "i1. student start_proctor_session succeeds and returns a session id",
@@ -506,7 +507,12 @@ async function main() {
     const { error: logErr } = await studentClient.rpc("log_proctor_events", {
       session_id: sessionId,
       events: [
-        { event_type: "tab_hidden", severity: "medium", occurred_at: nowIso, meta: { source: "smoke-test" } },
+        {
+          event_type: "tab_hidden",
+          severity: "medium",
+          occurred_at: nowIso,
+          meta: { source: "smoke-test" },
+        },
       ],
     });
     record("i2. student log_proctor_events (valid batch) succeeds", !logErr, logErr?.message);
@@ -526,10 +532,14 @@ async function main() {
     // i3. student cannot log events to another user's session.
     const { data: lecturerSessionId, error: lecturerStartErr } = await lecturerClient.rpc(
       "start_proctor_session",
-      { context: `${context}-lecturer`, tier: 2 },
+      { context: `${context}-lecturer`, tier: 2, attested: true },
     );
     if (lecturerStartErr) {
-      record("i3. student log_proctor_events on another user's session FAILS", false, lecturerStartErr.message);
+      record(
+        "i3. student log_proctor_events on another user's session FAILS",
+        false,
+        lecturerStartErr.message,
+      );
     } else {
       const { error: crossLogErr } = await studentClient.rpc("log_proctor_events", {
         session_id: lecturerSessionId,
@@ -538,7 +548,8 @@ async function main() {
       record(
         "i3. student log_proctor_events on another user's session FAILS",
         Boolean(crossLogErr),
-        crossLogErr?.message ?? "no error raised — SECURITY: student wrote events into another user's session",
+        crossLogErr?.message ??
+          "no error raised — SECURITY: student wrote events into another user's session",
       );
       // Clean up the lecturer's throwaway session.
       await lecturerClient.rpc("end_proctor_session", { session_id: lecturerSessionId });
@@ -619,7 +630,7 @@ async function main() {
     // first and logs a concurrent_session_detected event on it.
     const { data: secondSessionId, error: secondStartErr } = await studentClient.rpc(
       "start_proctor_session",
-      { context, tier: 2 },
+      { context, tier: 2, attested: true },
     );
     record(
       "i6a. second start_proctor_session (same context) succeeds",
@@ -677,13 +688,324 @@ async function main() {
     record(
       "i8. end_proctor_session by non-owner FAILS",
       Boolean(nonOwnerEndErr),
-      nonOwnerEndErr?.message ?? "no error raised — SECURITY: a non-owner ended another user's session",
+      nonOwnerEndErr?.message ??
+        "no error raised — SECURITY: a non-owner ended another user's session",
     );
 
     // Cleanup: end the second session as its rightful owner so this test is idempotent.
     if (secondSessionId) {
       await studentClient.rpc("end_proctor_session", { session_id: secondSessionId });
     }
+  }
+
+  // === (j) Phase 1.5: violation auto-termination + reports ==================
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const context = `smoke-test-violation-${Date.now()}`;
+
+    const { data: sessionId, error: startErr } = await studentClient.rpc("start_proctor_session", {
+      context,
+      tier: 3,
+      claimed_index_number: "5201040845",
+      attested: true,
+    });
+    record(
+      "j1. student start_proctor_session (attested) succeeds for violation test",
+      !startErr && typeof sessionId === "string",
+      startErr?.message ?? `sessionId=${sessionId}`,
+    );
+
+    // Log 2 high-severity events first: session should still be active,
+    // violation_count should be 2, no report yet.
+    const nowIso = new Date().toISOString();
+    const { data: batch1, error: batch1Err } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [
+        { event_type: "fullscreen_exit", severity: "high", occurred_at: nowIso },
+        { event_type: "copy_attempt", severity: "high", occurred_at: nowIso },
+      ],
+    });
+    record(
+      "j2. after 2 high-severity events, session_status is still active",
+      !batch1Err && batch1?.session_status === "active" && batch1?.violation_count === 2,
+      batch1Err?.message ??
+        `session_status=${batch1?.session_status} violation_count=${batch1?.violation_count}`,
+    );
+
+    // Third high-severity event crosses the default violation_limit (3) ->
+    // the RPC response itself should report termination.
+    const { data: batch2, error: batch2Err } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [{ event_type: "contextmenu", severity: "high", occurred_at: nowIso }],
+    });
+    record(
+      "j3. 3rd high-severity event: log_proctor_events response reports session_status=terminated",
+      !batch2Err && batch2?.session_status === "terminated" && batch2?.violation_count === 3,
+      batch2Err?.message ??
+        `session_status=${batch2?.session_status} violation_count=${batch2?.violation_count}`,
+    );
+
+    const { data: sessionRow, error: sessionRowErr } = await admin
+      .from("proctor_sessions")
+      .select("status, ended_at")
+      .eq("id", sessionId)
+      .single();
+    record(
+      "j4. proctor_sessions row is status=terminated with ended_at set",
+      !sessionRowErr && sessionRow?.status === "terminated" && Boolean(sessionRow?.ended_at),
+      sessionRowErr?.message ?? `status=${sessionRow?.status} ended_at=${sessionRow?.ended_at}`,
+    );
+
+    const { data: terminatedEvents, error: terminatedEventsErr } = await admin
+      .from("proctor_events")
+      .select("*")
+      .eq("session_id", sessionId)
+      .eq("event_type", "session_terminated");
+    record(
+      "j5. session_terminated event logged (high severity)",
+      !terminatedEventsErr &&
+        terminatedEvents?.length === 1 &&
+        terminatedEvents[0].severity === "high",
+      terminatedEventsErr?.message ?? `rows=${terminatedEvents?.length}`,
+    );
+
+    const { data: reportRow, error: reportRowErr } = await admin
+      .from("proctor_reports")
+      .select("*")
+      .eq("session_id", sessionId)
+      .maybeSingle();
+    record(
+      "j6. proctor_reports row exists with reason=violation_limit_reached, status=pending_review",
+      !reportRowErr &&
+        Boolean(reportRow) &&
+        reportRow?.reason === "violation_limit_reached" &&
+        reportRow?.status === "pending_review",
+      reportRowErr?.message ?? `reason=${reportRow?.reason} status=${reportRow?.status}`,
+    );
+
+    // Owner can read their own report.
+    const { data: ownReport, error: ownReportErr } = await studentClient
+      .from("proctor_reports")
+      .select("*")
+      .eq("session_id", sessionId);
+    record(
+      "j7. session owner (student) SELECT own proctor_reports row succeeds",
+      !ownReportErr && (ownReport?.length ?? 0) === 1,
+      ownReportErr?.message ?? `rows=${ownReport?.length}`,
+    );
+
+    // Lecturer can read it too (has_role('lecturer') policy).
+    const { data: lecturerReport, error: lecturerReportErr } = await lecturerClient
+      .from("proctor_reports")
+      .select("*")
+      .eq("session_id", sessionId);
+    record(
+      "j8. lecturer SELECT student's proctor_reports row succeeds",
+      !lecturerReportErr && (lecturerReport?.length ?? 0) === 1,
+      lecturerReportErr?.message ?? `rows=${lecturerReport?.length}`,
+    );
+
+    // Further log_proctor_events calls on a terminated session must fail
+    // (RPC re-checks status = 'active').
+    const { error: postTerminationErr } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [{ event_type: "tab_hidden", severity: "low", occurred_at: nowIso }],
+    });
+    record(
+      "j9. log_proctor_events on a terminated session FAILS",
+      Boolean(postTerminationErr),
+      postTerminationErr?.message ??
+        "no error raised — SECURITY: events accepted after termination",
+    );
+
+    // A second student session (own, unrelated) reads 0 rows for the
+    // terminated session's report — students never see each other's reports.
+    const { data: lecturerOwnSessionId, error: lecturerOwnStartErr } = await lecturerClient.rpc(
+      "start_proctor_session",
+      { context: `${context}-lecturer-own`, tier: 2, attested: true },
+    );
+    if (lecturerOwnStartErr) {
+      record(
+        "j10. student cannot read another user's proctor_reports (0 rows)",
+        false,
+        lecturerOwnStartErr.message,
+      );
+    } else {
+      // Force the lecturer's own session to terminate too, so there is a
+      // *second* report row owned by someone else, then confirm the student
+      // cannot see it.
+      await lecturerClient.rpc("log_proctor_events", {
+        session_id: lecturerOwnSessionId,
+        events: [
+          { event_type: "fullscreen_exit", severity: "high", occurred_at: nowIso },
+          { event_type: "copy_attempt", severity: "high", occurred_at: nowIso },
+          { event_type: "contextmenu", severity: "high", occurred_at: nowIso },
+        ],
+      });
+      const { data: crossReport, error: crossReportErr } = await studentClient
+        .from("proctor_reports")
+        .select("*")
+        .eq("session_id", lecturerOwnSessionId);
+      record(
+        "j10. student cannot read another user's proctor_reports (0 rows)",
+        !crossReportErr && (crossReport?.length ?? 0) === 0,
+        crossReportErr?.message ?? `rows=${crossReport?.length}`,
+      );
+    }
+  }
+
+  // === (k) Phase 1.5: identity verification ==================================
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+
+    // k1. start_proctor_session without attested=true fails.
+    const { data: noAttestId, error: noAttestErr } = await studentClient.rpc(
+      "start_proctor_session",
+      {
+        context: `smoke-test-identity-noattest-${Date.now()}`,
+        tier: 2,
+        claimed_index_number: "5201040845",
+        attested: false,
+      },
+    );
+    record(
+      "k1. start_proctor_session without attested=true FAILS",
+      Boolean(noAttestErr) && !noAttestId,
+      noAttestErr?.message ?? "no error raised — SECURITY: session created without attestation",
+    );
+
+    // k2. mismatch between claimed index number and profiles.student_number
+    // logs a high-severity identity_mismatch event but still creates the session.
+    const mismatchContext = `smoke-test-identity-mismatch-${Date.now()}`;
+    const { data: mismatchSessionId, error: mismatchErr } = await studentClient.rpc(
+      "start_proctor_session",
+      {
+        context: mismatchContext,
+        tier: 2,
+        claimed_index_number: "9999999999",
+        attested: true,
+      },
+    );
+    record(
+      "k2a. start_proctor_session with mismatched index number still succeeds (flag, not a block)",
+      !mismatchErr && typeof mismatchSessionId === "string",
+      mismatchErr?.message ?? `sessionId=${mismatchSessionId}`,
+    );
+
+    const { data: mismatchEvents, error: mismatchEventsErr } = await admin
+      .from("proctor_events")
+      .select("*")
+      .eq("session_id", mismatchSessionId)
+      .eq("event_type", "identity_mismatch");
+    record(
+      "k2b. identity_mismatch event logged (high severity) when claimed != profile student_number",
+      !mismatchEventsErr && mismatchEvents?.length === 1 && mismatchEvents[0].severity === "high",
+      mismatchEventsErr?.message ?? `rows=${mismatchEvents?.length}`,
+    );
+    if (mismatchSessionId) {
+      await studentClient.rpc("end_proctor_session", { session_id: mismatchSessionId });
+    }
+
+    // k3. matching index number logs no identity_mismatch event.
+    const matchContext = `smoke-test-identity-match-${Date.now()}`;
+    const { data: matchSessionId, error: matchErr } = await studentClient.rpc(
+      "start_proctor_session",
+      {
+        context: matchContext,
+        tier: 2,
+        claimed_index_number: "5201040845",
+        attested: true,
+      },
+    );
+    record(
+      "k3a. start_proctor_session with matching index number succeeds",
+      !matchErr,
+      matchErr?.message,
+    );
+
+    const { data: noMismatchEvents, error: noMismatchEventsErr } = await admin
+      .from("proctor_events")
+      .select("*")
+      .eq("session_id", matchSessionId)
+      .eq("event_type", "identity_mismatch");
+    record(
+      "k3b. no identity_mismatch event when claimed == profile student_number",
+      !noMismatchEventsErr && (noMismatchEvents?.length ?? 0) === 0,
+      noMismatchEventsErr?.message ?? `rows=${noMismatchEvents?.length}`,
+    );
+
+    // k4. attach_identity_portrait: owner-only, one-shot.
+    const portraitPath = `${matchSessionId}/identity-smoke-test.jpg`;
+    const tinyJpegBytes = Buffer.from(
+      "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMDAwMDAwMDAwMEAwMEBQgFBQQEBQoHBgYICwwLCwoKCgoLDA0ODw4NDAsKCgr/2wBDAQEBAQEBAQEBAQECAgECAgMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwP/wAALCAABAAEBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9sAQwADAwMDAwMDAwMDBAMDBAUIBQUEBAUKBwYGCAsMCwsKCgoKCwwNDg8ODQwLCgoK/9sAQwEBAQEBAQEBAQECAgECAgMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwP/2gAMAwEAAhADEAAAAT8A/9k=",
+      "base64",
+    );
+    const { error: uploadErr } = await studentClient.storage
+      .from("proctoring")
+      .upload(portraitPath, tinyJpegBytes, { contentType: "image/jpeg" });
+    record(
+      "k4a. student uploads identity portrait to own active session succeeds",
+      !uploadErr,
+      uploadErr?.message,
+    );
+
+    const { error: attachErr } = await studentClient.rpc("attach_identity_portrait", {
+      session_id: matchSessionId,
+      storage_path: portraitPath,
+    });
+    record("k4b. attach_identity_portrait (first call) succeeds", !attachErr, attachErr?.message);
+
+    const { error: secondAttachErr } = await studentClient.rpc("attach_identity_portrait", {
+      session_id: matchSessionId,
+      storage_path: portraitPath,
+    });
+    record(
+      "k4c. attach_identity_portrait a second time (one-shot) FAILS",
+      Boolean(secondAttachErr),
+      secondAttachErr?.message ?? "no error raised — SECURITY: identity portrait re-attached",
+    );
+
+    const { error: nonOwnerAttachErr } = await lecturerClient.rpc("attach_identity_portrait", {
+      session_id: matchSessionId,
+      storage_path: portraitPath,
+    });
+    record(
+      "k4d. attach_identity_portrait by non-owner FAILS",
+      Boolean(nonOwnerAttachErr),
+      nonOwnerAttachErr?.message ??
+        "no error raised — SECURITY: non-owner attached an identity portrait",
+    );
+
+    if (matchSessionId) {
+      await studentClient.rpc("end_proctor_session", { session_id: matchSessionId });
+    }
+
+    // k5. profiles.student_number CHECK rejects non-10-digit values. Must go
+    // through the service role directly (student_number is never
+    // client-updatable at all per profiles_guard_update — this asserts the
+    // DB-level CHECK itself, independent of that RLS/trigger restriction).
+    const { error: badFormatErr } = await admin
+      .from("profiles")
+      .update({ student_number: "12345" })
+      .eq("id", studentId);
+    record(
+      "k5. profiles.student_number CHECK rejects a non-10-digit value (even via service role)",
+      isDenied(badFormatErr) || Boolean(badFormatErr),
+      badFormatErr?.message ?? "no error raised — SECURITY: non-10-digit student_number accepted",
+    );
+    // Confirm the value is unchanged after the rejected update.
+    const { data: unchangedProfile } = await admin
+      .from("profiles")
+      .select("student_number")
+      .eq("id", studentId)
+      .single();
+    record(
+      "k5b. student_number remains unchanged after the rejected update",
+      unchangedProfile?.student_number === "5201040845",
+      `student_number=${unchangedProfile?.student_number}`,
+    );
   }
 
   // === cleanup / idempotency: restore original roles ========================

@@ -25,7 +25,11 @@ describe("createProctorEngine", () => {
 
   it("start() attaches collectors so a DOM event reaches listeners with mapped severity", () => {
     const transport = makeTransport();
-    const engine = createProctorEngine({ sessionId: "s1", adapters: { transport }, options: { tier: 2 } });
+    const engine = createProctorEngine({
+      sessionId: "s1",
+      adapters: { transport },
+      options: { tier: 2 },
+    });
 
     const received: unknown[] = [];
     engine.on((event) => received.push(event));
@@ -116,6 +120,48 @@ describe("createProctorEngine", () => {
     window.dispatchEvent(new Event("blur"));
 
     expect(received).toHaveLength(1);
+    engine.stop();
+  });
+
+  it("onTerminated fires once when a batch response reports session_status=terminated, and stops local collection (Phase 1.5)", async () => {
+    const sendEvents = vi.fn().mockResolvedValue({
+      accepted: true,
+      session_status: "terminated",
+      violation_count: 3,
+      violation_limit: 3,
+    });
+    const transport: ProctorTransportAdapter = { sendEvents };
+    const engine = createProctorEngine({
+      sessionId: "s7",
+      adapters: { transport },
+      options: { batchIntervalMs: 100000 },
+    });
+
+    const terminations: unknown[] = [];
+    engine.onTerminated((result) => terminations.push(result));
+
+    engine.start();
+    engine.report("copy_attempt", "high");
+    await engine.flush();
+
+    expect(terminations).toEqual([
+      expect.objectContaining({
+        session_status: "terminated",
+        violation_count: 3,
+        violation_limit: 3,
+      }),
+    ]);
+
+    // Local collection stopped: a DOM event no longer reaches listeners.
+    const received: unknown[] = [];
+    engine.on((event) => received.push(event));
+    window.dispatchEvent(new Event("blur"));
+    expect(received).toHaveLength(0);
+
+    // A second flush settling "terminated" again must not double-fire.
+    await engine.flush();
+    expect(terminations).toHaveLength(1);
+
     engine.stop();
   });
 });

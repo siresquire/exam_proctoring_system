@@ -1,3 +1,4 @@
+import Image from "next/image";
 import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
@@ -20,8 +21,16 @@ const ROLE_LINKS = [
 
 export default function Home() {
   return (
-    <div className="mx-auto max-w-6xl px-4 py-16 sm:px-6">
-      <section>
+    <div className="mx-auto flex min-h-[calc(100vh-4rem)] max-w-6xl flex-col px-4 py-16 sm:px-6">
+      <section className="flex-1">
+        <Image
+          src="/aamusted-logo.png"
+          alt="AAMUSTED — University of Skills Training and Entrepreneurial Development"
+          width={480}
+          height={139}
+          className="mb-6 h-auto w-full max-w-md"
+          priority
+        />
         <h1 className="text-3xl font-semibold tracking-tight">USTED Exam Proctoring</h1>
         <p className="text-muted-foreground mt-3 max-w-2xl text-lg">
           A proctored exam platform built on evidence and human review, not automated punishment.
@@ -46,6 +55,14 @@ export default function Home() {
           </Link>
         ))}
       </section>
+
+      <footer className="text-muted-foreground mt-16 border-t pt-6 text-sm">
+        <p>
+          Built for AAMUSTED — the University of Skills Training and Entrepreneurial Development.
+          The AAMUSTED name and crest are used with attribution to identify the institution this
+          platform serves.
+        </p>
+      </footer>
     </div>
   );
 }

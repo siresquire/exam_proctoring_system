@@ -1,5 +1,10 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { ProctorStorageAdapter, ProctorTransportAdapter, SnapshotMeta } from "@proctor/core";
+import type {
+  ProctorLogResult,
+  ProctorStorageAdapter,
+  ProctorTransportAdapter,
+  SnapshotMeta,
+} from "@proctor/core";
 
 import type { Database } from "@/lib/supabase/types";
 
@@ -18,11 +23,16 @@ export function createSupabaseTransportAdapter(
 ): ProctorTransportAdapter {
   return {
     async sendEvents(sessionId, events) {
-      const { error } = await supabase.rpc("log_proctor_events", {
+      const { data, error } = await supabase.rpc("log_proctor_events", {
         session_id: sessionId,
-        events: events as unknown as Database["public"]["Functions"]["log_proctor_events"]["Args"]["events"],
+        events:
+          events as unknown as Database["public"]["Functions"]["log_proctor_events"]["Args"]["events"],
       });
       if (error) throw error;
+      // Phase 1.5: log_proctor_events now returns { accepted, session_status,
+      // violation_count, violation_limit } — the engine uses this to detect
+      // server-side auto-termination without a second round-trip.
+      return data as unknown as ProctorLogResult;
     },
   };
 }
@@ -44,10 +54,12 @@ export function createSupabaseStorageAdapter(
       const ext = meta.mimeType === "image/jpeg" ? "jpg" : "bin";
       const path = `${sessionId}/${Date.now()}.${ext}`;
 
-      const { error: uploadError } = await supabase.storage.from(PROCTORING_BUCKET).upload(path, blob, {
-        contentType: meta.mimeType,
-        upsert: false,
-      });
+      const { error: uploadError } = await supabase.storage
+        .from(PROCTORING_BUCKET)
+        .upload(path, blob, {
+          contentType: meta.mimeType,
+          upsert: false,
+        });
       if (uploadError) throw uploadError;
 
       const { error: rpcError } = await supabase.rpc("record_proctor_media", {

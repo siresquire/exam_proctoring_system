@@ -6,7 +6,7 @@ import { ProctorDemo } from "@/components/proctor/proctor-demo";
 // "signed in" (requireRole with all four roles listed, though super_admin
 // would pass regardless).
 export default async function ProctorDemoPage() {
-  await requireRole("super_admin", "admin", "lecturer", "student");
+  const { profile } = await requireRole("super_admin", "admin", "lecturer", "student");
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
@@ -18,7 +18,7 @@ export default async function ProctorDemoPage() {
           each signal.
         </p>
       </header>
-      <ProctorDemo />
+      <ProctorDemo fullName={profile.full_name} />
     </div>
   );
 }

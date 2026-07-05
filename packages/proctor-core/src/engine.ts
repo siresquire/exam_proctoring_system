@@ -17,7 +17,9 @@ import type {
   ProctorEngineEvent,
   ProctorEvent,
   ProctorEventListener,
+  ProctorLogResult,
   ProctorSeverity,
+  ProctorTerminationListener,
 } from "./types";
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 20000;
@@ -38,14 +40,45 @@ export function createProctorEngine(config: ProctorEngineConfig): ProctorEngine 
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
 
   const listeners = new Set<ProctorEventListener>();
-  const queue: EventQueue = createEventQueue(sessionId, adapters.transport, {
-    batchIntervalMs: options.batchIntervalMs,
-    storageKeyPrefix: options.storageKeyPrefix,
-  });
-
+  const terminationListeners = new Set<ProctorTerminationListener>();
+  let terminated = false;
   let detachers: Detach[] = [];
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let running = false;
+
+  function stopCollectingLocally() {
+    // Stops signal capture without touching the queue (the final batch —
+    // including the client's own view of what led to termination — should
+    // still flush). Used both by the public stop() and by onResult below,
+    // which reacts to the server telling us the session is already
+    // terminated: continuing to collect after that just wastes cycles.
+    if (!running) return;
+    running = false;
+
+    for (const detach of detachers) detach();
+    detachers = [];
+
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  const queue: EventQueue = createEventQueue(sessionId, adapters.transport, {
+    batchIntervalMs: options.batchIntervalMs,
+    storageKeyPrefix: options.storageKeyPrefix,
+    onResult(result: ProctorLogResult) {
+      // Fire at most once per session: the server has already appended
+      // session_terminated to proctor_events and stopped accepting further
+      // logs for this session, so repeated batches settling after
+      // termination (in flight, or offline-buffered) must not re-notify.
+      if (result.session_status === "terminated" && !terminated) {
+        terminated = true;
+        stopCollectingLocally();
+        for (const listener of terminationListeners) listener(result);
+      }
+    },
+  });
 
   function report(event: ProctorEvent, severity: ProctorSeverity, meta?: Record<string, unknown>) {
     const payload: ProctorEngineEvent = {
@@ -84,22 +117,16 @@ export function createProctorEngine(config: ProctorEngineConfig): ProctorEngine 
       queue.start();
     },
     stop() {
-      if (!running) return;
-      running = false;
-
-      for (const detach of detachers) detach();
-      detachers = [];
-
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-      }
-
+      stopCollectingLocally();
       queue.stop();
     },
     on(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
+    },
+    onTerminated(listener) {
+      terminationListeners.add(listener);
+      return () => terminationListeners.delete(listener);
     },
     report,
     async flush() {

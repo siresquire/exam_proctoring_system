@@ -13,9 +13,11 @@ import {
   Scissors,
   ScreenShare,
   ScreenShareOff,
+  ShieldAlert,
   Unplug,
   Video,
   VideoOff,
+  XCircle,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -49,9 +51,14 @@ const EVENT_LABELS: Record<ProctorEvent, string> = {
   session_start: "Session started",
   session_end: "Session ended",
   concurrent_session_detected: "Concurrent session detected",
+  identity_mismatch: "Identity mismatch flagged",
+  session_terminated: "Session terminated (violation limit reached)",
 };
 
-const EVENT_ICONS: Record<ProctorEvent, React.ComponentType<{ className?: string; "aria-hidden": true }>> = {
+const EVENT_ICONS: Record<
+  ProctorEvent,
+  React.ComponentType<{ className?: string; "aria-hidden": true }>
+> = {
   tab_hidden: EyeOff,
   tab_visible: Eye,
   window_blur: MinusCircle,
@@ -72,6 +79,8 @@ const EVENT_ICONS: Record<ProctorEvent, React.ComponentType<{ className?: string
   session_start: Info,
   session_end: Info,
   concurrent_session_detected: AlertTriangle,
+  identity_mismatch: ShieldAlert,
+  session_terminated: XCircle,
 };
 
 const SEVERITY_VARIANT: Record<ProctorSeverity, "secondary" | "outline" | "destructive"> = {
@@ -111,7 +120,11 @@ export function EventFeed({ events }: { events: FeedEvent[] }) {
   }
 
   return (
-    <ul aria-live="polite" aria-label="Live proctoring event feed" className="max-h-96 space-y-2 overflow-y-auto">
+    <ul
+      aria-live="polite"
+      aria-label="Live proctoring event feed"
+      className="max-h-96 space-y-2 overflow-y-auto"
+    >
       {events.map((event, index) => {
         const Icon = EVENT_ICONS[event.event_type] ?? Info;
         return (

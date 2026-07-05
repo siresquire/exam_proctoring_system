@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
+import Image from "next/image";
 import { redirect } from "next/navigation";
 import { TriangleAlert } from "lucide-react";
 
@@ -21,6 +22,14 @@ export default async function LoginPage() {
 
   return (
     <div className="mx-auto flex max-w-md flex-col px-4 py-16 sm:px-6">
+      <Image
+        src="/aamusted-logo.png"
+        alt="AAMUSTED — University of Skills Training and Entrepreneurial Development"
+        width={400}
+        height={116}
+        className="mx-auto mb-8 h-auto w-full max-w-xs"
+        priority
+      />
       <Card>
         <CardHeader>
           <CardTitle>

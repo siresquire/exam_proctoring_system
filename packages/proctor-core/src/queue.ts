@@ -1,4 +1,4 @@
-import type { ProctorEventPayload, ProctorTransportAdapter } from "./types";
+import type { ProctorEventPayload, ProctorLogResult, ProctorTransportAdapter } from "./types";
 
 /**
  * Batches events and flushes them to the transport adapter on an interval,
@@ -55,7 +55,12 @@ export interface EventQueue {
 export function createEventQueue(
   sessionId: string,
   transport: ProctorTransportAdapter,
-  options: { batchIntervalMs?: number; storageKeyPrefix?: string } = {},
+  options: {
+    batchIntervalMs?: number;
+    storageKeyPrefix?: string;
+    /** Called with the server's response every time a batch is accepted (Phase 1.5 violation-limit reporting). */
+    onResult?: (result: ProctorLogResult) => void;
+  } = {},
 ): EventQueue {
   const batchIntervalMs = options.batchIntervalMs ?? DEFAULT_BATCH_INTERVAL_MS;
   const key = storageKey(options.storageKeyPrefix ?? "proctor-core", sessionId);
@@ -79,12 +84,13 @@ export function createEventQueue(
     // and then get dropped by the batch.length slice below.
     const batch = pending.slice();
     try {
-      await transport.sendEvents(sessionId, batch);
+      const result = await transport.sendEvents(sessionId, batch);
       // Only drop the events we actually sent — anything enqueued during
       // the await stays queued for the next flush.
       pending = pending.slice(batch.length);
       persist();
       backoffMs = MIN_BACKOFF_MS;
+      if (result) options.onResult?.(result);
     } catch {
       // Leave `pending` untouched (still includes `batch`); retry with
       // exponential backoff. Offline buffering already happened via

@@ -49,5 +49,7 @@ export type {
   ProctorEngineOptions,
   ProctorEngineConfig,
   ProctorEngine,
+  ProctorLogResult,
+  ProctorTerminationListener,
   SnapshotMeta,
 } from "./types";

@@ -27,6 +27,11 @@ describe("defaultSeverity", () => {
     expect(defaultSeverity("concurrent_session_detected")).toBe("high");
   });
 
+  it("treats identity_mismatch and session_terminated as high (Phase 1.5)", () => {
+    expect(defaultSeverity("identity_mismatch")).toBe("high");
+    expect(defaultSeverity("session_terminated")).toBe("high");
+  });
+
   it("treats benign/lifecycle events as info", () => {
     expect(defaultSeverity("tab_visible")).toBe("info");
     expect(defaultSeverity("window_focus")).toBe("info");

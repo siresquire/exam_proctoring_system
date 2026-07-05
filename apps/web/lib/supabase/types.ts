@@ -10,8 +10,10 @@ export type Json = string | number | boolean | null | { [key: string]: Json | un
 
 export type UserRole = "super_admin" | "admin" | "lecturer" | "student";
 
-export type ProctorSessionStatus = "active" | "ended" | "abandoned";
+export type ProctorSessionStatus = "active" | "ended" | "abandoned" | "terminated";
 export type ProctorSeverity = "info" | "low" | "medium" | "high";
+export type ProctorReportStatus = "pending_review" | "reviewed";
+export type ProctorReportVerdict = "pass" | "escalate" | "violation";
 
 export interface Database {
   public: {
@@ -21,6 +23,7 @@ export interface Database {
           id: string;
           role: UserRole;
           full_name: string | null;
+          /** USTED index number, exactly 10 digits (CHECK profiles_student_number_format). Null for staff. */
           student_number: string | null;
           /**
            * Documented keys (see SQL comment on profiles.accommodations):
@@ -101,9 +104,20 @@ export interface Database {
           started_at: string;
           ended_at: string | null;
           last_heartbeat_at: string | null;
+          /** Phase 1.5: strikes tolerated before auto-termination (default 3). */
+          violation_limit: number;
+          /** Phase 1.5: running count of high-severity events, maintained by log_proctor_events(). */
+          violation_count: number;
+          /** Phase 1.5: storage path of the one-shot identity portrait, set via attach_identity_portrait(). */
+          identity_portrait_path: string | null;
+          /** Phase 1.5: index number entered at the identity step. */
+          claimed_index_number: string | null;
+          /** Phase 1.5: server-stamped attestation timestamp, set by start_proctor_session. */
+          attested_at: string | null;
         };
-        // Writable only via start_proctor_session/end_proctor_session RPCs
-        // (security definer) — no client INSERT/UPDATE policy exists.
+        // Writable only via start_proctor_session/end_proctor_session/
+        // attach_identity_portrait RPCs (security definer) — no client
+        // INSERT/UPDATE policy exists.
         Insert: never;
         Update: never;
         Relationships: [];
@@ -137,6 +151,25 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      proctor_reports: {
+        Row: {
+          id: string;
+          session_id: string;
+          reason: "violation_limit_reached";
+          summary: Json;
+          generated_at: string;
+          status: ProctorReportStatus;
+          reviewed_by: string | null;
+          reviewed_at: string | null;
+          verdict: ProctorReportVerdict | null;
+        };
+        // Append-only, filed only by log_proctor_events() (security
+        // definer). reviewed_by/reviewed_at/verdict are reserved for the
+        // Phase 4 review RPC — no client UPDATE policy exists yet.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -166,7 +199,16 @@ export interface Database {
         Returns: undefined;
       };
       start_proctor_session: {
-        Args: { context: string; tier?: number };
+        // Phase 1.5: gains claimed_index_number + attested. attested must be
+        // true or the RPC raises (identity attestation gate); a mismatch
+        // between claimed_index_number and profiles.student_number logs a
+        // high-severity identity_mismatch event but never blocks creation.
+        Args: {
+          context: string;
+          tier?: number;
+          claimed_index_number?: string | null;
+          attested?: boolean;
+        };
         Returns: string;
       };
       end_proctor_session: {
@@ -175,11 +217,25 @@ export interface Database {
       };
       log_proctor_events: {
         Args: { session_id: string; events: Json };
-        Returns: undefined;
+        // Phase 1.5: returns the server's verdict on this batch so the
+        // client learns about violation-limit auto-termination without a
+        // second round-trip. See ProctorLogResult in @proctor/core.
+        Returns: {
+          accepted: boolean | number;
+          session_status: string;
+          violation_count: number;
+          violation_limit: number;
+        };
       };
       record_proctor_media: {
         Args: { session_id: string; storage_path: string; kind: string; captured_at: string };
         Returns: number;
+      };
+      attach_identity_portrait: {
+        // One-shot, owner-only, own ACTIVE session, only while
+        // identity_portrait_path is still null.
+        Args: { session_id: string; storage_path: string };
+        Returns: undefined;
       };
     };
     Enums: {
@@ -193,3 +249,4 @@ export type Profile = Database["public"]["Tables"]["profiles"]["Row"];
 export type ProctorSessionRow = Database["public"]["Tables"]["proctor_sessions"]["Row"];
 export type ProctorEventRow = Database["public"]["Tables"]["proctor_events"]["Row"];
 export type ProctorMediaRow = Database["public"]["Tables"]["proctor_media"]["Row"];
+export type ProctorReportRow = Database["public"]["Tables"]["proctor_reports"]["Row"];

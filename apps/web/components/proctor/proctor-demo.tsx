@@ -6,21 +6,36 @@ import {
   requestFullscreen,
   exitFullscreen,
   type ProctorEngine,
+  type ProctorLogResult,
   type ProctorSeverity,
   type WebcamHandle,
 } from "@proctor/core";
-import { AlertTriangle, Camera, Maximize, Minimize, PlayCircle, StopCircle } from "lucide-react";
+import {
+  AlertTriangle,
+  Camera,
+  ChevronDown,
+  FileWarning,
+  Maximize,
+  Minimize,
+  PlayCircle,
+  StopCircle,
+} from "lucide-react";
 
 import { ConsentScreen } from "@/components/proctor/consent-screen";
 import { EventFeed, type FeedEvent } from "@/components/proctor/event-feed";
+import { IdentityCheck, type IdentityCheckResult } from "@/components/proctor/identity-check";
+import { SampleQuiz } from "@/components/proctor/sample-quiz";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { createClient } from "@/lib/supabase/client";
-import { createSupabaseStorageAdapter, createSupabaseTransportAdapter } from "@/lib/proctor/supabase-adapters";
+import {
+  createSupabaseStorageAdapter,
+  createSupabaseTransportAdapter,
+} from "@/lib/proctor/supabase-adapters";
 import { notify } from "@/lib/notify";
 
-type Phase = "intro" | "consent" | "ready" | "live" | "summary";
+type Phase = "intro" | "consent" | "identity" | "ready" | "live" | "summary";
 
 const SNAPSHOT_INTERVAL_MS = 20000;
 const HEARTBEAT_INTERVAL_MS = 20000;
@@ -36,6 +51,9 @@ interface SessionSummary {
   endedAt: string;
   counts: Record<ProctorSeverity, number>;
   snapshotCount: number;
+  terminated: boolean;
+  violationCount: number;
+  violationLimit: number;
 }
 
 const TRY_THESE = [
@@ -47,19 +65,35 @@ const TRY_THESE = [
   "Right-click anywhere on the page",
 ];
 
-export function ProctorDemo() {
+interface ProctorDemoProps {
+  fullName: string | null;
+}
+
+export function ProctorDemo({ fullName }: ProctorDemoProps) {
   const [phase, setPhase] = useState<Phase>("intro");
   const [events, setEvents] = useState<FeedEvent[]>([]);
   const [thumbnails, setThumbnails] = useState<Thumbnail[]>([]);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [summary, setSummary] = useState<SessionSummary | null>(null);
+  const [terminated, setTerminated] = useState(false);
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [violationStanding, setViolationStanding] = useState<{
+    count: number;
+    limit: number;
+  } | null>(null);
 
   const webcamRef = useRef<WebcamHandle | null>(null);
   const engineRef = useRef<ProctorEngine | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const startedAtRef = useRef<string | null>(null);
-  const countsRef = useRef<Record<ProctorSeverity, number>>({ info: 0, low: 0, medium: 0, high: 0 });
+  const countsRef = useRef<Record<ProctorSeverity, number>>({
+    info: 0,
+    low: 0,
+    medium: 0,
+    high: 0,
+  });
   const snapshotTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const announcedViolationsRef = useRef(0);
 
   useEffect(() => {
     function onFullscreenChange() {
@@ -99,33 +133,102 @@ export function ProctorDemo() {
     }
   }, []);
 
-  const handleConsent = useCallback(
-    async (webcam: WebcamHandle) => {
-      webcamRef.current = webcam;
+  const finalizeSession = useCallback(
+    async (outcome: { terminated: boolean; violationCount: number; violationLimit: number }) => {
+      const sessionId = sessionIdRef.current;
       const supabase = createClient();
-      if (!supabase) {
-        await notify.error("Not configured", "Supabase is not configured in this environment.");
-        return;
+
+      if (snapshotTimerRef.current) {
+        clearInterval(snapshotTimerRef.current);
+        snapshotTimerRef.current = null;
+      }
+      engineRef.current?.stop();
+      await engineRef.current?.flush();
+      webcamRef.current?.stop();
+
+      if (!outcome.terminated && sessionId && supabase) {
+        const { error } = await supabase.rpc("end_proctor_session", { session_id: sessionId });
+        if (error) {
+          console.error("end_proctor_session failed", error);
+        }
       }
 
-      const { data: sessionId, error } = await supabase.rpc("start_proctor_session", {
-        context: "demo",
-        tier: 2,
+      if (document.fullscreenElement) {
+        await exitFullscreen();
+      }
+
+      setSummary({
+        startedAt: startedAtRef.current ?? new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        counts: { ...countsRef.current },
+        snapshotCount: thumbnails.length,
+        terminated: outcome.terminated,
+        violationCount: outcome.violationCount,
+        violationLimit: outcome.violationLimit,
       });
-      if (error || !sessionId) {
-        await notify.error("Could not start session", error?.message ?? "Unknown error");
-        return;
-      }
-
-      sessionIdRef.current = sessionId;
-      startedAtRef.current = new Date().toISOString();
-      countsRef.current = { info: 0, low: 0, medium: 0, high: 0 };
-      setEvents([]);
-      setThumbnails([]);
-      setPhase("ready");
+      setPhase("summary");
     },
-    [],
+    [thumbnails.length],
   );
+
+  const handleConsent = useCallback(() => {
+    setPhase("identity");
+  }, []);
+
+  const handleIdentityVerified = useCallback(async (result: IdentityCheckResult) => {
+    const supabase = createClient();
+    if (!supabase) {
+      await notify.error("Not configured", "Supabase is not configured in this environment.");
+      return;
+    }
+
+    // Reuse the same webcam stream IdentityCheck opened for the portrait —
+    // avoids prompting for camera access twice for one session.
+    webcamRef.current = result.webcamHandle;
+
+    const { data: sessionId, error } = await supabase.rpc("start_proctor_session", {
+      context: "demo",
+      tier: 2,
+      claimed_index_number: result.claimedIndexNumber,
+      attested: result.attested,
+    });
+    if (error || !sessionId) {
+      await notify.error("Could not start session", error?.message ?? "Unknown error");
+      return;
+    }
+
+    // Upload the identity portrait under {session_id}/... (storage RLS
+    // requires an active session owned by the caller) then link it.
+    try {
+      const path = `${sessionId}/identity-${Date.now()}.jpg`;
+      const { error: uploadError } = await supabase.storage
+        .from("proctoring")
+        .upload(path, result.portraitBlob, { contentType: "image/jpeg", upsert: false });
+      if (uploadError) throw uploadError;
+
+      const { error: attachError } = await supabase.rpc("attach_identity_portrait", {
+        session_id: sessionId,
+        storage_path: path,
+      });
+      if (attachError) throw attachError;
+    } catch (err) {
+      console.error("Identity portrait upload/attach failed", err);
+      await notify.warning(
+        "Identity photo not saved",
+        "Your session started, but the identity photo could not be uploaded. You may continue.",
+      );
+    }
+
+    sessionIdRef.current = sessionId;
+    startedAtRef.current = new Date().toISOString();
+    countsRef.current = { info: 0, low: 0, medium: 0, high: 0 };
+    announcedViolationsRef.current = 0;
+    setTerminated(false);
+    setViolationStanding(null);
+    setEvents([]);
+    setThumbnails([]);
+    setPhase("ready");
+  }, []);
 
   const handleStart = useCallback(async () => {
     const sessionId = sessionIdRef.current;
@@ -146,16 +249,45 @@ export function ProctorDemo() {
         return;
       }
       setEvents((prev) => [
-        { event_type: event.event_type, severity: event.severity, occurred_at: event.occurred_at, meta: event.meta },
+        {
+          event_type: event.event_type,
+          severity: event.severity,
+          occurred_at: event.occurred_at,
+          meta: event.meta,
+        },
         ...prev,
       ]);
 
-      if (event.severity === "high" || event.severity === "medium") {
+      if (event.severity === "high") {
+        // Transparency/fairness (DESIGN.md, PLAN.md Phase 1.5): tell the
+        // student exactly which strike this is and what triggered it,
+        // BEFORE the server's next batch response might report termination.
+        announcedViolationsRef.current += 1;
+        const ordinal = announcedViolationsRef.current;
+        void notify.examWarning(
+          `Violation ${ordinal} recorded`,
+          `${event.event_type.replace(/_/g, " ")} — this has been logged to your session.`,
+        );
+      } else if (event.severity === "medium") {
         void notify.examWarning(
           "Integrity signal recorded",
           `${event.event_type.replace(/_/g, " ")} — this has been logged to your session.`,
         );
       }
+    });
+
+    engine.onTerminated((result: ProctorLogResult) => {
+      setTerminated(true);
+      setViolationStanding({ count: result.violation_count, limit: result.violation_limit });
+      void notify.error(
+        "Session ended: violation limit reached",
+        "A report has been sent to your lecturer for review.",
+      );
+      void finalizeSession({
+        terminated: true,
+        violationCount: result.violation_count,
+        violationLimit: result.violation_limit,
+      });
     });
 
     engine.start();
@@ -166,7 +298,11 @@ export function ProctorDemo() {
 
     setPhase("live");
     await notify.toast({ title: "Monitored session started" });
-  }, [takeSnapshot]);
+  }, [finalizeSession, takeSnapshot]);
+
+  const handleQuizSubmit = useCallback(() => {
+    void finalizeSession({ terminated: false, violationCount: 0, violationLimit: 0 });
+  }, [finalizeSession]);
 
   const handleEnd = useCallback(async () => {
     const confirmed = await notify.confirm({
@@ -176,37 +312,9 @@ export function ProctorDemo() {
     });
     if (!confirmed) return;
 
-    const sessionId = sessionIdRef.current;
-    const supabase = createClient();
-
-    if (snapshotTimerRef.current) {
-      clearInterval(snapshotTimerRef.current);
-      snapshotTimerRef.current = null;
-    }
-    engineRef.current?.stop();
-    await engineRef.current?.flush();
-    webcamRef.current?.stop();
-
-    if (sessionId && supabase) {
-      const { error } = await supabase.rpc("end_proctor_session", { session_id: sessionId });
-      if (error) {
-        console.error("end_proctor_session failed", error);
-      }
-    }
-
-    if (document.fullscreenElement) {
-      await exitFullscreen();
-    }
-
-    setSummary({
-      startedAt: startedAtRef.current ?? new Date().toISOString(),
-      endedAt: new Date().toISOString(),
-      counts: { ...countsRef.current },
-      snapshotCount: thumbnails.length,
-    });
-    setPhase("summary");
+    await finalizeSession({ terminated: false, violationCount: 0, violationLimit: 0 });
     await notify.success("Session ended", "Your summary is below.");
-  }, [thumbnails.length]);
+  }, [finalizeSession]);
 
   const handleRestart = useCallback(() => {
     sessionIdRef.current = null;
@@ -214,6 +322,8 @@ export function ProctorDemo() {
     setEvents([]);
     setThumbnails([]);
     setSummary(null);
+    setTerminated(false);
+    setViolationStanding(null);
     setPhase("intro");
   }, []);
 
@@ -223,7 +333,10 @@ export function ProctorDemo() {
     } else {
       const ok = await requestFullscreen();
       if (!ok) {
-        await notify.warning("Fullscreen unavailable", "Your browser blocked or does not support fullscreen.");
+        await notify.warning(
+          "Fullscreen unavailable",
+          "Your browser blocked or does not support fullscreen.",
+        );
       }
     }
   }
@@ -240,10 +353,11 @@ export function ProctorDemo() {
         </CardHeader>
         <CardContent className="space-y-4">
           <p className="text-muted-foreground text-sm">
-            You&apos;ll consent to monitoring, check your camera, then start a short monitored
-            session. Try switching tabs, exiting fullscreen, copying text, or going offline — each
-            shows up in the live event feed with a severity level, the same way it would appear to a
-            human reviewer.
+            You&apos;ll consent to monitoring, verify your identity, check your camera, then start a
+            short monitored session with a sample quiz. Try switching tabs, exiting fullscreen,
+            copying text, or going offline — each shows up in the live event feed with a severity
+            level, the same way it would appear to a human reviewer. Three high-severity signals end
+            the session automatically, just like a real proctored exam.
           </p>
           <p className="text-muted-foreground text-sm">
             Client-side signals are evidence, not proof — a browser can always be tricked. That is
@@ -259,6 +373,10 @@ export function ProctorDemo() {
     return <ConsentScreen onConsent={handleConsent} />;
   }
 
+  if (phase === "identity") {
+    return <IdentityCheck fullName={fullName} onVerified={handleIdentityVerified} />;
+  }
+
   if (phase === "ready") {
     return (
       <Card className="mx-auto max-w-2xl">
@@ -268,8 +386,8 @@ export function ProctorDemo() {
             Ready to start
           </CardTitle>
           <CardDescription>
-            Consent recorded and camera verified. Starting will begin event capture and periodic
-            snapshots immediately.
+            Identity verified, consent recorded, and camera checked. Starting will begin event
+            capture, periodic snapshots, and the sample quiz immediately.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -284,7 +402,7 @@ export function ProctorDemo() {
 
   if (phase === "live") {
     return (
-      <div className="mx-auto max-w-4xl space-y-6">
+      <div className="mx-auto max-w-6xl space-y-6">
         <Card>
           <CardHeader className="flex-row items-center justify-between">
             <div>
@@ -295,14 +413,19 @@ export function ProctorDemo() {
                 </span>
                 Session live
               </CardTitle>
-              <CardDescription>Events and snapshots are being recorded.</CardDescription>
+              <CardDescription>
+                Events and snapshots are being recorded.
+                {violationStanding
+                  ? ` Strikes: ${violationStanding.count} of ${violationStanding.limit}.`
+                  : null}
+              </CardDescription>
             </div>
             <div className="flex gap-2">
-              <Button variant="outline" onClick={handleToggleFullscreen}>
+              <Button variant="outline" onClick={handleToggleFullscreen} disabled={terminated}>
                 {isFullscreen ? <Minimize aria-hidden /> : <Maximize aria-hidden />}
                 {isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
               </Button>
-              <Button variant="destructive" onClick={handleEnd}>
+              <Button variant="destructive" onClick={handleEnd} disabled={terminated}>
                 <StopCircle aria-hidden />
                 End session
               </Button>
@@ -310,62 +433,91 @@ export function ProctorDemo() {
           </CardHeader>
         </Card>
 
-        <div className="grid gap-6 md:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>Live event feed</CardTitle>
-              <CardDescription>Newest first. Updates announce politely to screen readers.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <EventFeed events={events} />
+        {terminated ? (
+          <Card className="border-destructive">
+            <CardContent className="flex items-start gap-3 py-4">
+              <FileWarning aria-hidden className="text-destructive mt-0.5 size-5 shrink-0" />
+              <div>
+                <p className="font-medium">Session ended: violation limit reached.</p>
+                <p className="text-muted-foreground text-sm">
+                  A report has been sent to your lecturer for review. The quiz below is now locked.
+                </p>
+              </div>
             </CardContent>
           </Card>
+        ) : null}
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Recent snapshots</CardTitle>
-              <CardDescription>Latest {MAX_THUMBNAILS}, captured every {SNAPSHOT_INTERVAL_MS / 1000}s.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {thumbnails.length === 0 ? (
-                <p className="text-muted-foreground text-sm">No snapshots captured yet.</p>
-              ) : (
-                <ul className="grid grid-cols-3 gap-2">
-                  {thumbnails.map((thumb) => (
-                    <li key={thumb.capturedAt}>
-                      {/* eslint-disable-next-line @next/next/no-img-element --
-                          local blob: URL for a just-captured snapshot; next/image
-                          optimization doesn't apply (nothing to fetch/resize
-                          remotely) and would just add overhead here. */}
-                      <img
-                        src={thumb.url}
-                        alt={`Webcam snapshot captured at ${new Date(thumb.capturedAt).toLocaleTimeString()}`}
-                        className="aspect-video w-full rounded-md border object-cover"
-                      />
+        <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
+          <SampleQuiz disabled={terminated} onSubmit={handleQuizSubmit} />
+
+          <details
+            open={panelOpen}
+            onToggle={(event) => setPanelOpen(event.currentTarget.open)}
+            className="rounded-xl border"
+          >
+            <summary
+              aria-expanded={panelOpen}
+              className="flex min-h-11 cursor-pointer select-none list-none items-center justify-between gap-2 rounded-t-xl px-4 py-3 text-sm font-medium"
+            >
+              Monitoring panel
+              <ChevronDown
+                aria-hidden
+                className={
+                  panelOpen
+                    ? "size-4 rotate-180 transition-transform"
+                    : "size-4 transition-transform"
+                }
+              />
+            </summary>
+            <div className="space-y-6 border-t px-4 py-4">
+              <section>
+                <h2 className="mb-2 text-sm font-medium">Live event feed</h2>
+                <p className="text-muted-foreground mb-2 text-xs">
+                  Newest first. Announces politely to screen readers.
+                </p>
+                <EventFeed events={events} />
+              </section>
+
+              <section>
+                <h2 className="mb-2 text-sm font-medium">Recent snapshots</h2>
+                <p className="text-muted-foreground mb-2 text-xs">
+                  Latest {MAX_THUMBNAILS}, captured every {SNAPSHOT_INTERVAL_MS / 1000}s.
+                </p>
+                {thumbnails.length === 0 ? (
+                  <p className="text-muted-foreground text-sm">No snapshots captured yet.</p>
+                ) : (
+                  <ul className="grid grid-cols-3 gap-2">
+                    {thumbnails.map((thumb) => (
+                      <li key={thumb.capturedAt}>
+                        {/* eslint-disable-next-line @next/next/no-img-element --
+                            local blob: URL for a just-captured snapshot; next/image
+                            optimization doesn't apply (nothing to fetch/resize
+                            remotely) and would just add overhead here. */}
+                        <img
+                          src={thumb.url}
+                          alt={`Webcam snapshot captured at ${new Date(thumb.capturedAt).toLocaleTimeString()}`}
+                          className="aspect-video w-full rounded-md border object-cover"
+                        />
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+
+              <section>
+                <h2 className="mb-2 text-sm font-medium">Things to try</h2>
+                <ul className="space-y-2">
+                  {TRY_THESE.map((item) => (
+                    <li key={item} className="text-muted-foreground flex items-start gap-2 text-xs">
+                      <AlertTriangle aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+                      {item}
                     </li>
                   ))}
                 </ul>
-              )}
-            </CardContent>
-          </Card>
+              </section>
+            </div>
+          </details>
         </div>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Things to try</CardTitle>
-            <CardDescription>Each of these should appear in the event feed above.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ul className="grid gap-2 sm:grid-cols-2">
-              {TRY_THESE.map((item) => (
-                <li key={item} className="text-muted-foreground flex items-start gap-2 text-sm">
-                  <AlertTriangle aria-hidden className="mt-0.5 size-4 shrink-0" />
-                  {item}
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
       </div>
     );
   }
@@ -382,10 +534,22 @@ export function ProctorDemo() {
   return (
     <Card className="mx-auto max-w-2xl">
       <CardHeader>
-        <CardTitle className="text-xl">Session summary</CardTitle>
+        <CardTitle className="text-xl">
+          {summary?.terminated ? "Session summary — submitted for review" : "Session summary"}
+        </CardTitle>
         <CardDescription>Duration: {durationLabel}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
+        {summary?.terminated ? (
+          <div className="border-destructive bg-destructive/5 flex items-start gap-3 rounded-md border p-3">
+            <FileWarning aria-hidden className="text-destructive mt-0.5 size-5 shrink-0" />
+            <p className="text-sm">
+              This session was ended automatically after reaching {summary.violationCount} of{" "}
+              {summary.violationLimit} allowed violations. A report has been filed and is pending
+              lecturer review — no automatic penalty has been applied.
+            </p>
+          </div>
+        ) : null}
         <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4">
           <div>
             <dt className="text-muted-foreground text-xs">Total events</dt>
@@ -409,7 +573,8 @@ export function ProctorDemo() {
           </div>
         </dl>
         <p className="text-muted-foreground text-sm">
-          Snapshots captured: <span className="text-foreground font-medium">{summary?.snapshotCount ?? 0}</span>
+          Snapshots captured:{" "}
+          <span className="text-foreground font-medium">{summary?.snapshotCount ?? 0}</span>
         </p>
         <Button onClick={handleRestart}>Run the demo again</Button>
       </CardContent>

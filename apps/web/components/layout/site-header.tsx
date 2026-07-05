@@ -1,5 +1,7 @@
+import Image from "next/image";
 import Link from "next/link";
 
+import { FontSizeControl } from "@/components/layout/font-size-control";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { UserMenu } from "@/components/layout/user-menu";
 
@@ -17,8 +19,16 @@ export function SiteHeader() {
   return (
     <header className="bg-background border-b">
       <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-4 py-4 sm:px-6">
-        <Link href="/" className="text-lg font-semibold tracking-tight">
-          USTED Proctoring
+        <Link href="/" className="flex items-center gap-2 text-lg font-semibold tracking-tight">
+          <Image
+            src="/aamusted-logo.png"
+            alt="AAMUSTED — University of Skills Training and Entrepreneurial Development"
+            width={160}
+            height={46}
+            className="h-10 w-auto"
+            priority
+          />
+          <span className="sr-only sm:not-sr-only">USTED Proctoring</span>
         </Link>
         <nav aria-label="Primary" className="flex flex-wrap items-center gap-1">
           {NAV_LINKS.map((link) => (
@@ -34,6 +44,7 @@ export function SiteHeader() {
         <div className="flex items-center gap-2">
           {/* Hidden when signed out (UserMenu renders null). */}
           <UserMenu />
+          <FontSizeControl />
           <ThemeToggle />
         </div>
       </div>
