@@ -48,4 +48,11 @@ describe("defaultSeverity", () => {
     // display isn't itself suspicious, just worth recording.
     expect(defaultSeverity("multi_monitor_detected")).toBe("info");
   });
+
+  it("treats display_configuration_changed (Phase 1.7) as high locally, though the server now decides for real", () => {
+    // This is only the client-local/optimistic default — the server
+    // (log_proctor_events, 20260705000004) assigns the real severity from
+    // the session's violation_policy snapshot and ignores this value.
+    expect(defaultSeverity("display_configuration_changed")).toBe("high");
+  });
 });

@@ -1008,17 +1008,30 @@ async function main() {
     );
   }
 
-  // === (l) Phase 1.6: face-presence detection events =========================
+  // === (l) Phase 1.6/1.7: face-presence detection events, server-assigned
+  // severity =================================================================
+  // Phase 1.7 changed the DEFAULT policy: no_face_detected now counts toward
+  // the violation limit by default (counts=true, severity medium) — the
+  // "students are supposed to stay on the screen" directive applies here
+  // too, same as every other violation-type event. This section overrides
+  // no_face_detected to counts=false so it can isolate the
+  // multiple_faces_detected auto-termination path exactly like before,
+  // AND separately asserts the actual new default (a fresh session with NO
+  // override counts no_face_detected as a strike).
   {
     const { client: studentClient } = sessions.student;
     const context = `smoke-test-face-detection-${Date.now()}`;
 
-    // l1. start a fresh session for this scenario.
+    // l1. start a fresh session, explicitly overriding no_face_detected to
+    // counts=false so this scenario can isolate multiple_faces_detected's
+    // termination path the same way it did before Phase 1.7's default-policy
+    // change (see l1b below for a session that keeps the new default).
     const { data: sessionId, error: startErr } = await studentClient.rpc("start_proctor_session", {
       context,
       tier: 2,
       claimed_index_number: "5201040845",
       attested: true,
+      violation_policy: { no_face_detected: { counts: false } },
     });
     record(
       "l1. student start_proctor_session succeeds for face-detection test",
@@ -1026,9 +1039,54 @@ async function main() {
       startErr?.message ?? `sessionId=${sessionId}`,
     );
 
-    // l2. no_face_detected (debounced client-side already, so the server
-    // just needs to accept the vocabulary) logs fine at medium severity and
-    // does NOT count toward the violation limit.
+    // l1b. a SEPARATE session with no override: Phase 1.7's new default
+    // policy makes no_face_detected count (medium, counts=true) — assert
+    // that default directly, independent of l1's override.
+    const { data: defaultPolicySessionId, error: defaultPolicyStartErr } = await studentClient.rpc(
+      "start_proctor_session",
+      { context: `${context}-default-policy`, tier: 2, claimed_index_number: "5201040845", attested: true },
+    );
+    if (defaultPolicyStartErr) {
+      record("l1b. Phase 1.7 default policy: no_face_detected counts by default", false, defaultPolicyStartErr.message);
+    } else {
+      const nowIsoDefault = new Date().toISOString();
+      const { data: defaultBatch, error: defaultBatchErr } = await studentClient.rpc("log_proctor_events", {
+        session_id: defaultPolicySessionId,
+        events: [
+          {
+            event_type: "no_face_detected",
+            severity: "info", // client lies about severity — server must ignore this
+            occurred_at: nowIsoDefault,
+            meta: { faceCount: 0, consecutiveMisses: 2 },
+          },
+        ],
+      });
+      record(
+        "l1b. Phase 1.7 default policy: no_face_detected counts (violation_count=1) even though the client reported severity=info",
+        !defaultBatchErr && defaultBatch?.session_status === "active" && defaultBatch?.violation_count === 1,
+        defaultBatchErr?.message ??
+          `session_status=${defaultBatch?.session_status} violation_count=${defaultBatch?.violation_count}`,
+      );
+
+      const { data: storedDefaultEvent } = await admin
+        .from("proctor_events")
+        .select("severity")
+        .eq("session_id", defaultPolicySessionId)
+        .eq("event_type", "no_face_detected")
+        .maybeSingle();
+      record(
+        "l1c. ANTI-TAMPER: stored severity is the server's policy value (medium), not the client's lied value (info)",
+        storedDefaultEvent?.severity === "medium",
+        `stored severity=${storedDefaultEvent?.severity}`,
+      );
+
+      await studentClient.rpc("end_proctor_session", { session_id: defaultPolicySessionId });
+    }
+
+    // l2. no_face_detected on the l1 session (overridden to counts=false)
+    // logs fine at its default severity (medium) but does NOT count toward
+    // the violation limit, isolating the multiple_faces_detected assertions
+    // below from this unrelated signal.
     const nowIso = new Date().toISOString();
     const { data: noFaceBatch, error: noFaceErr } = await studentClient.rpc("log_proctor_events", {
       session_id: sessionId,
@@ -1042,7 +1100,7 @@ async function main() {
       ],
     });
     record(
-      "l2. log_proctor_events accepts no_face_detected (medium) and does not bump violation_count",
+      "l2. log_proctor_events accepts no_face_detected (overridden counts=false) and does not bump violation_count",
       !noFaceErr && noFaceBatch?.session_status === "active" && noFaceBatch?.violation_count === 0,
       noFaceErr?.message ??
         `session_status=${noFaceBatch?.session_status} violation_count=${noFaceBatch?.violation_count}`,
@@ -1060,30 +1118,30 @@ async function main() {
     );
 
     // l4. multiple_faces_detected accepted at high severity and DOES count
-    // toward the violation limit — drive it to the default limit (3) with
-    // three high-severity multiple_faces_detected events and confirm
-    // auto-termination + report filing, exactly like the generic
-    // high-severity path in section (j), but exercising the new event type
-    // specifically end-to-end.
+    // toward the violation limit (default policy, unchanged by Phase 1.7 —
+    // still counts=true/severity=high) — drive it to the default limit (3)
+    // with three multiple_faces_detected events and confirm auto-termination
+    // + report filing. The client sends severity="low" here deliberately —
+    // the server must ignore it and use the policy's "high" regardless.
     const { data: batch1, error: batch1Err } = await studentClient.rpc("log_proctor_events", {
       session_id: sessionId,
       events: [
         {
           event_type: "multiple_faces_detected",
-          severity: "high",
+          severity: "low",
           occurred_at: nowIso,
           meta: { faceCount: 2 },
         },
         {
           event_type: "multiple_faces_detected",
-          severity: "high",
+          severity: "low",
           occurred_at: nowIso,
           meta: { faceCount: 2 },
         },
       ],
     });
     record(
-      "l4. two multiple_faces_detected (high) events accepted, violation_count=2, still active",
+      "l4. two multiple_faces_detected events accepted (client-reported severity=low ignored), violation_count=2, still active",
       !batch1Err && batch1?.session_status === "active" && batch1?.violation_count === 2,
       batch1Err?.message ??
         `session_status=${batch1?.session_status} violation_count=${batch1?.violation_count}`,
@@ -1094,14 +1152,14 @@ async function main() {
       events: [
         {
           event_type: "multiple_faces_detected",
-          severity: "high",
+          severity: "low",
           occurred_at: nowIso,
           meta: { faceCount: 3 },
         },
       ],
     });
     record(
-      "l5. 3rd multiple_faces_detected (high) event terminates the session (violation_limit reached)",
+      "l5. 3rd multiple_faces_detected event terminates the session (violation_limit reached)",
       !batch2Err && batch2?.session_status === "terminated" && batch2?.violation_count === 3,
       batch2Err?.message ??
         `session_status=${batch2?.session_status} violation_count=${batch2?.violation_count}`,
@@ -1116,6 +1174,19 @@ async function main() {
       "l6. proctor_sessions row is status=terminated with ended_at set",
       !sessionRowErr && sessionRow?.status === "terminated" && Boolean(sessionRow?.ended_at),
       sessionRowErr?.message ?? `status=${sessionRow?.status} ended_at=${sessionRow?.ended_at}`,
+    );
+
+    const { data: storedFacesEvents } = await admin
+      .from("proctor_events")
+      .select("severity")
+      .eq("session_id", sessionId)
+      .eq("event_type", "multiple_faces_detected");
+    record(
+      "l6b. ANTI-TAMPER: all 3 multiple_faces_detected rows stored as severity=high despite the client reporting low",
+      Array.isArray(storedFacesEvents) &&
+        storedFacesEvents.length === 3 &&
+        storedFacesEvents.every((e) => e.severity === "high"),
+      `severities=${JSON.stringify(storedFacesEvents?.map((e) => e.severity))}`,
     );
 
     const { data: reportRow, error: reportRowErr } = await admin
@@ -1134,7 +1205,7 @@ async function main() {
     );
 
     // l8. an invalid event_type is still rejected (vocabulary is an
-    // allowlist, not "anything goes now that we added two more values").
+    // allowlist, not "anything goes now that we added more values").
     const { error: invalidErr } = await studentClient.rpc("log_proctor_events", {
       session_id: sessionId,
       events: [{ event_type: "face_swap_detected", severity: "high", occurred_at: nowIso }],
@@ -1144,6 +1215,161 @@ async function main() {
       Boolean(invalidErr),
       invalidErr?.message ?? "no error raised — SECURITY: arbitrary event_type accepted",
     );
+  }
+
+  // === (m) Phase 1.7: configurable violation policy + display-change =======
+  {
+    const { client: studentClient } = sessions.student;
+    const context = `smoke-test-violation-policy-${Date.now()}`;
+
+    // m1. default_violation_policy() is readable and shapes as expected.
+    const { data: defaults, error: defaultsErr } = await studentClient.rpc("default_violation_policy");
+    record(
+      "m1. default_violation_policy() returns tab_hidden as counts=true/severity=high",
+      !defaultsErr && defaults?.tab_hidden?.counts === true && defaults?.tab_hidden?.severity === "high",
+      defaultsErr?.message ?? `tab_hidden=${JSON.stringify(defaults?.tab_hidden)}`,
+    );
+    record(
+      "m1b. default_violation_policy() returns connection_lost as counts=true/severity=medium (user directive)",
+      !defaultsErr &&
+        defaults?.connection_lost?.counts === true &&
+        defaults?.connection_lost?.severity === "medium",
+      defaultsErr?.message ?? `connection_lost=${JSON.stringify(defaults?.connection_lost)}`,
+    );
+    record(
+      "m1c. default_violation_policy() returns heartbeat as counts=false/severity=info (lifecycle, never a violation)",
+      !defaultsErr && defaults?.heartbeat?.counts === false && defaults?.heartbeat?.severity === "info",
+      defaultsErr?.message ?? `heartbeat=${JSON.stringify(defaults?.heartbeat)}`,
+    );
+
+    // m2. start_proctor_session with a partial override merges correctly:
+    // disable copy_attempt entirely, downgrade tab_hidden to low severity
+    // but keep it counting.
+    const { data: sessionId, error: startErr } = await studentClient.rpc("start_proctor_session", {
+      context,
+      tier: 2,
+      attested: true,
+      violation_policy: {
+        copy_attempt: { counts: false },
+        tab_hidden: { severity: "low" },
+      },
+    });
+    record(
+      "m2. start_proctor_session with a partial violation_policy override succeeds",
+      !startErr && typeof sessionId === "string",
+      startErr?.message ?? `sessionId=${sessionId}`,
+    );
+
+    // m3. an event whose policy was overridden to counts=false never
+    // increments violation_count, regardless of client-reported severity.
+    const nowIso = new Date().toISOString();
+    const { data: copyBatch, error: copyErr } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [{ event_type: "copy_attempt", severity: "high", occurred_at: nowIso }],
+    });
+    record(
+      "m3. copy_attempt overridden to counts=false does not bump violation_count",
+      !copyErr && copyBatch?.session_status === "active" && copyBatch?.violation_count === 0,
+      copyErr?.message ?? `violation_count=${copyBatch?.violation_count}`,
+    );
+
+    // m4. tab_hidden overridden to severity=low still COUNTS (counts was
+    // not overridden, stays true) and is stored with the overridden
+    // severity, not the client's claimed "high".
+    const { data: tabBatch, error: tabErr } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [{ event_type: "tab_hidden", severity: "high", occurred_at: nowIso }],
+    });
+    record(
+      "m4. tab_hidden (severity overridden to low, counts left at default true) bumps violation_count to 1",
+      !tabErr && tabBatch?.session_status === "active" && tabBatch?.violation_count === 1,
+      tabErr?.message ?? `violation_count=${tabBatch?.violation_count}`,
+    );
+
+    const { data: storedTabEvent } = await admin
+      .from("proctor_events")
+      .select("severity")
+      .eq("session_id", sessionId)
+      .eq("event_type", "tab_hidden")
+      .maybeSingle();
+    record(
+      "m5. stored tab_hidden severity reflects the session's override (low), not the client's claimed severity (high)",
+      storedTabEvent?.severity === "low",
+      `stored severity=${storedTabEvent?.severity}`,
+    );
+
+    // m6. an override naming an unknown event_type is rejected server-side
+    // (strict validation, not "silently ignored").
+    const { error: badKeyErr } = await studentClient.rpc("start_proctor_session", {
+      context: `${context}-bad-key`,
+      tier: 2,
+      attested: true,
+      violation_policy: { not_a_real_event_type: { counts: true } },
+    });
+    record(
+      "m6. start_proctor_session rejects a violation_policy override with an unknown event_type",
+      Boolean(badKeyErr),
+      badKeyErr?.message ?? "no error raised — SECURITY: unknown event_type override accepted",
+    );
+
+    // m7. an override with an invalid severity value is rejected.
+    const { error: badSeverityErr } = await studentClient.rpc("start_proctor_session", {
+      context: `${context}-bad-severity`,
+      tier: 2,
+      attested: true,
+      violation_policy: { tab_hidden: { severity: "catastrophic" } },
+    });
+    record(
+      "m7. start_proctor_session rejects a violation_policy override with an invalid severity value",
+      Boolean(badSeverityErr),
+      badSeverityErr?.message ?? "no error raised — SECURITY: invalid severity override accepted",
+    );
+
+    // m8. an override with a non-boolean counts value is rejected.
+    const { error: badCountsErr } = await studentClient.rpc("start_proctor_session", {
+      context: `${context}-bad-counts`,
+      tier: 2,
+      attested: true,
+      violation_policy: { tab_hidden: { counts: "yes" } },
+    });
+    record(
+      "m8. start_proctor_session rejects a violation_policy override with a non-boolean counts value",
+      Boolean(badCountsErr),
+      badCountsErr?.message ?? "no error raised — SECURITY: non-boolean counts override accepted",
+    );
+
+    // m9. display_configuration_changed is accepted by the event_type
+    // vocabulary and counts by default (Phase 1.7 new event type).
+    const { data: displayBatch, error: displayErr } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [
+        {
+          event_type: "display_configuration_changed",
+          severity: "info",
+          occurred_at: nowIso,
+          meta: { source: "screen.change" },
+        },
+      ],
+    });
+    record(
+      "m9. display_configuration_changed accepted and counts by default (violation_count=2)",
+      !displayErr && displayBatch?.session_status === "active" && displayBatch?.violation_count === 2,
+      displayErr?.message ?? `violation_count=${displayBatch?.violation_count}`,
+    );
+
+    const { data: storedDisplayEvent } = await admin
+      .from("proctor_events")
+      .select("severity")
+      .eq("session_id", sessionId)
+      .eq("event_type", "display_configuration_changed")
+      .maybeSingle();
+    record(
+      "m10. stored display_configuration_changed severity is the server default (high), not the client's claimed info",
+      storedDisplayEvent?.severity === "high",
+      `stored severity=${storedDisplayEvent?.severity}`,
+    );
+
+    await studentClient.rpc("end_proctor_session", { session_id: sessionId });
   }
 
   // === cleanup / idempotency: restore original roles ========================

@@ -145,3 +145,122 @@ export async function checkMultiMonitor(emit: Emit): Promise<void> {
   // browsers; skip it here to avoid surprising the student with a second
   // permission dialog beyond camera — screen.isExtended is best-effort only.
 }
+
+type ScreenWithDetails = Screen & {
+  isExtended?: boolean;
+  addEventListener?: (type: string, listener: () => void) => void;
+  removeEventListener?: (type: string, listener: () => void) => void;
+};
+
+type ScreenDetailsLike = {
+  addEventListener?: (type: string, listener: () => void) => void;
+  removeEventListener?: (type: string, listener: () => void) => void;
+  screens?: unknown[];
+};
+
+interface DisplaySnapshot {
+  isExtended: boolean;
+  width: number;
+  height: number;
+}
+
+function readDisplaySnapshot(): DisplaySnapshot {
+  const screenWithExtended = screen as ScreenWithDetails;
+  return {
+    isExtended: Boolean(screenWithExtended.isExtended),
+    width: screen.width,
+    height: screen.height,
+  };
+}
+
+function snapshotsDiffer(a: DisplaySnapshot, b: DisplaySnapshot): boolean {
+  return a.isExtended !== b.isExtended || a.width !== b.width || a.height !== b.height;
+}
+
+/**
+ * Phase 1.7: detects a display configuration CHANGE happening mid-session —
+ * e.g. a second monitor plugged in via HDMI/VGA/dock after the exam already
+ * started, unplugged, or resized/rearranged. Distinct from
+ * `checkMultiMonitor` (the one-shot START-of-session observation, which is
+ * never itself a violation): this collector only reports a *change* from
+ * whatever the state was when it attached, which IS the violation signal.
+ *
+ * Three independent layers, all best-effort (never a mid-exam permission
+ * prompt):
+ *   1. `screen.addEventListener('change', ...)` — fires on display geometry
+ *      changes in browsers that support it (spec: Screen "change" event).
+ *      No permission required.
+ *   2. `getScreenDetails()`'s `screenschange` event — ONLY attached if the
+ *      "window-management" permission is ALREADY granted (checked via the
+ *      Permissions API before ever calling getScreenDetails, which itself
+ *      would otherwise trigger a permission prompt — we never prompt mid-
+ *      exam, only opportunistically use a grant that already exists from
+ *      earlier in the session or a previous visit).
+ *   3. A fallback poll of `screen.isExtended` + `screen.width`/`height`
+ *      every `pollIntervalMs` (default ~10s) — catches the change even in
+ *      browsers with neither event, at the cost of coarser timing.
+ *
+ * HONEST LIMIT (PLAN.md Phase 1.7): a mirrored splitter or capture card is
+ * invisible to all of the above (the OS still reports one display) — no
+ * browser API can see it. That gap is mitigated by the webcam/gaze layer
+ * (Phase 5), not by this collector.
+ */
+export function collectDisplayChange(emit: Emit, options: { pollIntervalMs?: number } = {}): Detach {
+  const pollIntervalMs = options.pollIntervalMs ?? 10000;
+  let baseline = readDisplaySnapshot();
+  let screenDetails: ScreenDetailsLike | null = null;
+
+  function reportIfChanged(source: string) {
+    const current = readDisplaySnapshot();
+    if (snapshotsDiffer(baseline, current)) {
+      emit("display_configuration_changed", {
+        source,
+        previous: baseline,
+        current,
+      });
+      baseline = current;
+    }
+  }
+
+  function onScreenChange() {
+    reportIfChanged("screen.change");
+  }
+
+  function onScreensChange() {
+    reportIfChanged("screenschange");
+  }
+
+  const screenWithDetails = screen as ScreenWithDetails;
+  screenWithDetails.addEventListener?.("change", onScreenChange);
+
+  // getScreenDetails() itself prompts for permission if not already
+  // granted — never call it speculatively mid-exam. Only use it when the
+  // Permissions API confirms "window-management" is already 'granted'
+  // (e.g. from earlier in this same session, or a previous visit).
+  void (async () => {
+    try {
+      const nav = navigator as Navigator & {
+        permissions?: { query: (opts: { name: string }) => Promise<{ state: string }> };
+        getScreenDetails?: () => Promise<ScreenDetailsLike>;
+      };
+      if (!nav.permissions || !nav.getScreenDetails) return;
+      const status = await nav.permissions.query({ name: "window-management" });
+      if (status.state !== "granted") return;
+
+      const details = await nav.getScreenDetails();
+      screenDetails = details;
+      details.addEventListener?.("screenschange", onScreensChange);
+    } catch {
+      // Permission query unsupported, denied, or getScreenDetails rejected
+      // — the screen.change listener and poll fallback still cover us.
+    }
+  })();
+
+  const pollTimer = setInterval(() => reportIfChanged("poll"), pollIntervalMs);
+
+  return () => {
+    screenWithDetails.removeEventListener?.("change", onScreenChange);
+    screenDetails?.removeEventListener?.("screenschange", onScreensChange);
+    clearInterval(pollTimer);
+  };
+}

@@ -29,6 +29,7 @@ export {
   collectContextMenu,
   collectConnection,
   collectUnload,
+  collectDisplayChange,
   checkMultiMonitor,
 } from "./collectors";
 export { startWebcam, isWebcamSupported } from "./webcam";

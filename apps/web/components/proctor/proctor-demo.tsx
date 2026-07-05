@@ -26,6 +26,12 @@ import { EventFeed, type FeedEvent } from "@/components/proctor/event-feed";
 import { IdentityCheck, type IdentityCheckResult } from "@/components/proctor/identity-check";
 import { SampleQuiz } from "@/components/proctor/sample-quiz";
 import { ViolationHarness } from "@/components/proctor/violation-harness";
+import {
+  ViolationPolicyEditor,
+  buildDefaultPolicyState,
+  policyStateToOverrides,
+  type ViolationPolicyState,
+} from "@/components/proctor/violation-policy-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -37,7 +43,7 @@ import {
 import { createMediaPipeFaceDetectorAdapter } from "@/lib/proctor/face-detector";
 import { notify } from "@/lib/notify";
 
-type Phase = "intro" | "consent" | "identity" | "ready" | "live" | "summary";
+type Phase = "intro" | "consent" | "policy" | "identity" | "ready" | "live" | "summary";
 
 const SNAPSHOT_INTERVAL_MS = 20000;
 const HEARTBEAT_INTERVAL_MS = 20000;
@@ -86,6 +92,13 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
     limit: number;
   } | null>(null);
   const [noFaceSeverity, setNoFaceSeverity] = useState<"medium" | "high">("medium");
+  // Phase 1.7: lecturer/admin/super_admin-configurable violation policy,
+  // prefilled from the server's defaults (see violation-policy-editor.tsx).
+  // Lazy initializer so buildDefaultPolicyState() runs once per component
+  // instance, matching the faceDetector pattern just below.
+  const [violationPolicy, setViolationPolicy] = useState<ViolationPolicyState>(() =>
+    buildDefaultPolicyState(),
+  );
   // Lazy useState initializer (not a ref read during render, which the
   // react-hooks/refs rule forbids): runs exactly once per component
   // instance. createMediaPipeFaceDetectorAdapter() itself does no I/O —
@@ -205,6 +218,10 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
   );
 
   const handleConsent = useCallback(() => {
+    setPhase("policy");
+  }, []);
+
+  const handlePolicyContinue = useCallback(() => {
     setPhase("identity");
   }, []);
 
@@ -224,6 +241,13 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
       tier: 2,
       claimed_index_number: result.claimedIndexNumber,
       attested: result.attested,
+      // Phase 1.7: the policy chosen in the pre-session editor, merged over
+      // default_violation_policy() and validated server-side, then
+      // snapshotted onto this session (log_proctor_events reads it from
+      // there, never from client event payloads). In Phase 3/4, once exams
+      // exist, server code will pass the exam's lecturer-configured policy
+      // here instead of the session owner passing their own choice.
+      violation_policy: policyStateToOverrides(violationPolicy),
     });
     if (error || !sessionId) {
       await notify.error("Could not start session", error?.message ?? "Unknown error");
@@ -261,7 +285,7 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
     setEvents([]);
     setThumbnails([]);
     setPhase("ready");
-  }, []);
+  }, [violationPolicy]);
 
   const handleStart = useCallback(async () => {
     const sessionId = sessionIdRef.current;
@@ -381,6 +405,7 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
     setSummary(null);
     setTerminated(false);
     setViolationStanding(null);
+    setViolationPolicy(buildDefaultPolicyState());
     setPhase("intro");
   }, []);
 
@@ -439,6 +464,27 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
 
   if (phase === "consent") {
     return <ConsentScreen onConsent={handleConsent} />;
+  }
+
+  if (phase === "policy") {
+    return (
+      <div className="mx-auto max-w-4xl space-y-4">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-xl">Violation policy</CardTitle>
+            <CardDescription>
+              Set by whoever is responsible for this session (lecturer, admin, or super_admin — here,
+              you, standing in for that role for the demo). Review or change how each violation is
+              treated before continuing to identity verification.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+        <ViolationPolicyEditor value={violationPolicy} onChange={setViolationPolicy} />
+        <Button onClick={handlePolicyContinue} className="w-full">
+          Continue to identity verification
+        </Button>
+      </div>
+    );
   }
 
   if (phase === "identity") {
@@ -526,6 +572,7 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
           disabled={terminated}
           violationCount={violationStanding?.count ?? 0}
           violationLimit={violationStanding?.limit ?? DEFAULT_VIOLATION_LIMIT}
+          policy={violationPolicy}
           noFaceSeverity={noFaceSeverity}
           onToggleNoFaceSeverity={handleToggleNoFaceSeverity}
         />

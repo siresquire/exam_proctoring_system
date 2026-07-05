@@ -114,6 +114,8 @@ export interface Database {
           claimed_index_number: string | null;
           /** Phase 1.5: server-stamped attestation timestamp, set by start_proctor_session. */
           attested_at: string | null;
+          /** Phase 1.7: snapshot of event_type -> {severity, counts}, merged from default_violation_policy() + caller overrides at start_proctor_session time. log_proctor_events reads this, never the client payload's severity. */
+          violation_policy: Json;
         };
         // Writable only via start_proctor_session/end_proctor_session/
         // attach_identity_portrait RPCs (security definer) — no client
@@ -203,13 +205,24 @@ export interface Database {
         // true or the RPC raises (identity attestation gate); a mismatch
         // between claimed_index_number and profiles.student_number logs a
         // high-severity identity_mismatch event but never blocks creation.
+        // Phase 1.7: gains violation_policy — partial overrides merged over
+        // default_violation_policy() and validated server-side, then
+        // snapshotted onto proctor_sessions.violation_policy.
         Args: {
           context: string;
           tier?: number;
           claimed_index_number?: string | null;
           attested?: boolean;
+          violation_policy?: Json | null;
         };
         Returns: string;
+      };
+      default_violation_policy: {
+        // Phase 1.7: the server's defaults (event_type -> {severity, counts}).
+        // Immutable/pure — used both as start_proctor_session's merge base
+        // and by the policy editor UI to prefill its controls.
+        Args: Record<string, never>;
+        Returns: Json;
       };
       end_proctor_session: {
         Args: { session_id: string };

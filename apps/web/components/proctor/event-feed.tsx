@@ -7,6 +7,7 @@ import {
   Heart,
   Info,
   MinusCircle,
+  Monitor,
   MousePointerClick,
   PlugZap,
   PowerOff,
@@ -57,6 +58,7 @@ const EVENT_LABELS: Record<ProctorEvent, string> = {
   session_terminated: "Session terminated (violation limit reached)",
   no_face_detected: "No face detected",
   multiple_faces_detected: "Multiple faces detected",
+  display_configuration_changed: "Display configuration changed",
 };
 
 const EVENT_ICONS: Record<
@@ -87,6 +89,7 @@ const EVENT_ICONS: Record<
   session_terminated: XCircle,
   no_face_detected: UserX,
   multiple_faces_detected: Users,
+  display_configuration_changed: Monitor,
 };
 
 const SEVERITY_VARIANT: Record<ProctorSeverity, "secondary" | "outline" | "destructive"> = {

@@ -3,6 +3,7 @@ import {
   collectClipboard,
   collectConnection,
   collectContextMenu,
+  collectDisplayChange,
   collectFullscreen,
   collectUnload,
   collectVisibility,
@@ -178,6 +179,11 @@ export function createProctorEngine(config: ProctorEngineConfig): ProctorEngine 
         collectContextMenu(emit, { prevent: false }),
         collectConnection(emit),
         collectUnload(emit),
+        // Phase 1.7: mid-session display-configuration changes (second
+        // monitor plugged in via HDMI/VGA/dock, unplugged, or resized).
+        // Independent of checkMultiMonitor below, which only observes the
+        // START-of-session state.
+        collectDisplayChange(emit),
       ];
 
       void checkMultiMonitor(emit);

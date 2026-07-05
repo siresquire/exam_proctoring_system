@@ -52,7 +52,23 @@ export type ProctorEvent =
    * face-detector miss), but still routed to human review like every
    * other flag, never an automatic penalty.
    */
-  | "multiple_faces_detected";
+  | "multiple_faces_detected"
+  /**
+   * Phase 1.7: the display configuration changed AFTER the session
+   * started — e.g. a second monitor plugged in via HDMI/VGA/dock,
+   * unplugged, or resized/rearranged mid-exam. Distinct from
+   * `multi_monitor_detected` (the one-shot START-of-session observation,
+   * never itself a violation) — this is the mid-session CHANGE, which is
+   * the actual violation. Emitted by collectDisplayChange in collectors.ts
+   * via the Window Management API's `screenschange` event (only if
+   * permission was already granted — never prompts mid-exam) and/or a
+   * lightweight fallback poll of screen.isExtended/width/height. HONEST
+   * LIMIT (PLAN.md Phase 1.7): a mirrored splitter or capture card is
+   * invisible to this and every other browser API (the OS still reports
+   * one display) — the webcam/gaze layer (Phase 5) is the mitigation for
+   * that gap, not this collector.
+   */
+  | "display_configuration_changed";
 
 export type ProctorSeverity = "info" | "low" | "medium" | "high";
 
@@ -246,7 +262,22 @@ export interface ProctorEngine {
   flush(): Promise<void>;
 }
 
-/** Severity mapping per RESEARCH.md §3's industry taxonomy. Tier-aware: some signals escalate at higher tiers. */
+/**
+ * Severity mapping per RESEARCH.md §3's industry taxonomy. Tier-aware: some
+ * signals escalate at higher tiers.
+ *
+ * Phase 1.7 note: as of the server-assigned-severity anti-tamper fix
+ * (supabase/migrations/20260705000004_violation_policy.sql), the SERVER
+ * ignores whatever severity a client attaches to an event — it looks up
+ * event_type in the session's stored violation_policy instead, so a
+ * tampered client gains nothing by lying here. This function therefore now
+ * only affects local/optimistic behavior: what severity the live event
+ * feed displays before the next server round-trip, and (for
+ * no_face_detected/multiple_faces_detected) the debounce/threshold
+ * decisions inside engine.ts. Left unchanged as an informative default —
+ * real severity/strike-counting truth always comes from the server's
+ * response (ProctorLogResult) and the policy snapshot, never from this.
+ */
 export function defaultSeverity(event: ProctorEvent, tier: ProctorTier = 2): ProctorSeverity {
   switch (event) {
     case "tab_hidden":
@@ -276,6 +307,8 @@ export function defaultSeverity(event: ProctorEvent, tier: ProctorTier = 2): Pro
       return "high";
     case "multi_monitor_detected":
       return "info";
+    case "display_configuration_changed":
+      return "high";
     case "page_unload":
       return "medium";
     case "concurrent_session_detected":
