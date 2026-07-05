@@ -179,3 +179,33 @@ export async function reopenFormsExamAsDraft(id: string): Promise<FormsExamActio
   revalidatePath(FORMS_EXAMS_PATH);
   return { id };
 }
+
+export interface RotateSecretResult {
+  error?: string;
+  secret?: string;
+}
+
+/**
+ * Phase 2b: generates (or replaces) the per-exam shared secret the lecturer
+ * pastes into their Apps Script (apps-script/forms-proctor-crosscheck.gs).
+ * Delegates the actual generation + RLS-equivalent ownership check to the
+ * rotate_forms_exam_secret() RPC (security definer) — this action does not
+ * duplicate that check, it only re-asserts the coarse lecturer-or-higher
+ * dashboard gate that guards every action in this file.
+ */
+export async function rotateFormsExamSecret(id: string): Promise<RotateSecretResult> {
+  await requireRole("lecturer", "admin");
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { data, error } = await supabase.rpc("rotate_forms_exam_secret", { forms_exam_id: id });
+  if (error || !data) {
+    return { error: error?.message ?? "Could not generate a secret." };
+  }
+
+  revalidatePath(`${FORMS_EXAMS_PATH}/${id}/results`);
+  return { secret: data };
+}

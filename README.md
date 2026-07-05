@@ -10,6 +10,7 @@ design system and accessibility requirements (mandatory on every screen).
 apps/web            Next.js app (TypeScript, App Router, Tailwind, shadcn/ui)
 packages/proctor-core   Framework-agnostic proctoring engine (shared by System 1 & 2)
 supabase/            Supabase CLI project: config.toml, migrations/, seed.sql
+apps-script/         Google Apps Script for the Phase 2b Forms bypass-detection webhook
 docs/                Specs (RESEARCH.md, DESIGN.md)
 .github/workflows/   CI + Supabase keep-alive cron
 ```
@@ -575,14 +576,76 @@ accidentally reverted. The lesson generalizes: naming conventions are not
 access control in Postgres — every function reachable via `rpc()` needs an
 explicit `GRANT`/`REVOKE` decision, "internal" or not.
 
-### Deferred to Phase 2b
+### Bypass detection (Phase 2b)
 
-An Apps Script `onFormSubmit` trigger cross-checking the form's actual
-submission timestamp against the proctoring session (flagging
-out-of-window or unmatched submissions) is designed in PLAN.md Phase 2 but
-not yet implemented — Phase 2a ships the wrapper and exam-owned policy
-enforcement first, since that's the security-critical half; the Apps Script
-integration is an additional evidence signal, not a gate.
+Phase 2a's biggest structural gap: a student who learns the raw Google Form
+URL can skip the proctored wrapper entirely and submit unproctored, and we
+have **no way to see that submission at all** — it never touches our
+servers. Phase 2b closes part of that gap with an Apps Script
+`onFormSubmit` cross-check that runs on Google's side and reports every
+submission (wrapped or bypassed) back to the platform.
+
+**How it works.** The lecturer installs a small Apps Script
+(`apps-script/forms-proctor-crosscheck.gs`, full install steps in
+`apps-script/README.md`) directly on their Google Form. Its `onFormSubmit`
+installable trigger fires in Google's cloud after every submission and POSTs
+`{ forms_exam_id, respondent_email, submitted_at }` to
+`POST /api/forms/submission`, authenticated by a per-exam shared secret
+(`forms_exams.submission_secret`) sent as the `x-forms-secret` header. The
+lecturer generates/rotates this secret from the Results page's **"Bypass
+detection (Apps Script)"** panel (`rotate_forms_exam_secret` RPC,
+owner-or-lecturer-or-higher only) — shown once, like an API key, alongside
+the `WEBHOOK_URL`/`FORMS_EXAM_ID` values to paste into the script.
+
+**Trust model.** The route (`apps/web/app/api/forms/submission/route.ts`) is
+intentionally public/unauthenticated by session — Apps Script has no
+Supabase session to send — and trusts **exactly one thing**: a
+constant-time (`crypto.timingSafeEqual`) comparison of the supplied secret
+against the exam's stored `submission_secret`. Everything else in the body
+(`respondent_email`, `submitted_at`) is unverified input from Google's side,
+recorded and then cross-checked against our own `proctor_sessions` data —
+never taken as a claim of identity on its own. Wrong or missing secret → 401;
+unknown `forms_exam_id` → 404; the body is size- and field-capped before any
+DB write. Writes go through the service-role client
+(`lib/supabase/admin.ts`) since there is no authenticated user on the
+request to key RLS off.
+
+**Cross-check classification** (`match_forms_submission`, a
+service-role-only SQL helper — `EXECUTE` revoked from `anon`/`authenticated`,
+same lock-down pattern as `_create_proctor_session`/`20260705000006`, so a
+student cannot use it to fish for "does this email have a session"):
+resolves `respondent_email` to an `auth.users` id, finds that user's
+`proctor_sessions` row for `context = 'form:<forms_exam_id>'`, and returns
+one of four outcomes, stored on `forms_submissions.match_status`:
+
+| Status | Meaning |
+|---|---|
+| `matched` | A proctored session exists and `submitted_at` falls inside it. |
+| `out_of_window` | A session exists, but the submission timestamp is outside `[started_at, ended_at or now]`. |
+| `no_session` | **The bypass flag** — no proctored session exists at all for that email against this form. |
+| `no_email` | The submission carried no email (the form's "Collect email addresses" setting is off). |
+
+`forms_submissions` is append-only: no INSERT/UPDATE policy exists for any
+client role (only the service-role webhook writes), and an UPDATE-blocking
+trigger stops even the service role from editing a row after the fact.
+DELETE is deliberately *not* trigger-blocked (only REVOKEd from
+`anon`/`authenticated` + no RLS policy) so that deleting the parent
+`forms_exams` row can still cascade — an earlier draft of this migration
+blocked DELETE unconditionally and broke exactly that cascade, caught by the
+smoke test's `p14e` regression check.
+
+Results surface next to the proctoring sessions table
+(`forms_exam_submissions` RPC, owner-or-lecturer-gated like
+`forms_exam_sessions`): respondent email, submission/report timestamps, and
+a match-status badge that always pairs an icon with text, never color alone
+(WCAG 2.2 AA).
+
+**Honest limits** (see `docs/RESEARCH.md` §1 and `apps-script/README.md`):
+matching is by email, so it depends on the form collecting one; a
+determined student submitting via a direct API call rather than Google's
+own form-submit UI would not trigger `onFormSubmit` either. This is a
+detection/deterrence signal for lecturer review — consistent with PLAN.md
+§0 — never an automatic penalty.
 
 ## Design system review
 

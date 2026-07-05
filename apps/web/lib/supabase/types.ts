@@ -18,6 +18,9 @@ export type ProctorReportVerdict = "pass" | "escalate" | "violation";
 /** Phase 2a: forms_exams.status. draft is never visible to students; published is the only state start_forms_exam_session accepts; closed stops new sessions. */
 export type FormsExamStatus = "draft" | "published" | "closed";
 
+/** Phase 2b: forms_submissions.match_status — see the migration comment on the column for the full classification rules. */
+export type FormsSubmissionMatchStatus = "matched" | "no_session" | "out_of_window" | "no_email";
+
 export interface Database {
   public: {
     Tables: {
@@ -189,6 +192,8 @@ export interface Database {
           closes_at: string | null;
           duration_minutes: number | null;
           status: FormsExamStatus;
+          /** Phase 2b: per-exam shared secret for the Apps Script webhook (x-forms-secret header). Null until rotate_forms_exam_secret() is called. Never render this outside the one-time "generated" display — re-fetching the row later shows it again (unlike a true one-way hash), so treat it as a live secret, not just a one-time reveal. */
+          submission_secret: string | null;
           created_at: string;
           updated_at: string;
         };
@@ -203,6 +208,7 @@ export interface Database {
           closes_at?: string | null;
           duration_minutes?: number | null;
           status?: FormsExamStatus;
+          submission_secret?: string | null;
           created_at?: string;
           updated_at?: string;
         };
@@ -217,9 +223,43 @@ export interface Database {
           closes_at?: string | null;
           duration_minutes?: number | null;
           status?: FormsExamStatus;
+          submission_secret?: string | null;
           created_at?: string;
           updated_at?: string;
         };
+        Relationships: [];
+      };
+      forms_submissions: {
+        Row: {
+          id: string;
+          forms_exam_id: string;
+          respondent_email: string | null;
+          submitted_at: string | null;
+          received_at: string;
+          matched_session_id: string | null;
+          match_status: FormsSubmissionMatchStatus;
+          raw: Json;
+        };
+        // Insert exists in the type (unlike proctor_events/proctor_reports,
+        // which are RPC-only) because the ONE sanctioned writer — the
+        // webhook route (apps/web/app/api/forms/submission/route.ts) — uses
+        // the service-role client's plain `.insert()`, not an RPC. RLS still
+        // has NO insert policy for authenticated/anon at all (see the
+        // migration), so this type permissiveness does not open a new write
+        // path for any browser-facing client: the service-role client
+        // bypasses RLS by construction and is never imported into browser
+        // code (see lib/supabase/admin.ts's guard).
+        Insert: {
+          id?: string;
+          forms_exam_id: string;
+          respondent_email?: string | null;
+          submitted_at?: string | null;
+          received_at?: string;
+          matched_session_id?: string | null;
+          match_status: FormsSubmissionMatchStatus;
+          raw?: Json;
+        };
+        Update: never;
         Relationships: [];
       };
     };
@@ -331,6 +371,40 @@ export interface Database {
           has_report: boolean;
         }[];
       };
+      rotate_forms_exam_secret: {
+        // Phase 2b: generates + stores a new random submission_secret for
+        // a forms_exams row and returns it ONCE (like showing an API key at
+        // creation time) — not retrievable again except by rotating again.
+        // Owner-or-lecturer-or-higher only.
+        Args: { forms_exam_id: string };
+        Returns: string;
+      };
+      forms_exam_submissions: {
+        // Phase 2b lecturer results view: one row per Apps Script
+        // onFormSubmit webhook call recorded for this forms_exam.
+        // SELECT-guarded to the exam owner or lecturer-or-higher.
+        Args: { forms_exam_id: string };
+        Returns: {
+          submission_id: string;
+          respondent_email: string | null;
+          submitted_at: string | null;
+          received_at: string;
+          match_status: FormsSubmissionMatchStatus;
+          matched_session_id: string | null;
+        }[];
+      };
+      match_forms_submission: {
+        // Phase 2b: INTERNAL cross-check, EXECUTE revoked from
+        // anon/authenticated (service_role only, same lock-down pattern as
+        // _create_proctor_session) — called only from the webhook route via
+        // the admin (service-role) client. Classifies a hypothetical
+        // submission against proctor_sessions without writing anything.
+        Args: { forms_exam_id: string; respondent_email: string | null; submitted_at: string | null };
+        Returns: {
+          match_status: FormsSubmissionMatchStatus;
+          matched_session_id: string | null;
+        }[];
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -347,3 +421,6 @@ export type ProctorReportRow = Database["public"]["Tables"]["proctor_reports"]["
 export type FormsExamRow = Database["public"]["Tables"]["forms_exams"]["Row"];
 export type FormsExamSessionRow =
   Database["public"]["Functions"]["forms_exam_sessions"]["Returns"][number];
+export type FormsSubmissionRow = Database["public"]["Tables"]["forms_submissions"]["Row"];
+export type FormsExamSubmissionRow =
+  Database["public"]["Functions"]["forms_exam_submissions"]["Returns"][number];

@@ -1750,6 +1750,513 @@ async function main() {
     }
   }
 
+  // === (p) Phase 2b: Apps Script onFormSubmit cross-check (bypass detection)
+  // ===========================================================================
+  // Covers: rotate_forms_exam_secret is owner/lecturer-only; a student cannot
+  // SELECT forms_submissions directly (RLS); the webhook route classifies
+  // matched / no_session / out_of_window correctly; a wrong/missing secret
+  // is rejected (401); forms_exam_submissions() is owner/lecturer-gated.
+  {
+    const { client: lecturerClient } = sessions.lecturer;
+    const { client: studentClient } = sessions.student;
+    const suffix = Date.now();
+    const WEB_APP_ORIGIN = process.env.SMOKE_TEST_WEB_ORIGIN ?? "http://localhost:3000";
+    const WEBHOOK_URL = `${WEB_APP_ORIGIN}/api/forms/submission`;
+
+    // Create a published forms_exam owned by the lecturer to attach
+    // submissions/sessions to.
+    const { data: examP, error: examPErr } = await lecturerClient
+      .from("forms_exams")
+      .insert({
+        owner_id: lecturerId,
+        title: `Smoke test bypass-detection exam ${suffix}`,
+        google_form_url: `https://docs.google.com/forms/d/e/smoke-test-bypass-${suffix}/viewform?embedded=true`,
+        status: "published",
+      })
+      .select("id")
+      .single();
+    const examPId = examP?.id;
+    record(
+      "p1. lecturer creates + publishes a forms_exam for the bypass-detection test",
+      !examPErr && Boolean(examPId),
+      examPErr?.message ?? `id=${examPId}`,
+    );
+
+    // p2. rotate_forms_exam_secret: student (non-owner, non-lecturer) DENIED.
+    if (examPId) {
+      const { data: studentSecret, error: studentSecretErr } = await studentClient.rpc(
+        "rotate_forms_exam_secret",
+        { forms_exam_id: examPId },
+      );
+      record(
+        "p2. student rpc rotate_forms_exam_secret on another user's exam FAILS",
+        Boolean(studentSecretErr) && !studentSecret,
+        studentSecretErr?.message ??
+          "no error raised — SECURITY: a student generated another user's submission secret",
+      );
+    } else {
+      record("p2. student rpc rotate_forms_exam_secret on another user's exam FAILS", false, "skipped — p1 failed");
+    }
+
+    // p3. rotate_forms_exam_secret: owner (lecturer) succeeds and returns a secret.
+    let examSecret;
+    if (examPId) {
+      const { data: secret, error: secretErr } = await lecturerClient.rpc("rotate_forms_exam_secret", {
+        forms_exam_id: examPId,
+      });
+      examSecret = secret;
+      record(
+        "p3. lecturer (owner) rpc rotate_forms_exam_secret succeeds and returns a non-empty secret",
+        !secretErr && typeof secret === "string" && secret.length >= 32,
+        secretErr?.message ?? `secret_len=${secret?.length}`,
+      );
+    } else {
+      record("p3. lecturer (owner) rpc rotate_forms_exam_secret succeeds and returns a non-empty secret", false, "skipped — p1 failed");
+    }
+
+    // p4. rotate_forms_exam_secret on a nonexistent exam FAILS.
+    {
+      const { data: bogusSecret, error: bogusErr } = await lecturerClient.rpc(
+        "rotate_forms_exam_secret",
+        { forms_exam_id: "00000000-0000-0000-0000-000000000000" },
+      );
+      record(
+        "p4. rotate_forms_exam_secret on a nonexistent forms_exam FAILS",
+        Boolean(bogusErr) && !bogusSecret,
+        bogusErr?.message ?? "no error raised",
+      );
+    }
+
+    // === Case (a): a student WITH an in-window proctored session for this
+    // form, whose submission email matches -> 'matched'.
+    let matchedSessionId;
+    if (examPId) {
+      const { data: sid, error: sidErr } = await studentClient.rpc("start_forms_exam_session", {
+        forms_exam_id: examPId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      matchedSessionId = sid;
+      record(
+        "p5. student starts a proctored session against the bypass-detection exam",
+        !sidErr && typeof sid === "string",
+        sidErr?.message ?? `sessionId=${sid}`,
+      );
+    }
+
+    // Case (b): a DIFFERENT user (lecturer, standing in as "a user with no
+    // session for this form") — used below for the no_session case; no
+    // session started for them against this exam's context on purpose.
+
+    if (examPId && examSecret) {
+      // p6. Case (a) MATCHED: submit within the session window, correct secret.
+      const matchedEmail = "student@usted.test";
+      const nowIso = new Date().toISOString();
+      const resMatched = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forms-secret": examSecret },
+        body: JSON.stringify({
+          forms_exam_id: examPId,
+          respondent_email: matchedEmail,
+          submitted_at: nowIso,
+          raw: { source: "smoke-test-matched" },
+        }),
+      }).catch((err) => ({ ok: false, status: 0, _fetchError: err }));
+      record(
+        "p6a. webhook POST with correct secret + in-window submission returns 200",
+        resMatched.ok && resMatched.status === 200,
+        resMatched._fetchError?.message ?? `status=${resMatched.status}`,
+      );
+
+      const { data: matchedRow, error: matchedRowErr } = await admin
+        .from("forms_submissions")
+        .select("*")
+        .eq("forms_exam_id", examPId)
+        .eq("respondent_email", matchedEmail)
+        .order("received_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      record(
+        "p6b. cross-check classifies the in-window submission as match_status='matched'",
+        !matchedRowErr && matchedRow?.match_status === "matched" && matchedRow?.matched_session_id === matchedSessionId,
+        matchedRowErr?.message ?? `match_status=${matchedRow?.match_status} matched_session_id=${matchedRow?.matched_session_id}`,
+      );
+
+      // p7. Case (b) NO_SESSION: email of a user with NO session for this
+      // form's context at all (lecturer never started a forms-exam session
+      // against examPId) -> 'no_session' (the bypass flag).
+      const noSessionEmail = "lecturer@usted.test";
+      const resNoSession = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forms-secret": examSecret },
+        body: JSON.stringify({
+          forms_exam_id: examPId,
+          respondent_email: noSessionEmail,
+          submitted_at: new Date().toISOString(),
+          raw: { source: "smoke-test-no-session" },
+        }),
+      }).catch((err) => ({ ok: false, status: 0, _fetchError: err }));
+      record(
+        "p7a. webhook POST for a user with no proctored session returns 200",
+        resNoSession.ok && resNoSession.status === 200,
+        resNoSession._fetchError?.message ?? `status=${resNoSession.status}`,
+      );
+
+      const { data: noSessionRow, error: noSessionRowErr } = await admin
+        .from("forms_submissions")
+        .select("*")
+        .eq("forms_exam_id", examPId)
+        .eq("respondent_email", noSessionEmail)
+        .order("received_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      record(
+        "p7b. BYPASS FLAG: cross-check classifies a submission with no matching proctored session as match_status='no_session'",
+        !noSessionRowErr && noSessionRow?.match_status === "no_session" && noSessionRow?.matched_session_id === null,
+        noSessionRowErr?.message ?? `match_status=${noSessionRow?.match_status}`,
+      );
+
+      // p8. Case (c) OUT_OF_WINDOW: same matched student/session, but
+      // submitted_at is far outside [started_at, ended_at-or-now]. End the
+      // session first so it has a fixed window, then submit with a
+      // submitted_at 2 hours before it started.
+      if (matchedSessionId) {
+        await studentClient.rpc("end_proctor_session", { session_id: matchedSessionId });
+      }
+      const { data: sessionWindow } = await admin
+        .from("proctor_sessions")
+        .select("started_at, ended_at")
+        .eq("id", matchedSessionId)
+        .maybeSingle();
+      const outOfWindowTimestamp = sessionWindow?.started_at
+        ? new Date(new Date(sessionWindow.started_at).getTime() - 2 * 60 * 60 * 1000).toISOString()
+        : new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+      const resOutOfWindow = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forms-secret": examSecret },
+        body: JSON.stringify({
+          forms_exam_id: examPId,
+          respondent_email: matchedEmail,
+          submitted_at: outOfWindowTimestamp,
+          raw: { source: "smoke-test-out-of-window" },
+        }),
+      }).catch((err) => ({ ok: false, status: 0, _fetchError: err }));
+      record(
+        "p8a. webhook POST for a submission outside the session window returns 200",
+        resOutOfWindow.ok && resOutOfWindow.status === 200,
+        resOutOfWindow._fetchError?.message ?? `status=${resOutOfWindow.status}`,
+      );
+
+      const { data: outOfWindowRow, error: outOfWindowRowErr } = await admin
+        .from("forms_submissions")
+        .select("*")
+        .eq("forms_exam_id", examPId)
+        .eq("respondent_email", matchedEmail)
+        .eq("match_status", "out_of_window")
+        .order("received_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      record(
+        "p8b. cross-check classifies the out-of-window submission as match_status='out_of_window' against the same session",
+        !outOfWindowRowErr && outOfWindowRow?.match_status === "out_of_window" && outOfWindowRow?.matched_session_id === matchedSessionId,
+        outOfWindowRowErr?.message ?? `match_status=${outOfWindowRow?.match_status}`,
+      );
+
+      // p9. no_email case: blank respondent_email -> 'no_email'.
+      const resNoEmail = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forms-secret": examSecret },
+        body: JSON.stringify({
+          forms_exam_id: examPId,
+          respondent_email: null,
+          submitted_at: new Date().toISOString(),
+          raw: { source: "smoke-test-no-email" },
+        }),
+      }).catch((err) => ({ ok: false, status: 0, _fetchError: err }));
+      record(
+        "p9a. webhook POST with no respondent_email returns 200",
+        resNoEmail.ok && resNoEmail.status === 200,
+        resNoEmail._fetchError?.message ?? `status=${resNoEmail.status}`,
+      );
+
+      const { data: noEmailRow, error: noEmailRowErr } = await admin
+        .from("forms_submissions")
+        .select("*")
+        .eq("forms_exam_id", examPId)
+        .is("respondent_email", null)
+        .order("received_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      record(
+        "p9b. cross-check classifies a submission with no email as match_status='no_email'",
+        !noEmailRowErr && noEmailRow?.match_status === "no_email",
+        noEmailRowErr?.message ?? `match_status=${noEmailRow?.match_status}`,
+      );
+
+      // p10. WRONG secret is rejected with 401 and writes NOTHING.
+      const { count: countBeforeWrongSecret } = await admin
+        .from("forms_submissions")
+        .select("*", { count: "exact", head: true })
+        .eq("forms_exam_id", examPId);
+      const resWrongSecret = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forms-secret": "not-the-real-secret" },
+        body: JSON.stringify({
+          forms_exam_id: examPId,
+          respondent_email: matchedEmail,
+          submitted_at: new Date().toISOString(),
+        }),
+      }).catch((err) => ({ ok: false, status: 0, _fetchError: err }));
+      record(
+        "p10a. webhook POST with a WRONG secret is rejected with 401",
+        resWrongSecret.status === 401,
+        resWrongSecret._fetchError?.message ?? `status=${resWrongSecret.status}`,
+      );
+      const { count: countAfterWrongSecret } = await admin
+        .from("forms_submissions")
+        .select("*", { count: "exact", head: true })
+        .eq("forms_exam_id", examPId);
+      record(
+        "p10b. wrong-secret request writes no forms_submissions row",
+        countBeforeWrongSecret === countAfterWrongSecret,
+        `before=${countBeforeWrongSecret} after=${countAfterWrongSecret}`,
+      );
+
+      // p11. MISSING secret header is rejected with 401.
+      const resMissingSecret = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          forms_exam_id: examPId,
+          respondent_email: matchedEmail,
+          submitted_at: new Date().toISOString(),
+        }),
+      }).catch((err) => ({ ok: false, status: 0, _fetchError: err }));
+      record(
+        "p11. webhook POST with a MISSING secret header is rejected with 401",
+        resMissingSecret.status === 401,
+        resMissingSecret._fetchError?.message ?? `status=${resMissingSecret.status}`,
+      );
+
+      // p12. unknown forms_exam_id is rejected with 404.
+      const resUnknownExam = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forms-secret": examSecret },
+        body: JSON.stringify({
+          forms_exam_id: "00000000-0000-0000-0000-000000000000",
+          respondent_email: matchedEmail,
+          submitted_at: new Date().toISOString(),
+        }),
+      }).catch((err) => ({ ok: false, status: 0, _fetchError: err }));
+      record(
+        "p12. webhook POST for an unknown forms_exam_id is rejected with 404",
+        resUnknownExam.status === 404,
+        resUnknownExam._fetchError?.message ?? `status=${resUnknownExam.status}`,
+      );
+    } else {
+      for (const label of [
+        "p6a. webhook POST with correct secret + in-window submission returns 200",
+        "p6b. cross-check classifies the in-window submission as match_status='matched'",
+        "p7a. webhook POST for a user with no proctored session returns 200",
+        "p7b. BYPASS FLAG: cross-check classifies a submission with no matching proctored session as match_status='no_session'",
+        "p8a. webhook POST for a submission outside the session window returns 200",
+        "p8b. cross-check classifies the out-of-window submission as match_status='out_of_window' against the same session",
+        "p9a. webhook POST with no respondent_email returns 200",
+        "p9b. cross-check classifies a submission with no email as match_status='no_email'",
+        "p10a. webhook POST with a WRONG secret is rejected with 401",
+        "p10b. wrong-secret request writes no forms_submissions row",
+        "p11. webhook POST with a MISSING secret header is rejected with 401",
+        "p12. webhook POST for an unknown forms_exam_id is rejected with 404",
+      ]) {
+        record(label, false, "skipped — p1/p3 failed (exam or secret not created; is the web dev server running on SMOKE_TEST_WEB_ORIGIN?)");
+      }
+    }
+
+    // p13. RLS: a student cannot SELECT forms_submissions directly, even for
+    // an exam they themselves submitted evidence against.
+    if (examPId) {
+      const { data: studentSubmissions, error: studentSubmissionsErr } = await studentClient
+        .from("forms_submissions")
+        .select("*")
+        .eq("forms_exam_id", examPId);
+      record(
+        "p13. student direct SELECT of forms_submissions returns 0 rows (RLS)",
+        !studentSubmissionsErr && (studentSubmissions?.length ?? 0) === 0,
+        studentSubmissionsErr?.message ?? `rows=${studentSubmissions?.length}`,
+      );
+    } else {
+      record("p13. student direct SELECT of forms_submissions returns 0 rows (RLS)", false, "skipped — p1 failed");
+    }
+
+    // p14. student cannot INSERT/UPDATE/DELETE forms_submissions directly —
+    // append-only, service-role-only writer.
+    if (examPId) {
+      const { error: studentInsertErr } = await studentClient.from("forms_submissions").insert({
+        forms_exam_id: examPId,
+        respondent_email: "forged@usted.test",
+        match_status: "matched",
+      });
+      record(
+        "p14a. student direct INSERT into forms_submissions FAILS",
+        isDenied(studentInsertErr) || Boolean(studentInsertErr),
+        studentInsertErr?.message ?? "no error raised — SECURITY: a student inserted a forged submission",
+      );
+
+      const { data: anyRow } = await admin
+        .from("forms_submissions")
+        .select("id")
+        .eq("forms_exam_id", examPId)
+        .limit(1)
+        .maybeSingle();
+      if (anyRow) {
+        const { error: studentUpdateErr } = await studentClient
+          .from("forms_submissions")
+          .update({ match_status: "matched" })
+          .eq("id", anyRow.id);
+        record(
+          "p14b. student direct UPDATE of forms_submissions FAILS (append-only)",
+          isDenied(studentUpdateErr) || Boolean(studentUpdateErr),
+          studentUpdateErr?.message ?? "no error raised — SECURITY: forms_submissions is mutable",
+        );
+
+        // DELETE is blocked for a student via REVOKE + no DELETE RLS policy
+        // (not a trigger — see the migration comment: a trigger here would
+        // also break the legitimate on-delete-cascade from forms_exams).
+        const { error: studentDeleteErr } = await studentClient
+          .from("forms_submissions")
+          .delete()
+          .eq("id", anyRow.id);
+        record(
+          "p14c. student direct DELETE of forms_submissions FAILS (RLS + REVOKE, not a trigger)",
+          isDenied(studentDeleteErr) || Boolean(studentDeleteErr),
+          studentDeleteErr?.message ?? "no error raised — SECURITY: forms_submissions rows can be deleted",
+        );
+
+        // Belt-and-braces: even the SERVICE ROLE cannot UPDATE an
+        // append-only row (the trigger fires regardless of role) — this is
+        // narrower than DELETE deliberately, see p14e below.
+        const { error: adminUpdateErr } = await admin
+          .from("forms_submissions")
+          .update({ match_status: "no_session" })
+          .eq("id", anyRow.id);
+        record(
+          "p14d. even the SERVICE ROLE cannot UPDATE forms_submissions (trigger-enforced append-only)",
+          Boolean(adminUpdateErr),
+          adminUpdateErr?.message ?? "no error raised — SECURITY: forms_submissions is mutable even via service role",
+        );
+      } else {
+        record("p14b. student direct UPDATE of forms_submissions FAILS (append-only)", false, "skipped — no row to test against");
+        record("p14c. student direct DELETE of forms_submissions FAILS (RLS + REVOKE, not a trigger)", false, "skipped — no row to test against");
+        record("p14d. even the SERVICE ROLE cannot UPDATE forms_submissions (trigger-enforced append-only)", false, "skipped — no row to test against");
+      }
+    } else {
+      record("p14a. student direct INSERT into forms_submissions FAILS", false, "skipped — p1 failed");
+      record("p14b. student direct UPDATE of forms_submissions FAILS (append-only)", false, "skipped — p1 failed");
+      record("p14c. student direct DELETE of forms_submissions FAILS (RLS + REVOKE, not a trigger)", false, "skipped — p1 failed");
+      record("p14d. even the SERVICE ROLE cannot UPDATE forms_submissions (trigger-enforced append-only)", false, "skipped — p1 failed");
+    }
+
+    // p14e. REGRESSION GUARD: deleting the parent forms_exams row (a normal
+    // owner/lecturer action) must cascade-delete its forms_submissions rows
+    // without error. This is the exact case that broke during development —
+    // an earlier version of the append-only trigger blocked ALL deletes
+    // (including cascades), which made deleting a forms_exams row with
+    // submissions attached fail outright. Verified here with a SEPARATE
+    // throwaway exam so it doesn't interfere with p1..p16's examPId, which
+    // the end-of-block cleanup below also relies on cascading cleanly.
+    {
+      const { data: cascadeExam, error: cascadeExamErr } = await lecturerClient
+        .from("forms_exams")
+        .insert({
+          owner_id: lecturerId,
+          title: `Smoke test cascade-delete exam ${suffix}`,
+          google_form_url: `https://docs.google.com/forms/d/e/smoke-test-cascade-${suffix}/viewform?embedded=true`,
+          status: "published",
+        })
+        .select("id")
+        .single();
+      if (cascadeExamErr || !cascadeExam?.id) {
+        record("p14e. deleting a forms_exams row cascades to forms_submissions without error", false, cascadeExamErr?.message ?? "insert failed");
+      } else {
+        const { data: cascadeSecret } = await lecturerClient.rpc("rotate_forms_exam_secret", {
+          forms_exam_id: cascadeExam.id,
+        });
+        await fetch(WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-forms-secret": cascadeSecret ?? "" },
+          body: JSON.stringify({
+            forms_exam_id: cascadeExam.id,
+            respondent_email: "nobody@usted.test",
+            submitted_at: new Date().toISOString(),
+          }),
+        }).catch(() => {});
+
+        const { error: cascadeDeleteErr } = await admin
+          .from("forms_exams")
+          .delete()
+          .eq("id", cascadeExam.id);
+        record(
+          "p14e. deleting a forms_exams row cascades to forms_submissions without error",
+          !cascadeDeleteErr,
+          cascadeDeleteErr?.message ?? "cascade delete succeeded",
+        );
+      }
+    }
+
+    // p15. forms_exam_submissions(): lecturer (owner) sees the recorded
+    // submissions; a non-owner, non-lecturer student is denied.
+    if (examPId) {
+      const { data: ownerSubs, error: ownerSubsErr } = await lecturerClient.rpc(
+        "forms_exam_submissions",
+        { forms_exam_id: examPId },
+      );
+      record(
+        "p15a. lecturer (owner) forms_exam_submissions() returns the recorded submissions",
+        !ownerSubsErr && Array.isArray(ownerSubs) && ownerSubs.length >= 1,
+        ownerSubsErr?.message ?? `rows=${ownerSubs?.length}`,
+      );
+
+      const { error: nonOwnerSubsErr } = await studentClient.rpc("forms_exam_submissions", {
+        forms_exam_id: examPId,
+      });
+      record(
+        "p15b. student (non-owner, non-lecturer) forms_exam_submissions() FAILS",
+        Boolean(nonOwnerSubsErr),
+        nonOwnerSubsErr?.message ??
+          "no error raised — SECURITY: a student read another user's forms_submissions",
+      );
+    } else {
+      record("p15a. lecturer (owner) forms_exam_submissions() returns the recorded submissions", false, "skipped — p1 failed");
+      record("p15b. student (non-owner, non-lecturer) forms_exam_submissions() FAILS", false, "skipped — p1 failed");
+    }
+
+    // p16. SECURITY: match_forms_submission (service-role-only helper) is
+    // NOT directly callable by a signed-in student — same lock-down pattern
+    // as _create_proctor_session (20260705000006). A student calling this
+    // could otherwise fish for "does this email have a session for this
+    // form" without ever having the exam's secret.
+    {
+      const { error: directMatchErr } = await studentClient.rpc("match_forms_submission", {
+        forms_exam_id: examPId ?? "00000000-0000-0000-0000-000000000000",
+        respondent_email: "lecturer@usted.test",
+        submitted_at: new Date().toISOString(),
+      });
+      record(
+        "p16. SECURITY: student rpc('match_forms_submission', ...) directly is DENIED",
+        isDenied(directMatchErr),
+        directMatchErr?.message ??
+          "no error raised — SECURITY: the internal cross-check helper is directly callable by a student",
+      );
+    }
+
+    // Cleanup: delete everything this block created (service role bypasses RLS).
+    if (examPId) {
+      await admin.from("forms_submissions").delete().eq("forms_exam_id", examPId);
+      await admin.from("forms_exams").delete().eq("id", examPId);
+    }
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the
