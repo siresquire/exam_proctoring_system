@@ -241,10 +241,16 @@ a **security regression check**: a signed-in student calling the internal
 guards the lock-down migration (`20260705000006`) that closed a real bypass
 (Postgres/Supabase grant `EXECUTE` to `PUBLIC`/`authenticated` by default, so
 the helper was callable over PostgREST despite the leading-underscore naming
-convention, letting a student mint a session with an arbitrary policy). It
-prints PASS/FAIL per check (111 checks as of Phase 2a), restores any role
-changes it makes and deletes any `forms_exams` rows it created so it's safe
-to re-run, and exits non-zero if anything fails.
+convention, letting a student mint a session with an arbitrary policy).
+Phase 2b adds a section covering the Apps Script bypass-detection webhook
+(`rotate_forms_exam_secret` ownership gating, the wrong/missing-secret 401s,
+each `match_status` classification, `forms_submissions` append-only
+enforcement, and the `match_forms_submission` lock-down). Phase 3a adds a
+section covering classes/enrollment/onboarding — see "Classes, enrollment &
+onboarding (Phase 3a)" above for what it checks. It prints PASS/FAIL per
+check (163 checks as of Phase 3a), restores any role changes it makes and
+deletes any rows it created so it's safe to re-run, and exits non-zero if
+anything fails.
 
 ```bash
 node scripts/rls-smoke-test.mjs
@@ -646,6 +652,144 @@ determined student submitting via a direct API call rather than Google's
 own form-submit UI would not trigger `onFormSubmit` either. This is a
 detection/deterrence signal for lecturer review — consistent with PLAN.md
 §0 — never an automatic penalty.
+
+## Classes, enrollment & onboarding (Phase 3a)
+
+The onboarding tooling that lets a lecturer run a real class through the
+platform **before USTED buys a domain** — no student email address is
+required anywhere in this flow (PLAN.md "Student onboarding without a
+domain").
+
+### Classes and rosters
+
+Lecturers (and admins) create classes from **Dashboard → Classes &
+enrollment** (`create_class` RPC, lecturer-or-higher only) and open one to
+see its roster. RLS matrix (`supabase/migrations/20260705000008_classes_enrollment.sql`):
+the owner or *any* lecturer can manage a class (same "any lecturer" known
+simplification as `forms_exams`/`proctor_*` elsewhere in this codebase —
+Phase 4 scopes it to ownership/co-teaching); a student may only `SELECT`
+their **own** `class_members` row (`student_id = auth.uid()`), never a
+classmate's — the full roster with names is only readable through the
+owner-or-lecturer-gated `class_roster()` RPC.
+
+### The synthetic-email identity model
+
+There is no verified sending domain, so a student account cannot depend on
+real email. Every student created through this flow gets:
+
+- A **non-routable synthetic email**, `<10-digit index>@students.usted.local`
+  (`apps/web/lib/onboarding/student-email.ts`) — `.local` is reserved by RFC
+  6762 for link-local mDNS and is not resolvable on the public internet, so
+  even if this address ever leaked into a real "email" field somewhere,
+  nothing could be delivered to it. It exists purely as a stable internal
+  auth identifier.
+- A **crypto-random temp password** (`generateTempPassword()`,
+  `lib/onboarding/temp-password.ts` — Web Crypto `getRandomValues`, not
+  `Math.random()`, and excludes visually-confusable characters like `0/O`
+  and `1/l/I` since it's read off a printed roster and typed back in, often
+  on a phone).
+- `profiles.must_change_password = true`.
+
+The account is created via the Auth admin API
+(`apps/web/lib/onboarding/create-student.ts`, service-role only —
+`email_confirm: true` since there's no inbox to confirm from). **The
+existing index-number sign-in path (`app/login/actions.ts`,
+`resolveEmailForIndexNumber`) needs no changes at all**: it already resolves
+`profiles.student_number` → `auth.users.id` → that user's email, and the
+synthetic email is exactly what's stored there, so a brand-new student signs
+in with their index number and temp password on the very first try.
+
+**The temp password is never stored anywhere.** It's generated, used once to
+set the account's initial password, and returned to the caller in memory for
+that one request/response — there is no column, table, or log holding it.
+Losing it means calling `regenerate_temp_password` (via
+`regenerateStudentPassword` server action, lecturer/admin only), which
+re-issues a fresh one through the Auth admin API's `updateUserById` and
+re-sets `must_change_password = true`.
+
+### Forced first-login password change
+
+Any signed-in user with `profiles.must_change_password = true` is redirected
+to `/onboarding/set-password` before reaching any dashboard —
+`requireRole()` (`lib/auth.ts`) checks the flag before its role check runs,
+for every dashboard layout in the app. The page itself uses a separate
+`requireSignedIn()` (not `requireRole`) so it doesn't redirect to itself.
+Signing out is still reachable (the header's sign-out action isn't gated).
+After the student sets a new password
+(`supabase.auth.updateUser({ password })`), the self-only
+`clear_must_change_password()` RPC clears the flag — it takes no target id,
+so it can only ever clear the caller's own row. The flag itself is protected
+by `profiles_guard_update` (extended in `20260705000008`/`20260705000009`)
+so that **only** `clear_must_change_password()` or the service role can
+touch it — not even a direct PATCH by `super_admin`, since this column gates
+which password is currently trusted, not ordinary profile data. (The
+service-role carve-out is detected via the request's JWT `role` claim,
+`request.jwt.claims ->> 'role' = 'service_role'` — `current_user`/`session_user`
+both turned out to be useless for this inside a `security definer` trigger:
+`current_user` is always the function owner, and PostgREST's `authenticator`
+connection makes `session_user` identical for every request regardless of
+which key was used.)
+
+### CSV import with a validation preview
+
+From a class page, **Import students (CSV)** accepts a file with columns
+`full_name,index_number,phone` (template download button in the dialog;
+`phone` is optional). Parsing/validation
+(`apps/web/lib/onboarding/roster-csv.ts`) is dependency-free — a small
+RFC-4180-ish parser handling quoted fields, since names can contain commas —
+and runs **server-side** on every step (never trust the client's own parsed
+preview): `previewRosterImport` re-parses the raw text and flags each row as
+ready / duplicate index in the file / bad index format (`^\d{10}$`) /
+already enrolled / missing name, and **nothing is created until you
+confirm**. `commitRosterImport` re-validates again at commit time, then for
+each still-valid row creates-or-finds the student account (idempotent by
+index number — re-running the same CSV after fixing one bad row does not
+recreate or re-charge a password to already-imported students) and enrolls
+it via `enroll_existing_student` (also idempotent —
+`ON CONFLICT ON CONSTRAINT ... DO NOTHING`).
+
+### Roster export for mail-merge
+
+After an import (or after using **Reset password** on an existing student),
+**Export roster (CSV)** downloads `full_name,index_number,login_url,temp_password`
+— built client-side (`lib/onboarding/roster-export.ts`) from whatever temp
+passwords are still held in the page's component state. CSV is the required
+format (works with Google/Microsoft mail merge with no extra tooling);
+**XLSX is intentionally not included** — no spreadsheet library is in this
+repo's dependencies and CSV alone already satisfies the mail-merge use case.
+Accounts with no freshly generated password in this session show
+`(existing — use reset)` instead of a blank cell, so a lecturer never
+mistakes "no password shown" for "no password needed." The UI states
+explicitly, next to the table, that these values are shown **once**.
+
+### Pluggable SMS adapter
+
+`apps/web/lib/sms/provider.ts` defines `SmsProvider` (`send(to, message)`).
+`getSmsProvider()` returns `HubtelSmsProvider`
+(`apps/web/lib/sms/hubtel-provider.ts`) only when `HUBTEL_CLIENT_ID`,
+`HUBTEL_CLIENT_SECRET`, and `HUBTEL_SENDER` are **all** set in the
+environment (see `apps/web/.env.example`); otherwise it falls back to
+`LogSmsProvider` (`apps/web/lib/sms/log-provider.ts`) — the default in every
+environment today, since USTED has no Hubtel account yet. The log provider
+sends nothing; it records (server console) exactly what would have been
+sent and returns success, so **Send login details via SMS** in the import
+dialog can be demoed end-to-end — each recipient's outcome (sent/recorded,
+or "no phone number on file") is shown in the UI. Switching to real delivery
+later is a matter of setting the three env vars; no code changes needed.
+
+### Verifying locally
+
+The RLS smoke test's section `(q)` (`scripts/rls-smoke-test.mjs`) covers:
+`create_class` is lecturer-or-higher only; a student cannot create a class,
+read another class's members, or call `enroll_existing_student` /
+`remove_class_member` / `class_roster` on a class they don't own or teach;
+enrollment is idempotent; roster-membership RLS returns exactly the caller's
+own row; `must_change_password` cannot be set via a direct client PATCH by
+anyone (including `super_admin`) — only `clear_must_change_password()` or
+the service role; and a full onboarding round trip (service-role account
+creation → index-number login resolution → real password sign-in →
+self-service flag clear) using the exact synthetic-email scheme
+`create-student.ts` uses.
 
 ## Design system review
 

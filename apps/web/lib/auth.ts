@@ -152,19 +152,43 @@ async function fetchProfile(
   return (await res.json()) as Profile;
 }
 
+/** The one page a must-change-password user may reach before the flag is cleared. requireRole redirects here first for every other caller — see its doc comment. */
+export const SET_PASSWORD_PATH = "/onboarding/set-password";
+
+/**
+ * Requires only "signed in" — no role check, and does NOT redirect for
+ * must_change_password (unlike requireRole below). Used exclusively by
+ * SET_PASSWORD_PATH itself, which needs the session to know who it's
+ * updating but must not redirect to itself.
+ */
+export async function requireSignedIn(): Promise<SessionProfile> {
+  const session = await getSessionProfile();
+  if (!session) redirect("/login");
+  return session;
+}
+
 /**
  * Server-side role gate for dashboard layouts. UI-level only — RLS in
  * Postgres is the actual security boundary; this just keeps users on the
  * screens meant for them.
  *
  * - Unauthenticated (or Supabase unconfigured) -> redirect to /login.
- * - super_admin passes EVERY check (universal role — it can act as
+ * - Phase 3a: a signed-in user with profiles.must_change_password = true is
+ *   redirected to SET_PASSWORD_PATH before any role check runs (temp-
+ *   password accounts must change their password before touching any
+ *   dashboard). The set-password page itself uses requireSignedIn(), not
+ *   this function, so it isn't caught in its own redirect.
+ * - super_admin passes EVERY role check (universal role — it can act as
  *   admin/lecturer/student anywhere, mirroring public.has_role() in SQL).
  * - Any other role not in `roles` -> redirect to that user's own dashboard.
  */
 export async function requireRole(...roles: UserRole[]): Promise<SessionProfile> {
   const session = await getSessionProfile();
   if (!session) redirect("/login");
+
+  if (session.profile.must_change_password) {
+    redirect(SET_PASSWORD_PATH);
+  }
 
   const { role } = session.profile;
   if (role !== "super_admin" && !roles.includes(role)) {

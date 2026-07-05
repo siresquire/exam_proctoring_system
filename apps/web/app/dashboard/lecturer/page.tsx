@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { FileSpreadsheet } from "lucide-react";
+import { FileSpreadsheet, Users } from "lucide-react";
 
 import { DashboardShell } from "@/components/dashboard-shell";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,9 +7,23 @@ import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/ca
 export default function LecturerDashboard() {
   return (
     <div>
-      <div className="mx-auto max-w-6xl px-4 pt-10 sm:px-6">
+      <div className="mx-auto grid max-w-6xl gap-4 px-4 pt-10 sm:grid-cols-2 sm:px-6">
+        <Link href="/dashboard/lecturer/classes" className="block">
+          <Card className="hover:bg-muted/50 h-full transition-colors">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Users aria-hidden className="text-primary" />
+                Classes & enrollment
+              </CardTitle>
+              <CardDescription>
+                Create classes, import students by CSV, and export a roster with login details —
+                no student email address required.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+        </Link>
         <Link href="/dashboard/lecturer/forms-exams" className="block">
-          <Card className="hover:bg-muted/50 transition-colors">
+          <Card className="hover:bg-muted/50 h-full transition-colors">
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <FileSpreadsheet aria-hidden className="text-primary" />

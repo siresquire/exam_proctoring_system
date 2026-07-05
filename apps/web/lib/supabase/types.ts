@@ -37,6 +37,10 @@ export interface Database {
            * notes (string).
            */
           accommodations: Json;
+          /** Phase 3a: true for accounts created with (or re-issued) a server-generated temp password. Gates /onboarding/set-password via requireRole. Only changeable via clear_must_change_password() or the service role — never a direct client PATCH, including by super_admin. */
+          must_change_password: boolean;
+          /** Phase 3a: optional contact number for the SMS onboarding adapter (lib/sms/). Light validation only. */
+          phone: string | null;
           created_at: string;
           updated_at: string;
         };
@@ -46,6 +50,8 @@ export interface Database {
           full_name?: string | null;
           student_number?: string | null;
           accommodations?: Json;
+          must_change_password?: boolean;
+          phone?: string | null;
           created_at?: string;
           updated_at?: string;
         };
@@ -55,6 +61,8 @@ export interface Database {
           full_name?: string | null;
           student_number?: string | null;
           accommodations?: Json;
+          must_change_password?: boolean;
+          phone?: string | null;
           created_at?: string;
           updated_at?: string;
         };
@@ -262,6 +270,49 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      classes: {
+        Row: {
+          id: string;
+          owner_id: string;
+          name: string;
+          code: string | null;
+          description: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          owner_id: string;
+          name: string;
+          code?: string | null;
+          description?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          owner_id?: string;
+          name?: string;
+          code?: string | null;
+          description?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
+      class_members: {
+        Row: {
+          id: string;
+          class_id: string;
+          student_id: string;
+          created_at: string;
+        };
+        // Writable only via enroll_existing_student()/remove_class_member()
+        // RPCs (security definer) — no client INSERT/UPDATE/DELETE policy.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -405,6 +456,44 @@ export interface Database {
           matched_session_id: string | null;
         }[];
       };
+      clear_must_change_password: {
+        // Phase 3a: clears must_change_password on the CALLER's own profile
+        // only (no id parameter). Called after a successful
+        // supabase.auth.updateUser() in /onboarding/set-password.
+        Args: Record<string, never>;
+        Returns: undefined;
+      };
+      create_class: {
+        // Phase 3a: lecturer-or-higher only (has_role('lecturer')). Returns
+        // the new class id. Audit-logged.
+        Args: { name: string; code?: string | null; description?: string | null };
+        Returns: string;
+      };
+      enroll_existing_student: {
+        // Phase 3a: owner-or-lecturer-or-higher only. Upserts a
+        // class_members row; no-op if already enrolled. Rejects targets
+        // whose profile role is not 'student'.
+        Args: { class_id: string; student_id: string };
+        Returns: undefined;
+      };
+      remove_class_member: {
+        // Phase 3a: owner-or-lecturer-or-higher only. No-op if not enrolled.
+        Args: { class_id: string; student_id: string };
+        Returns: undefined;
+      };
+      class_roster: {
+        // Phase 3a: owner-or-lecturer-or-higher roster view with student
+        // full_name/student_number/phone, for the class dashboard, roster
+        // export, and SMS send flow.
+        Args: { class_id: string };
+        Returns: {
+          student_id: string;
+          full_name: string | null;
+          student_number: string | null;
+          phone: string | null;
+          enrolled_at: string;
+        }[];
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -424,3 +513,6 @@ export type FormsExamSessionRow =
 export type FormsSubmissionRow = Database["public"]["Tables"]["forms_submissions"]["Row"];
 export type FormsExamSubmissionRow =
   Database["public"]["Functions"]["forms_exam_submissions"]["Returns"][number];
+export type ClassRow = Database["public"]["Tables"]["classes"]["Row"];
+export type ClassMemberRow = Database["public"]["Tables"]["class_members"]["Row"];
+export type ClassRosterRow = Database["public"]["Functions"]["class_roster"]["Returns"][number];

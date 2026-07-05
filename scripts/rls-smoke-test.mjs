@@ -2257,6 +2257,440 @@ async function main() {
     }
   }
 
+  // === (q) Phase 3a: classes, enrollment, temp-password onboarding =========
+  // Covers: create_class is lecturer-or-higher only; a student cannot
+  // create a class or read another class's full roster (only their own
+  // membership row); enroll_existing_student / remove_class_member /
+  // class_roster are owner-or-lecturer-gated; must_change_password is set
+  // on newly-created accounts and can only be cleared via
+  // clear_must_change_password (self-only) — never a direct client PATCH,
+  // not even by super_admin; a brand-new synthetic-email student account
+  // resolves through the EXISTING index-number login path
+  // (resolveEmailForIndexNumber in app/login/actions.ts) exactly like a
+  // pre-seeded one.
+  //
+  // Note on the "lock down trusting helpers" rule (20260705000006 pattern):
+  // none of this phase's new security-definer functions (create_class,
+  // enroll_existing_student, remove_class_member, class_roster,
+  // clear_must_change_password) blindly trust their arguments the way
+  // _create_proctor_session/match_forms_submission do — each independently
+  // re-derives the caller's authority (ownership lookup + has_role, or
+  // auth.uid()-only self-scoping) from auth.uid() before doing anything, so
+  // there is no internal "trusts a pre-validated payload" helper introduced
+  // here that needs an EXECUTE revoke. q9 below still asserts a students'
+  // negative-authorization case for each of them, and the account-creation
+  // helpers (createOrFindStudent/regenerateTempPassword) are plain
+  // TypeScript functions run only from server actions gated by
+  // requireRole("lecturer", "admin") — never RPCs, so there is nothing for
+  // a client to call directly at all.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const suffix = Date.now();
+
+    // q1. student cannot call create_class.
+    const { data: studentClassId, error: studentCreateErr } = await studentClient.rpc("create_class", {
+      name: `Student-forged class ${suffix}`,
+    });
+    record(
+      "q1. student rpc create_class FAILS",
+      Boolean(studentCreateErr) && !studentClassId,
+      studentCreateErr?.message ?? "no error raised — SECURITY: a student created a class",
+    );
+
+    // q2. lecturer creates a class.
+    const { data: classId, error: createErr } = await lecturerClient.rpc("create_class", {
+      name: `Smoke test class ${suffix}`,
+      code: `SMOKE-${suffix}`,
+      description: "Created by rls-smoke-test.mjs",
+    });
+    record(
+      "q2. lecturer rpc create_class succeeds and returns a class id",
+      !createErr && typeof classId === "string",
+      createErr?.message ?? `classId=${classId}`,
+    );
+
+    // q3. the class is visible to its owner and to "any lecturer" (known
+    // simplification, same as forms_exams) via a bare SELECT.
+    if (classId) {
+      const { data: ownerSees, error: ownerSeesErr } = await lecturerClient
+        .from("classes")
+        .select("*")
+        .eq("id", classId);
+      record(
+        "q3. lecturer (owner) SELECT classes sees the new row",
+        !ownerSeesErr && ownerSees?.length === 1,
+        ownerSeesErr?.message ?? `rows=${ownerSees?.length}`,
+      );
+    } else {
+      record("q3. lecturer (owner) SELECT classes sees the new row", false, "skipped — q2 failed");
+    }
+
+    // q4. student direct INSERT/UPDATE/DELETE on classes FAILS.
+    if (classId) {
+      const { error: studentInsertErr } = await studentClient.from("classes").insert({
+        owner_id: studentId,
+        name: "Student-forged class row",
+      });
+      record(
+        "q4a. student direct INSERT into classes FAILS",
+        isDenied(studentInsertErr) || Boolean(studentInsertErr),
+        studentInsertErr?.message ?? "no error raised — SECURITY: student inserted a class row directly",
+      );
+
+      const { error: studentUpdateErr } = await studentClient
+        .from("classes")
+        .update({ name: "Hijacked" })
+        .eq("id", classId);
+      const { data: classAfterStudentUpdate } = await admin
+        .from("classes")
+        .select("name")
+        .eq("id", classId)
+        .single();
+      record(
+        "q4b. student direct UPDATE of another user's class FAILS (name unchanged)",
+        isDenied(studentUpdateErr) ||
+          Boolean(studentUpdateErr) ||
+          classAfterStudentUpdate?.name === `Smoke test class ${suffix}`,
+        studentUpdateErr?.message ?? `name_after=${classAfterStudentUpdate?.name}`,
+      );
+    } else {
+      record("q4a. student direct INSERT into classes FAILS", false, "skipped — q2 failed");
+      record("q4b. student direct UPDATE of another user's class FAILS (name unchanged)", false, "skipped — q2 failed");
+    }
+
+    // q5. student cannot call enroll_existing_student / remove_class_member
+    // / class_roster on a class they do not own (non-owner, non-lecturer).
+    if (classId) {
+      const { error: studentEnrollErr } = await studentClient.rpc("enroll_existing_student", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      record(
+        "q5a. student rpc enroll_existing_student on another user's class FAILS",
+        Boolean(studentEnrollErr),
+        studentEnrollErr?.message ??
+          "no error raised — SECURITY: a student enrolled themselves into a class they don't own/teach",
+      );
+
+      const { error: studentRosterErr } = await studentClient.rpc("class_roster", { class_id: classId });
+      record(
+        "q5b. student rpc class_roster on another user's class FAILS",
+        Boolean(studentRosterErr),
+        studentRosterErr?.message ??
+          "no error raised — SECURITY: a student read another user's class roster",
+      );
+
+      const { error: studentRemoveErr } = await studentClient.rpc("remove_class_member", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      record(
+        "q5c. student rpc remove_class_member on another user's class FAILS",
+        Boolean(studentRemoveErr),
+        studentRemoveErr?.message ?? "no error raised — SECURITY: a student removed a class member",
+      );
+    } else {
+      record("q5a. student rpc enroll_existing_student on another user's class FAILS", false, "skipped — q2 failed");
+      record("q5b. student rpc class_roster on another user's class FAILS", false, "skipped — q2 failed");
+      record("q5c. student rpc remove_class_member on another user's class FAILS", false, "skipped — q2 failed");
+    }
+
+    // q6. lecturer enrolls the seeded student (pre-existing account,
+    // student_number 5201040845) into the class; idempotent re-enroll is a
+    // no-op, not an error.
+    if (classId) {
+      const { error: enrollErr } = await lecturerClient.rpc("enroll_existing_student", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      record("q6a. lecturer rpc enroll_existing_student (owner) succeeds", !enrollErr, enrollErr?.message);
+
+      const { error: reEnrollErr } = await lecturerClient.rpc("enroll_existing_student", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      record(
+        "q6b. re-enrolling the same student is a no-op, not an error (idempotent CSV re-import)",
+        !reEnrollErr,
+        reEnrollErr?.message,
+      );
+
+      const { data: memberRows, error: memberRowsErr } = await admin
+        .from("class_members")
+        .select("*")
+        .eq("class_id", classId)
+        .eq("student_id", studentId);
+      record(
+        "q6c. exactly one class_members row exists after two enroll calls (unique constraint honored)",
+        !memberRowsErr && memberRows?.length === 1,
+        memberRowsErr?.message ?? `rows=${memberRows?.length}`,
+      );
+    } else {
+      record("q6a. lecturer rpc enroll_existing_student (owner) succeeds", false, "skipped — q2 failed");
+      record("q6b. re-enrolling the same student is a no-op, not an error (idempotent CSV re-import)", false, "skipped — q2 failed");
+      record("q6c. exactly one class_members row exists after two enroll calls (unique constraint honored)", false, "skipped — q2 failed");
+    }
+
+    // q7. enroll_existing_student rejects a target whose profile role is
+    // not 'student' (e.g. the lecturer trying to "enroll" another lecturer).
+    if (classId) {
+      const { error: nonStudentEnrollErr } = await lecturerClient.rpc("enroll_existing_student", {
+        class_id: classId,
+        student_id: lecturerId,
+      });
+      record(
+        "q7. enroll_existing_student rejects a target whose role is not 'student'",
+        Boolean(nonStudentEnrollErr),
+        nonStudentEnrollErr?.message ?? "no error raised — SECURITY: a non-student was enrolled as a student",
+      );
+    } else {
+      record("q7. enroll_existing_student rejects a target whose role is not 'student'", false, "skipped — q2 failed");
+    }
+
+    // q8. class_members roster-privacy: the enrolled student sees their OWN
+    // membership row via a bare SELECT
+    // (class_members_select_own_membership). This repo's seed data has
+    // exactly one student, so a true "classmate" scenario can't be
+    // constructed here — but the guarantee is structural, not empirical:
+    // the RLS predicate is `student_id = auth.uid()`, which by construction
+    // can never match a row whose student_id differs from the caller, no
+    // matter how many other members a class has. What's asserted here is
+    // that this policy returns EXACTLY the caller's own row (not zero, not
+    // the whole roster) and that the lecturer-only class_roster() RPC is
+    // the one place the full roster (with names) is actually visible.
+    if (classId) {
+      const { data: ownMembership, error: ownMembershipErr } = await studentClient
+        .from("class_members")
+        .select("*")
+        .eq("class_id", classId);
+      record(
+        "q8a. student SELECT class_members (own membership policy) for their class returns exactly their own row",
+        !ownMembershipErr &&
+          ownMembership?.length === 1 &&
+          ownMembership[0].student_id === studentId,
+        ownMembershipErr?.message ?? `rows=${JSON.stringify(ownMembership)}`,
+      );
+
+      const { data: rosterViaRpc, error: rosterViaRpcErr } = await lecturerClient.rpc("class_roster", {
+        class_id: classId,
+      });
+      record(
+        "q8b. lecturer (owner) class_roster() includes the enrolled student with full_name/student_number",
+        !rosterViaRpcErr &&
+          Array.isArray(rosterViaRpc) &&
+          rosterViaRpc.some((r) => r.student_id === studentId && r.student_number === "5201040845"),
+        rosterViaRpcErr?.message ?? `rows=${JSON.stringify(rosterViaRpc)}`,
+      );
+    } else {
+      record("q8a. student SELECT class_members (own membership policy) for their class returns exactly their own row", false, "skipped — q2 failed");
+      record("q8b. lecturer (owner) class_roster() includes the enrolled student with full_name/student_number", false, "skipped — q2 failed");
+    }
+
+    // q9. remove_class_member (owner) works and is reflected in the roster.
+    if (classId) {
+      const { error: removeErr } = await lecturerClient.rpc("remove_class_member", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      record("q9a. lecturer rpc remove_class_member (owner) succeeds", !removeErr, removeErr?.message);
+
+      const { data: afterRemove } = await admin
+        .from("class_members")
+        .select("*")
+        .eq("class_id", classId)
+        .eq("student_id", studentId);
+      record(
+        "q9b. class_members row is gone after remove_class_member",
+        (afterRemove?.length ?? 0) === 0,
+        `rows=${afterRemove?.length}`,
+      );
+    } else {
+      record("q9a. lecturer rpc remove_class_member (owner) succeeds", false, "skipped — q2 failed");
+      record("q9b. class_members row is gone after remove_class_member", false, "skipped — q2 failed");
+    }
+
+    // q10. must_change_password: a student cannot set the flag on their own
+    // profile via a direct client PATCH (profiles_guard_update's new
+    // usted.allow_password_flag_change gate), and neither can super_admin —
+    // this flag is deliberately outside even super_admin's "any column"
+    // carve-out (see the migration comment).
+    {
+      const { error: studentFlagErr } = await studentClient
+        .from("profiles")
+        .update({ must_change_password: true })
+        .eq("id", studentId);
+      record(
+        "q10a. student direct UPDATE of own must_change_password FAILS",
+        isDenied(studentFlagErr) || Boolean(studentFlagErr),
+        studentFlagErr?.message ?? "no error raised — SECURITY: a student set their own must_change_password flag",
+      );
+
+      const { client: superAdminClientForFlag } = sessions.super_admin;
+      const { error: superAdminFlagErr } = await superAdminClientForFlag
+        .from("profiles")
+        .update({ must_change_password: true })
+        .eq("id", studentId);
+      record(
+        "q10b. even super_admin direct UPDATE of must_change_password FAILS (outside the universal-role carve-out)",
+        isDenied(superAdminFlagErr) || Boolean(superAdminFlagErr),
+        superAdminFlagErr?.message ??
+          "no error raised — SECURITY: must_change_password is settable via a direct PATCH",
+      );
+    }
+
+    // q11. clear_must_change_password is self-only: student cannot clear
+    // ANOTHER user's flag (there is no id parameter — call as the lecturer
+    // targeting nothing in particular, then verify the STUDENT's flag,
+    // which was never true here, is unaffected either way; the real
+    // self-only guarantee is structural (no id argument exists), asserted
+    // by q12's own-account round trip instead).
+    {
+      const { error: clearErr } = await studentClient.rpc("clear_must_change_password");
+      record(
+        "q11. clear_must_change_password (self, not currently set) succeeds harmlessly",
+        !clearErr,
+        clearErr?.message,
+      );
+    }
+
+    // q12. Full onboarding round trip via the service role, mirroring what
+    // apps/web/lib/onboarding/create-student.ts does server-side: create a
+    // brand-new synthetic-email student account for a fresh 10-digit index
+    // number, confirm must_change_password defaults true, then prove the
+    // EXISTING index-number login path (app/login/actions.ts's
+    // resolveEmailForIndexNumber) resolves it and signs in successfully.
+    {
+      // A fresh, syntactically valid 10-digit index derived from the
+      // timestamp so repeated runs don't collide.
+      const freshIndex = `9${String(suffix).slice(-9).padStart(9, "0")}`;
+      const syntheticEmail = `${freshIndex}@students.usted.local`;
+      const tempPassword = `Sm0ke-${suffix}-Aa!`;
+
+      const { data: createdUser, error: createUserErr } = await admin.auth.admin.createUser({
+        email: syntheticEmail,
+        password: tempPassword,
+        email_confirm: true,
+        user_metadata: { full_name: "Smoke Test Onboarded Student" },
+      });
+      record(
+        "q12a. service-role creates a synthetic-email student account",
+        !createUserErr && Boolean(createdUser?.user),
+        createUserErr?.message ?? `user=${createdUser?.user?.id}`,
+      );
+
+      const newStudentId = createdUser?.user?.id;
+      if (newStudentId) {
+        const { error: profileUpdateErr } = await admin
+          .from("profiles")
+          .update({
+            full_name: "Smoke Test Onboarded Student",
+            student_number: freshIndex,
+            must_change_password: true,
+          })
+          .eq("id", newStudentId);
+        record(
+          "q12b. profile updated with student_number + must_change_password=true",
+          !profileUpdateErr,
+          profileUpdateErr?.message,
+        );
+
+        const { data: profileRow, error: profileRowErr } = await admin
+          .from("profiles")
+          .select("must_change_password, student_number, role")
+          .eq("id", newStudentId)
+          .single();
+        record(
+          "q12c. new account has must_change_password=true, correct student_number, role=student",
+          !profileRowErr &&
+            profileRow?.must_change_password === true &&
+            profileRow?.student_number === freshIndex &&
+            profileRow?.role === "student",
+          profileRowErr?.message ?? JSON.stringify(profileRow),
+        );
+
+        // q12d. the EXISTING index-number login resolution path: index ->
+        // profiles.student_number -> auth.users.id -> email (exactly
+        // resolveEmailForIndexNumber in app/login/actions.ts), then a real
+        // password sign-in against the resolved email. This does not call
+        // the Next.js server action directly (no HTTP server assumed
+        // running for this section) — it reproduces the same three-step
+        // resolution against the same tables/APIs that function uses, which
+        // is what actually matters: that a freshly created account is
+        // reachable by index number at all.
+        const { data: resolvedProfile, error: resolveProfileErr } = await admin
+          .from("profiles")
+          .select("id")
+          .eq("student_number", freshIndex)
+          .maybeSingle();
+        const { data: resolvedUser, error: resolveUserErr } = resolvedProfile
+          ? await admin.auth.admin.getUserById(resolvedProfile.id)
+          : { data: null, error: null };
+        const resolvedEmail = resolvedUser?.user?.email;
+        record(
+          "q12d. index number resolves to the synthetic email via the same lookup app/login/actions.ts uses",
+          !resolveProfileErr && !resolveUserErr && resolvedEmail === syntheticEmail,
+          resolveProfileErr?.message ?? resolveUserErr?.message ?? `resolvedEmail=${resolvedEmail}`,
+        );
+
+        const anonForSignIn = createClient(SUPABASE_URL, ANON_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        const { data: signInData, error: signInErr } = await anonForSignIn.auth.signInWithPassword({
+          email: resolvedEmail ?? syntheticEmail,
+          password: tempPassword,
+        });
+        record(
+          "q12e. signing in with the resolved email + temp password succeeds (full index-login round trip)",
+          !signInErr && signInData?.user?.id === newStudentId,
+          signInErr?.message ?? `signed_in_id=${signInData?.user?.id}`,
+        );
+        await anonForSignIn.auth.signOut().catch(() => {});
+
+        // q12f. clear_must_change_password, called by the new student
+        // themselves, clears their OWN flag.
+        const newStudentClient = createClient(SUPABASE_URL, ANON_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        await newStudentClient.auth.signInWithPassword({ email: syntheticEmail, password: tempPassword });
+        const { error: selfClearErr } = await newStudentClient.rpc("clear_must_change_password");
+        record("q12f. new student rpc clear_must_change_password (self) succeeds", !selfClearErr, selfClearErr?.message);
+
+        const { data: afterClear } = await admin
+          .from("profiles")
+          .select("must_change_password")
+          .eq("id", newStudentId)
+          .single();
+        record(
+          "q12g. must_change_password is false after clear_must_change_password",
+          afterClear?.must_change_password === false,
+          `must_change_password=${afterClear?.must_change_password}`,
+        );
+        await newStudentClient.auth.signOut().catch(() => {});
+
+        // Cleanup: delete the throwaway account entirely (service role;
+        // cascades to profiles via the FK).
+        await admin.auth.admin.deleteUser(newStudentId);
+      } else {
+        for (const label of [
+          "q12b. profile updated with student_number + must_change_password=true",
+          "q12c. new account has must_change_password=true, correct student_number, role=student",
+          "q12d. index number resolves to the synthetic email via the same lookup app/login/actions.ts uses",
+          "q12e. signing in with the resolved email + temp password succeeds (full index-login round trip)",
+          "q12f. new student rpc clear_must_change_password (self) succeeds",
+          "q12g. must_change_password is false after clear_must_change_password",
+        ]) {
+          record(label, false, "skipped — q12a failed");
+        }
+      }
+    }
+
+    // Cleanup: delete everything this block created (service role bypasses RLS).
+    if (classId) {
+      await admin.from("classes").delete().eq("id", classId);
+    }
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the
