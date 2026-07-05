@@ -229,9 +229,21 @@ students cannot), `start_proctor_session` refusing unattested sessions,
 server-assigned-severity anti-tamper property (a client-claimed severity is
 overridden by the session's policy), custom-policy overrides (an event set to
 `counts: false` does not terminate), `violation_policy` validation, and
-`display_configuration_changed` counting by default. It prints PASS/FAIL per
-check (90 checks as of Phase 1.7), restores any role changes it makes so it's
-safe to re-run, and exits non-zero if anything fails.
+`display_configuration_changed` counting by default. Phase 2a adds a section
+covering `forms_exams` RLS (draft invisible to students, published+open
+visible), `start_forms_exam_session`'s exam-owned tier/policy enforcement
+(refuses on draft/closed/out-of-window, and the created session's
+`violation_policy`/`integrity_tier` provably come from the exam row, not the
+caller), the `forms_exam_sessions` results RPC's owner-or-lecturer guard, and
+a **security regression check**: a signed-in student calling the internal
+`_create_proctor_session` helper directly via `rpc()` must be denied — this
+guards the lock-down migration (`20260705000006`) that closed a real bypass
+(Postgres/Supabase grant `EXECUTE` to `PUBLIC`/`authenticated` by default, so
+the helper was callable over PostgREST despite the leading-underscore naming
+convention, letting a student mint a session with an arbitrary policy). It
+prints PASS/FAIL per check (111 checks as of Phase 2a), restores any role
+changes it makes and deletes any `forms_exams` rows it created so it's safe
+to re-run, and exits non-zero if anything fails.
 
 ```bash
 node scripts/rls-smoke-test.mjs
@@ -446,6 +458,131 @@ test (a client sending `severity: info` for a `tab_hidden` still gets stored
 These are exactly what **Tier 4 + Safe Exam Browser** (Phase 6) exists for;
 in-browser we catch only their side effects (focus flapping, display changes),
 and the webcam/face layer covers the rest.
+
+## System 1 — proctored Google Forms wrapper (Phase 2a)
+
+System 1 wraps an ordinary Google Form with the same proctoring engine used
+throughout this repo, without touching the form itself. It ships ahead of the
+full exam platform (System 2, Phase 3+) because a lecturer can be using it
+this week.
+
+### Lecturer flow
+
+1. `/dashboard/lecturer/forms-exams` → **New Forms quiz**
+   (`apps/web/components/forms/forms-exam-form.tsx`): title, the Google Form's
+   response link, an integrity tier (T1–T4, PLAN.md §2), an optional
+   opens/closes window and duration, and the same `ViolationPolicyEditor` the
+   Phase 1.5/1.7 demo uses — reused wholesale, not reimplemented.
+2. The pasted URL is normalized both client-side (immediate feedback) and
+   server-side (`apps/web/lib/forms/google-form-url.ts`, called again in the
+   `createFormsExam`/`updateFormsExam` server actions — never trust the
+   client's normalization). It accepts the standard
+   `.../forms/d/e/<id>/viewform` share link, strips tracking params, and
+   rewrites it to `.../viewform?embedded=true` (Google's documented iframe
+   query param). The **edit** link (`.../edit`) and `forms.gle` short links
+   are explicitly rejected with guidance, since both are common copy-paste
+   mistakes that would either leak the lecturer's authoring URL or need a
+   server-side redirect fetch this function deliberately avoids.
+3. Saved as `status = 'draft'` — invisible to students regardless of the
+   window (`forms_exams` RLS, see below) — until the lecturer clicks
+   **Publish** from the list. **Copy link** gives the student URL
+   (`/exam/forms/<id>`); **Close** stops new sessions without affecting
+   already-open ones; **Reopen as draft** undoes an accidental close.
+4. **Results** (`/dashboard/lecturer/forms-exams/<id>/results`) lists every
+   proctoring session started against that quiz via the `forms_exam_sessions`
+   RPC: student name/index number, session status, strikes (`violation_count`
+   / `violation_limit`), start/end times, and whether a `proctor_reports` row
+   exists (pending human review). This is deliberately thin — it links to the
+   event history in Studio for now rather than reimplementing Phase 4's
+   review workspace.
+
+### Student flow
+
+`/exam/forms/<id>` runs the same phase machine as `/proctor-demo` (consent →
+identity verification → live monitoring → summary), built from the identical
+Phase 1/1.5/1.6 components (`ConsentScreen`, `IdentityCheck`, `EventFeed`,
+the MediaPipe face-detector adapter) — but the **exam's own Google Form**
+renders inside the live-monitoring iframe instead of a sample quiz, and there
+is no policy-editing step: the tier and violation policy are fixed by the
+lecturer and loaded server-side (see below). When finished, the student
+clicks **"I have submitted the form"**, confirms via a `notify.confirm`
+dialog, and gets a session summary (event counts by severity, snapshot
+count).
+
+### The honest cross-origin limitation
+
+The Google Form runs entirely on Google's servers inside a cross-origin
+iframe. We structurally **cannot** read its questions, the student's answers,
+or detect Google's own submit action — the wrapper monitors the *exam
+environment* (tab switches, window focus, fullscreen exits, clipboard use,
+webcam presence, extra displays), exactly the same signals used everywhere
+else in this platform, and nothing more. This is disclosed to the student on
+the intro screen and again as a persistent notice during the live session,
+and it is why submission is a manual, self-reported step rather than an
+automatic detection — Phase 2b's `onFormSubmit` Apps Script cross-check
+(below) narrows this gap but can never close it entirely.
+
+### Embedding caveat and the graceful fallback
+
+A Google Form only embeds in an iframe if it is public ("Anyone with the
+link can respond"). A form restricted to signed-in users within an
+organization sends `X-Frame-Options`/refuses the embed via Google's own
+login redirect, and the iframe simply never fires its `load` event — there is
+no cross-origin-safe way to inspect *why* it failed. The wrapper
+(`apps/web/components/forms/forms-exam-wrapper.tsx`) handles this with a
+timeout (8s from entering the live phase): if `load` hasn't fired by then, it
+assumes the embed was blocked and swaps in a fallback panel with an "open the
+form in this monitored window" link (`target="_self"`, so it navigates within
+the same monitored tab rather than opening a new one proctor-core can't see).
+Monitoring keeps running throughout either way.
+
+### Tier and violation policy are exam-owned, enforced server-side
+
+The single most important security property of Phase 2a: **the student has
+no way to choose or override the tier or violation policy for a Forms exam.**
+`start_forms_exam_session(forms_exam_id, claimed_index_number, attested)`
+has no `tier`/`violation_policy` parameter at all — it loads both from the
+`forms_exams` row server-side and refuses unless `status = 'published'` and
+`now()` is inside `[opens_at, closes_at]`. This is structural, not a
+convention: even a fully hostile client cannot pass a different policy in,
+because there is nothing in the function's signature to pass it through.
+
+Under the hood, `start_proctor_session` (the Phase 1 demo/self-service path,
+which *does* accept a caller-supplied policy override) and
+`start_forms_exam_session` both delegate the actual row-creation work
+(concurrent-session abandon+flag, insert, `session_start` event, identity
+cross-check) to a shared internal helper, `public._create_proctor_session`.
+That helper does **no** policy validation itself — it trusts whatever
+tier/policy it's handed, because its only intended callers are the two
+functions above, which each produce a validated/trusted policy before
+delegating.
+
+**This shared-helper design initially shipped with a real security hole**
+(migration `20260705000005`): Postgres grants `EXECUTE` on new functions to
+`PUBLIC` by default, and Supabase additionally grants it to
+`anon`/`authenticated` — so despite the leading-underscore "internal, don't
+call this" naming convention, `_create_proctor_session` was directly
+reachable over PostgREST (`rpc('_create_proctor_session', {...})`) by any
+signed-in student, who could hand it an all-`counts:false` policy and get
+back a live session that could never hit the violation limit, completely
+bypassing the exam-owned guarantee above. Migration
+`20260705000006_lock_down_create_proctor_session_helper.sql` fixes this with
+a single `REVOKE EXECUTE ... FROM PUBLIC, anon, authenticated`; the two
+security-definer callers are unaffected (they execute as the function owner,
+which retains its own `EXECUTE` grant). The RLS smoke test's Phase 2a section
+asserts this directly and will fail loudly if the lock-down is ever
+accidentally reverted. The lesson generalizes: naming conventions are not
+access control in Postgres — every function reachable via `rpc()` needs an
+explicit `GRANT`/`REVOKE` decision, "internal" or not.
+
+### Deferred to Phase 2b
+
+An Apps Script `onFormSubmit` trigger cross-checking the form's actual
+submission timestamp against the proctoring session (flagging
+out-of-window or unmatched submissions) is designed in PLAN.md Phase 2 but
+not yet implemented — Phase 2a ships the wrapper and exam-owned policy
+enforcement first, since that's the security-critical half; the Apps Script
+integration is an additional evidence signal, not a gate.
 
 ## Design system review
 

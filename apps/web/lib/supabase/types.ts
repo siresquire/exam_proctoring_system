@@ -15,6 +15,9 @@ export type ProctorSeverity = "info" | "low" | "medium" | "high";
 export type ProctorReportStatus = "pending_review" | "reviewed";
 export type ProctorReportVerdict = "pass" | "escalate" | "violation";
 
+/** Phase 2a: forms_exams.status. draft is never visible to students; published is the only state start_forms_exam_session accepts; closed stops new sessions. */
+export type FormsExamStatus = "draft" | "published" | "closed";
+
 export interface Database {
   public: {
     Tables: {
@@ -172,6 +175,53 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      forms_exams: {
+        Row: {
+          id: string;
+          owner_id: string;
+          title: string;
+          /** Normalized to the embeddable form (".../viewform?embedded=true") server-side — see lib/forms/google-form-url.ts. Never trust an un-normalized value from the client. */
+          google_form_url: string;
+          integrity_tier: number;
+          /** Lecturer-chosen policy snapshotted onto every session start_forms_exam_session creates for this exam. The student never supplies this. */
+          violation_policy: Json;
+          opens_at: string | null;
+          closes_at: string | null;
+          duration_minutes: number | null;
+          status: FormsExamStatus;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          owner_id: string;
+          title: string;
+          google_form_url: string;
+          integrity_tier?: number;
+          violation_policy?: Json;
+          opens_at?: string | null;
+          closes_at?: string | null;
+          duration_minutes?: number | null;
+          status?: FormsExamStatus;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          owner_id?: string;
+          title?: string;
+          google_form_url?: string;
+          integrity_tier?: number;
+          violation_policy?: Json;
+          opens_at?: string | null;
+          closes_at?: string | null;
+          duration_minutes?: number | null;
+          status?: FormsExamStatus;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -250,6 +300,37 @@ export interface Database {
         Args: { session_id: string; storage_path: string };
         Returns: undefined;
       };
+      start_forms_exam_session: {
+        // Phase 2a: the forms-exam entry point. Deliberately has NO
+        // tier/violation_policy parameter — those are loaded server-side
+        // from the forms_exams row, never from the caller. Raises if the
+        // exam is not found, not status='published', or now() is outside
+        // [opens_at, closes_at].
+        Args: {
+          forms_exam_id: string;
+          claimed_index_number?: string | null;
+          attested?: boolean;
+        };
+        Returns: string;
+      };
+      forms_exam_sessions: {
+        // Phase 2a lecturer results view: one row per proctoring session
+        // started against this forms_exam. SELECT-guarded to the exam owner
+        // or lecturer-or-higher.
+        Args: { forms_exam_id: string };
+        Returns: {
+          session_id: string;
+          user_id: string;
+          full_name: string | null;
+          claimed_index_number: string | null;
+          status: string;
+          violation_count: number;
+          violation_limit: number;
+          started_at: string;
+          ended_at: string | null;
+          has_report: boolean;
+        }[];
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -263,3 +344,6 @@ export type ProctorSessionRow = Database["public"]["Tables"]["proctor_sessions"]
 export type ProctorEventRow = Database["public"]["Tables"]["proctor_events"]["Row"];
 export type ProctorMediaRow = Database["public"]["Tables"]["proctor_media"]["Row"];
 export type ProctorReportRow = Database["public"]["Tables"]["proctor_reports"]["Row"];
+export type FormsExamRow = Database["public"]["Tables"]["forms_exams"]["Row"];
+export type FormsExamSessionRow =
+  Database["public"]["Functions"]["forms_exam_sessions"]["Returns"][number];

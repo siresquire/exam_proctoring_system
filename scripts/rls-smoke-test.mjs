@@ -1372,6 +1372,384 @@ async function main() {
     await studentClient.rpc("end_proctor_session", { session_id: sessionId });
   }
 
+  // === (n) Phase 2a: proctored Google Forms wrapper (System 1) ==============
+  // forms_exams RLS, start_forms_exam_session's exam-owned tier/policy, the
+  // forms_exam_sessions results RPC, and — critically — the security
+  // regression guard for the lock-down migration (20260705000006): a signed-
+  // in student must NOT be able to call the shared _create_proctor_session
+  // helper directly.
+  {
+    const { client: lecturerClient } = sessions.lecturer;
+    const { client: studentClient } = sessions.student;
+    const suffix = Date.now();
+
+    // n1. lecturer creates a forms_exam (draft) via authenticated insert.
+    const { data: createdExam, error: createErr } = await lecturerClient
+      .from("forms_exams")
+      .insert({
+        owner_id: lecturerId,
+        title: `Smoke test forms exam ${suffix}`,
+        google_form_url: `https://docs.google.com/forms/d/e/smoke-test-${suffix}/viewform?embedded=true`,
+        integrity_tier: 3,
+        violation_policy: { copy_attempt: { counts: false } },
+      })
+      .select("*")
+      .single();
+    record(
+      "n1. lecturer INSERT forms_exams (draft) succeeds",
+      !createErr && Boolean(createdExam?.id),
+      createErr?.message ?? `id=${createdExam?.id}`,
+    );
+    const examId = createdExam?.id;
+
+    // n2. draft is invisible to a student via bare SELECT (RLS).
+    if (examId) {
+      const { data: draftAsStudent, error: draftAsStudentErr } = await studentClient
+        .from("forms_exams")
+        .select("*")
+        .eq("id", examId);
+      record(
+        "n2. student SELECT of a DRAFT forms_exam returns 0 rows",
+        !draftAsStudentErr && (draftAsStudent?.length ?? 0) === 0,
+        draftAsStudentErr?.message ?? `rows=${draftAsStudent?.length}`,
+      );
+    } else {
+      record("n2. student SELECT of a DRAFT forms_exam returns 0 rows", false, "skipped — n1 failed");
+    }
+
+    // n3. start_forms_exam_session refuses while status='draft'.
+    if (examId) {
+      const { data: draftStartId, error: draftStartErr } = await studentClient.rpc(
+        "start_forms_exam_session",
+        { forms_exam_id: examId, claimed_index_number: "5201040845", attested: true },
+      );
+      record(
+        "n3. start_forms_exam_session on a draft exam FAILS",
+        Boolean(draftStartErr) && !draftStartId,
+        draftStartErr?.message ?? "no error raised — SECURITY: session started against a draft exam",
+      );
+    } else {
+      record("n3. start_forms_exam_session on a draft exam FAILS", false, "skipped — n1 failed");
+    }
+
+    // n4. lecturer publishes it; can read it back and call forms_exam_sessions.
+    if (examId) {
+      const { error: publishErr } = await lecturerClient
+        .from("forms_exams")
+        .update({ status: "published" })
+        .eq("id", examId);
+      record("n4a. lecturer UPDATE forms_exams to status=published succeeds", !publishErr, publishErr?.message);
+
+      const { data: readBack, error: readBackErr } = await lecturerClient
+        .from("forms_exams")
+        .select("*")
+        .eq("id", examId)
+        .maybeSingle();
+      record(
+        "n4b. lecturer reads the published exam back",
+        !readBackErr && readBack?.status === "published",
+        readBackErr?.message ?? `status=${readBack?.status}`,
+      );
+
+      const { data: sessionsList, error: sessionsListErr } = await lecturerClient.rpc(
+        "forms_exam_sessions",
+        { forms_exam_id: examId },
+      );
+      record(
+        "n4c. lecturer calls forms_exam_sessions() on own exam (0 rows so far, no error)",
+        !sessionsListErr && Array.isArray(sessionsList),
+        sessionsListErr?.message ?? `rows=${sessionsList?.length}`,
+      );
+    } else {
+      record("n4a. lecturer UPDATE forms_exams to status=published succeeds", false, "skipped — n1 failed");
+      record("n4b. lecturer reads the published exam back", false, "skipped — n1 failed");
+      record("n4c. lecturer calls forms_exam_sessions() on own exam (0 rows so far, no error)", false, "skipped — n1 failed");
+    }
+
+    // n5. now published+open: a student CAN select it (RLS
+    // forms_exams_select_published_and_open).
+    if (examId) {
+      const { data: publishedAsStudent, error: publishedAsStudentErr } = await studentClient
+        .from("forms_exams")
+        .select("*")
+        .eq("id", examId);
+      record(
+        "n5. student SELECT of a PUBLISHED+OPEN forms_exam returns 1 row",
+        !publishedAsStudentErr && publishedAsStudent?.length === 1,
+        publishedAsStudentErr?.message ?? `rows=${publishedAsStudent?.length}`,
+      );
+    } else {
+      record("n5. student SELECT of a PUBLISHED+OPEN forms_exam returns 1 row", false, "skipped — n1 failed");
+    }
+
+    // n6. SECURITY REGRESSION (critical, guards 20260705000006): a signed-in
+    // student calling the internal _create_proctor_session helper directly
+    // via rpc() must be DENIED — this is exactly the bypass the lead found
+    // and fixed (a student could mint a session with an arbitrary
+    // caller-supplied policy, bypassing the exam-owned guarantee entirely).
+    {
+      const { error: directHelperErr } = await studentClient.rpc("_create_proctor_session", {
+        context: `smoke-test-direct-helper-${suffix}`,
+        tier: 1,
+        policy: { tab_hidden: { severity: "info", counts: false } },
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      record(
+        "n6. SECURITY: student rpc('_create_proctor_session', ...) directly is DENIED (guards 20260705000006)",
+        isDenied(directHelperErr),
+        directHelperErr?.message ??
+          "no error raised — SECURITY REGRESSION: the internal session-creation helper is directly callable, bypassing exam-owned policy",
+      );
+    }
+
+    // n7. start_forms_exam_session refuses when now() is outside
+    // [opens_at, closes_at] — both a future opens_at and a past closes_at.
+    const { data: futureExam, error: futureExamErr } = await lecturerClient
+      .from("forms_exams")
+      .insert({
+        owner_id: lecturerId,
+        title: `Smoke test forms exam (not yet open) ${suffix}`,
+        google_form_url: `https://docs.google.com/forms/d/e/smoke-test-future-${suffix}/viewform?embedded=true`,
+        status: "published",
+        opens_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      })
+      .select("id")
+      .single();
+    if (futureExamErr || !futureExam?.id) {
+      record("n7a. start_forms_exam_session before opens_at FAILS", false, futureExamErr?.message ?? "insert failed");
+    } else {
+      const { data: tooEarlyId, error: tooEarlyErr } = await studentClient.rpc("start_forms_exam_session", {
+        forms_exam_id: futureExam.id,
+        attested: true,
+      });
+      record(
+        "n7a. start_forms_exam_session before opens_at FAILS",
+        Boolean(tooEarlyErr) && !tooEarlyId,
+        tooEarlyErr?.message ?? "no error raised — SECURITY: session started before the exam opened",
+      );
+    }
+
+    const { data: pastExam, error: pastExamErr } = await lecturerClient
+      .from("forms_exams")
+      .insert({
+        owner_id: lecturerId,
+        title: `Smoke test forms exam (closed window) ${suffix}`,
+        google_form_url: `https://docs.google.com/forms/d/e/smoke-test-past-${suffix}/viewform?embedded=true`,
+        status: "published",
+        closes_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      })
+      .select("id")
+      .single();
+    if (pastExamErr || !pastExam?.id) {
+      record("n7b. start_forms_exam_session after closes_at FAILS", false, pastExamErr?.message ?? "insert failed");
+    } else {
+      const { data: tooLateId, error: tooLateErr } = await studentClient.rpc("start_forms_exam_session", {
+        forms_exam_id: pastExam.id,
+        attested: true,
+      });
+      record(
+        "n7b. start_forms_exam_session after closes_at FAILS",
+        Boolean(tooLateErr) && !tooLateId,
+        tooLateErr?.message ?? "no error raised — SECURITY: session started after the exam closed",
+      );
+    }
+
+    // n8. start_forms_exam_session on a status='closed' exam FAILS.
+    const { data: closedExam, error: closedExamErr } = await lecturerClient
+      .from("forms_exams")
+      .insert({
+        owner_id: lecturerId,
+        title: `Smoke test forms exam (closed) ${suffix}`,
+        google_form_url: `https://docs.google.com/forms/d/e/smoke-test-closed-${suffix}/viewform?embedded=true`,
+        status: "closed",
+      })
+      .select("id")
+      .single();
+    if (closedExamErr || !closedExam?.id) {
+      record("n8. start_forms_exam_session on status=closed exam FAILS", false, closedExamErr?.message ?? "insert failed");
+    } else {
+      const { data: closedStartId, error: closedStartErr } = await studentClient.rpc("start_forms_exam_session", {
+        forms_exam_id: closedExam.id,
+        attested: true,
+      });
+      record(
+        "n8. start_forms_exam_session on status=closed exam FAILS",
+        Boolean(closedStartErr) && !closedStartId,
+        closedStartErr?.message ?? "no error raised — SECURITY: session started against a closed exam",
+      );
+    }
+
+    // n9. published+open: start_forms_exam_session succeeds, and the created
+    // proctor_sessions.violation_policy EQUALS the exam's stored policy
+    // (deep-equal) even though the student has NO parameter to pass their
+    // own policy/tier — proving there is no override path, not just that
+    // one wasn't used.
+    let formsSessionId;
+    if (examId) {
+      const { data: startedId, error: startedErr } = await studentClient.rpc("start_forms_exam_session", {
+        forms_exam_id: examId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      record(
+        "n9a. start_forms_exam_session on a published+open exam succeeds",
+        !startedErr && typeof startedId === "string",
+        startedErr?.message ?? `sessionId=${startedId}`,
+      );
+      formsSessionId = startedId;
+
+      const { data: createdSession, error: createdSessionErr } = await admin
+        .from("proctor_sessions")
+        .select("integrity_tier, violation_policy, context")
+        .eq("id", startedId)
+        .maybeSingle();
+      record(
+        "n9b. created session's integrity_tier equals the exam's stored integrity_tier (3)",
+        !createdSessionErr && createdSession?.integrity_tier === 3,
+        createdSessionErr?.message ?? `integrity_tier=${createdSession?.integrity_tier}`,
+      );
+      record(
+        "n9c. created session's violation_policy deep-equals the exam's stored violation_policy (exam-owned, no student override)",
+        !createdSessionErr &&
+          JSON.stringify(createdSession?.violation_policy) === JSON.stringify(createdExam?.violation_policy ?? null) &&
+          createdSession?.violation_policy?.copy_attempt?.counts === false,
+        createdSessionErr?.message ?? `violation_policy=${JSON.stringify(createdSession?.violation_policy)}`,
+      );
+      record(
+        "n9d. created session's context is 'form:<forms_exam_id>'",
+        createdSession?.context === `form:${examId}`,
+        `context=${createdSession?.context}`,
+      );
+    } else {
+      record("n9a. start_forms_exam_session on a published+open exam succeeds", false, "skipped — n1 failed");
+      record("n9b. created session's integrity_tier equals the exam's stored integrity_tier (3)", false, "skipped — n1 failed");
+      record("n9c. created session's violation_policy deep-equals the exam's stored violation_policy (exam-owned, no student override)", false, "skipped — n1 failed");
+      record("n9d. created session's context is 'form:<forms_exam_id>'", false, "skipped — n1 failed");
+    }
+
+    // n10. forms_exam_sessions() now shows the student's session; lecturer
+    // (owner) can call it.
+    if (examId && formsSessionId) {
+      const { data: sessionsAfter, error: sessionsAfterErr } = await lecturerClient.rpc(
+        "forms_exam_sessions",
+        { forms_exam_id: examId },
+      );
+      const row = sessionsAfter?.find((r) => r.session_id === formsSessionId);
+      record(
+        "n10. forms_exam_sessions() (owner) now includes the student's session with matching claimed_index_number",
+        !sessionsAfterErr && Boolean(row) && row?.claimed_index_number === "5201040845",
+        sessionsAfterErr?.message ?? `row=${JSON.stringify(row)}`,
+      );
+    } else {
+      record(
+        "n10. forms_exam_sessions() (owner) now includes the student's session with matching claimed_index_number",
+        false,
+        "skipped — n1/n9 failed",
+      );
+    }
+
+    // n11. a non-owner, non-lecturer (student) cannot call
+    // forms_exam_sessions for someone else's exam.
+    if (examId) {
+      const { error: nonOwnerResultsErr } = await studentClient.rpc("forms_exam_sessions", {
+        forms_exam_id: examId,
+      });
+      record(
+        "n11. student (non-owner, non-lecturer) calling forms_exam_sessions() for another user's exam FAILS",
+        Boolean(nonOwnerResultsErr),
+        nonOwnerResultsErr?.message ??
+          "no error raised — SECURITY: a student read another user's exam results",
+      );
+    } else {
+      record(
+        "n11. student (non-owner, non-lecturer) calling forms_exam_sessions() for another user's exam FAILS",
+        false,
+        "skipped — n1 failed",
+      );
+    }
+
+    // n12. student cannot INSERT/UPDATE/DELETE forms_exams directly (owner-
+    // or-lecturer only) — a student is neither.
+    const { error: studentInsertErr } = await studentClient.from("forms_exams").insert({
+      owner_id: studentId,
+      title: "Student-forged exam",
+      google_form_url: "https://docs.google.com/forms/d/e/forged/viewform?embedded=true",
+    });
+    record(
+      "n12a. student direct INSERT into forms_exams FAILS",
+      isDenied(studentInsertErr) || Boolean(studentInsertErr),
+      studentInsertErr?.message ?? "no error raised — SECURITY: student created a forms_exam directly",
+    );
+
+    if (examId) {
+      const { error: studentUpdateErr } = await studentClient
+        .from("forms_exams")
+        .update({ integrity_tier: 1 })
+        .eq("id", examId);
+      const { data: examAfterStudentUpdate } = await admin
+        .from("forms_exams")
+        .select("integrity_tier")
+        .eq("id", examId)
+        .single();
+      record(
+        "n12b. student direct UPDATE of another user's forms_exams FAILS (tier unchanged)",
+        (isDenied(studentUpdateErr) || Boolean(studentUpdateErr) || examAfterStudentUpdate?.integrity_tier === 3),
+        studentUpdateErr?.message ?? `integrity_tier_after=${examAfterStudentUpdate?.integrity_tier}`,
+      );
+    } else {
+      record("n12b. student direct UPDATE of another user's forms_exams FAILS (tier unchanged)", false, "skipped — n1 failed");
+    }
+
+    // Cleanup: end the session we created, then delete every forms_exams row
+    // this block created (service role bypasses RLS) so the suite is
+    // idempotent across repeated runs.
+    if (formsSessionId) {
+      await studentClient.rpc("end_proctor_session", { session_id: formsSessionId });
+    }
+    const cleanupIds = [examId, futureExam?.id, pastExam?.id, closedExam?.id].filter(Boolean);
+    if (cleanupIds.length > 0) {
+      await admin.from("forms_exams").delete().in("id", cleanupIds);
+    }
+  }
+
+  // === (o) regression: start_proctor_session (demo path) still works
+  // unmodified through the new _create_proctor_session delegation. Sections
+  // (i)/(j)/(k)/(l)/(m) above already exercise it end-to-end and all passed,
+  // so this is a light, explicit confirmation the delegation didn't change
+  // its externally-observable behavior for a plain call with no overrides.
+  {
+    const { client: studentClient } = sessions.student;
+    const context = `smoke-test-post-delegation-${Date.now()}`;
+    const { data: sessionId, error: startErr } = await studentClient.rpc("start_proctor_session", {
+      context,
+      tier: 2,
+      claimed_index_number: "5201040845",
+      attested: true,
+    });
+    record(
+      "o1. start_proctor_session (no overrides) still works after the _create_proctor_session delegation refactor",
+      !startErr && typeof sessionId === "string",
+      startErr?.message ?? `sessionId=${sessionId}`,
+    );
+    if (sessionId) {
+      const { data: sessionRow } = await admin
+        .from("proctor_sessions")
+        .select("violation_policy")
+        .eq("id", sessionId)
+        .maybeSingle();
+      record(
+        "o2. delegated session's violation_policy equals default_violation_policy() (no override supplied)",
+        JSON.stringify(sessionRow?.violation_policy) ===
+          JSON.stringify((await studentClient.rpc("default_violation_policy")).data),
+        `violation_policy=${JSON.stringify(sessionRow?.violation_policy)}`,
+      );
+      await studentClient.rpc("end_proctor_session", { session_id: sessionId });
+    } else {
+      record("o2. delegated session's violation_policy equals default_violation_policy() (no override supplied)", false, "skipped — o1 failed");
+    }
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the
