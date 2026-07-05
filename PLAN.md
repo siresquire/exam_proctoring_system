@@ -118,6 +118,30 @@ session, surviving refreshes and network drops.
 - Demo page gets **sample quiz questions** so violations are experienced in a
   realistic test-taking flow.
 
+### Phase 1.7 — Configurable violation policy + display-change detection (added 2026-07-05)
+- **Server-assigned severity (security fix)**: the client no longer dictates event
+  severity. Each session snapshots a **violation policy** (jsonb: event_type →
+  { severity, counts_toward_limit }) at start; `log_proctor_events` assigns severity
+  and strike-counting from that policy server-side. A tampered client can no longer
+  dodge strikes by under-reporting severity.
+- **Default policy (user decision)**: ALL violation-type events count toward the
+  3-strike termination (tab switch, window blur, fullscreen exit, copy/paste/cut,
+  context menu, camera lost, no face, multiple faces, display change). Info-type
+  lifecycle events (heartbeat, snapshots, focus regained, etc.) never count.
+  `connection_lost` counts by default per the directive, but the policy editor
+  carries a fairness note recommending lecturers exempt it in low-bandwidth settings
+  (collides with autosave/resume-on-disconnect design otherwise).
+- **Configurable by lecturer/admin/super_admin**: policy editor UI (demo: in the
+  pre-session flow; Phase 3/4: set per exam, snapshot onto each session).
+- **Display-change detection**: `screen.isExtended` at start + `screenschange`
+  listener (Window Management API) + periodic fallback poll → new
+  `display_configuration_changed` violation (extra monitor plugged in mid-exam via
+  HDMI/VGA/dock). HONEST LIMITS documented: mirrored splitters/capture cards are
+  invisible to all browsers (OS sees one display) — mitigated by webcam/gaze layer;
+  remote-control software (TeamViewer etc.) cannot be enumerated by a browser —
+  that is Tier 4 / Safe Exam Browser territory; in-browser we catch its side effects
+  (focus flapping, display changes).
+
 ### Phase 2 — **System 1 ships: proctored Google Forms wrapper** (week 4–6)
 - `/proctor/[token]` page: consent → camera check → iframes the lecturer's Google Form
   → proctor-core runs around it → submit confirmation.
