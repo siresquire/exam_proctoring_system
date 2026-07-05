@@ -256,18 +256,35 @@ export function SampleQuiz({ disabled = false, onSubmit }: SampleQuizProps) {
                   aria-current={isCurrent ? "true" : undefined}
                   aria-label={`Question ${index + 1}${isAnswered ? ", answered" : ", not answered"}${isFlagged ? ", flagged for review" : ""}`}
                   className={cn(
-                    "relative flex size-10 min-h-11 min-w-11 items-center justify-center rounded-md border text-sm font-medium",
+                    "relative flex size-10 min-h-11 min-w-11 items-center justify-center overflow-hidden rounded-md border text-sm font-medium",
                     isCurrent && "ring-ring ring-2 ring-offset-1",
-                    isAnswered ? "border-primary bg-primary/10" : "border-border",
+                    isFlagged
+                      ? "border-accent bg-accent/15"
+                      : isAnswered
+                        ? "border-primary bg-primary/10"
+                        : "border-border",
                   )}
                 >
-                  {index + 1}
+                  {/* Corner-fold ribbon: a small triangular wedge flush
+                      inside the box's top-right corner (clip-path, not an
+                      icon floated outside the bounds) so the flagged state
+                      reads as part of the box's own design rather than a
+                      tacked-on badge. Shape + color together (never color
+                      alone, DESIGN.md §1) — the ribbon's triangular
+                      silhouette is itself distinguishable independent of
+                      hue, on top of the Flag glyph below the number. */}
                   {isFlagged ? (
-                    <Flag
+                    <span
                       aria-hidden="true"
-                      className="text-destructive absolute -right-1.5 -top-1.5 size-3.5"
+                      className="bg-accent absolute right-0 top-0 size-3.5 [clip-path:polygon(100%_0,100%_100%,0_0)]"
                     />
                   ) : null}
+                  <span className="flex flex-col items-center leading-none">
+                    {index + 1}
+                    {isFlagged ? (
+                      <Flag aria-hidden="true" className="text-accent-foreground mt-0.5 size-2.5" />
+                    ) : null}
+                  </span>
                 </button>
               );
             })}
@@ -285,6 +302,12 @@ export function SampleQuiz({ disabled = false, onSubmit }: SampleQuizProps) {
               answered
             </li>
             <li className="flex items-center gap-2">
+              <span
+                className="border-accent bg-accent/15 relative size-3 overflow-hidden rounded border"
+                aria-hidden="true"
+              >
+                <span className="bg-accent absolute right-0 top-0 size-1.5 [clip-path:polygon(100%_0,100%_100%,0_0)]" />
+              </span>
               <Flag aria-hidden="true" className="size-3" /> Flagged for review
             </li>
           </ul>

@@ -164,4 +164,42 @@ describe("createProctorEngine", () => {
 
     engine.stop();
   });
+
+  it("onViolationUpdate fires on every accepted batch (Phase 1.6), not just at termination", async () => {
+    const responses = [
+      { accepted: 1, session_status: "active", violation_count: 1, violation_limit: 3 },
+      { accepted: 1, session_status: "active", violation_count: 2, violation_limit: 3 },
+      { accepted: 1, session_status: "terminated", violation_count: 3, violation_limit: 3 },
+    ];
+    const sendEvents = vi.fn().mockImplementation(async () => responses.shift());
+    const transport: ProctorTransportAdapter = { sendEvents };
+    const engine = createProctorEngine({
+      sessionId: "s8",
+      adapters: { transport },
+      options: { batchIntervalMs: 100000 },
+    });
+
+    const updates: unknown[] = [];
+    engine.onViolationUpdate((result) => updates.push(result));
+    const terminations: unknown[] = [];
+    engine.onTerminated((result) => terminations.push(result));
+
+    engine.start();
+    engine.report("camera_lost", "high");
+    await engine.flush();
+    engine.report("concurrent_session_detected", "high");
+    await engine.flush();
+    engine.report("identity_mismatch", "high");
+    await engine.flush();
+
+    expect(updates).toEqual([
+      expect.objectContaining({ session_status: "active", violation_count: 1 }),
+      expect.objectContaining({ session_status: "active", violation_count: 2 }),
+      expect.objectContaining({ session_status: "terminated", violation_count: 3 }),
+    ]);
+    // onTerminated only fires once, for the final (terminal) update.
+    expect(terminations).toHaveLength(1);
+
+    engine.stop();
+  });
 });

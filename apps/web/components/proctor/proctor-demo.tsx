@@ -25,6 +25,7 @@ import { ConsentScreen } from "@/components/proctor/consent-screen";
 import { EventFeed, type FeedEvent } from "@/components/proctor/event-feed";
 import { IdentityCheck, type IdentityCheckResult } from "@/components/proctor/identity-check";
 import { SampleQuiz } from "@/components/proctor/sample-quiz";
+import { ViolationHarness } from "@/components/proctor/violation-harness";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -33,6 +34,7 @@ import {
   createSupabaseStorageAdapter,
   createSupabaseTransportAdapter,
 } from "@/lib/proctor/supabase-adapters";
+import { createMediaPipeFaceDetectorAdapter } from "@/lib/proctor/face-detector";
 import { notify } from "@/lib/notify";
 
 type Phase = "intro" | "consent" | "identity" | "ready" | "live" | "summary";
@@ -40,6 +42,8 @@ type Phase = "intro" | "consent" | "identity" | "ready" | "live" | "summary";
 const SNAPSHOT_INTERVAL_MS = 20000;
 const HEARTBEAT_INTERVAL_MS = 20000;
 const MAX_THUMBNAILS = 6;
+/** Mirrors proctor_sessions.violation_limit's server-side default (20260705000001) — display-only fallback before the first log_proctor_events response tells us the real value. */
+const DEFAULT_VIOLATION_LIMIT = 3;
 
 interface Thumbnail {
   url: string;
@@ -81,6 +85,21 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
     count: number;
     limit: number;
   } | null>(null);
+  const [noFaceSeverity, setNoFaceSeverity] = useState<"medium" | "high">("medium");
+  // Lazy useState initializer (not a ref read during render, which the
+  // react-hooks/refs rule forbids): runs exactly once per component
+  // instance. createMediaPipeFaceDetectorAdapter() itself does no I/O —
+  // it only returns an object whose detect() method lazily loads the
+  // MediaPipe WASM runtime + model on first call (see
+  // lib/proctor/face-detector.ts) — so constructing it eagerly here is
+  // cheap and safe even during SSR.
+  const [faceDetector] = useState(() => createMediaPipeFaceDetectorAdapter());
+  // Mirrors engineRef.current for JSX reads (ViolationHarness) — refs
+  // can't be read during render, so the engine is ALSO tracked in state,
+  // set alongside engineRef.current in handleStart/handleRestart. Callbacks
+  // still use engineRef for imperative access (report/setNoFaceSeverity),
+  // never trigger a re-render just to call a method.
+  const [engineForDisplay, setEngineForDisplay] = useState<ProctorEngine | null>(null);
 
   const webcamRef = useRef<WebcamHandle | null>(null);
   const engineRef = useRef<ProctorEngine | null>(null);
@@ -131,6 +150,19 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
     } catch (err) {
       console.error("Snapshot upload failed", err);
     }
+
+    // Phase 1.6: run face-presence detection on the same frame just
+    // captured. Independent of the upload try/catch above — a storage
+    // hiccup shouldn't also skip the face check on an otherwise-good frame.
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(blob);
+      await engineRef.current?.processSnapshot(bitmap);
+    } catch (err) {
+      console.error("Face-presence check failed", err);
+    } finally {
+      bitmap?.close();
+    }
   }, []);
 
   const finalizeSession = useCallback(
@@ -145,6 +177,7 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
       engineRef.current?.stop();
       await engineRef.current?.flush();
       webcamRef.current?.stop();
+      setEngineForDisplay(null);
 
       if (!outcome.terminated && sessionId && supabase) {
         const { error } = await supabase.rpc("end_proctor_session", { session_id: sessionId });
@@ -237,8 +270,23 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
 
     const engine = createProctorEngine({
       sessionId,
-      adapters: { transport: createSupabaseTransportAdapter(supabase) },
-      options: { heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS, tier: 2 },
+      adapters: {
+        transport: createSupabaseTransportAdapter(supabase),
+        // Phase 1.6: same detector instance IdentityCheck used for the
+        // portrait quality gate, reused for in-session
+        // no_face_detected/multiple_faces_detected — avoids loading the
+        // MediaPipe WASM runtime + model a second time.
+        faceDetector,
+      },
+      options: {
+        heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+        tier: 2,
+        // Demo harness lets the student flip no_face_detected between
+        // medium (human-review signal only, the real-exam default) and
+        // high (counts toward the 3-strike termination limit) — see
+        // ViolationHarness's toggle and noFaceSeverity state above.
+        noFaceSeverity,
+      },
     });
 
     engine.on((event) => {
@@ -276,6 +324,14 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
       }
     });
 
+    // Phase 1.6: keep the harness's live "N / limit" strike counter in sync
+    // with the server's actual count as each batch is confirmed — not just
+    // once, at termination (onTerminated below still handles that
+    // separately: locking the UI and finalizing the session).
+    engine.onViolationUpdate((result: ProctorLogResult) => {
+      setViolationStanding({ count: result.violation_count, limit: result.violation_limit });
+    });
+
     engine.onTerminated((result: ProctorLogResult) => {
       setTerminated(true);
       setViolationStanding({ count: result.violation_count, limit: result.violation_limit });
@@ -292,13 +348,14 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
 
     engine.start();
     engineRef.current = engine;
+    setEngineForDisplay(engine);
 
     void takeSnapshot();
     snapshotTimerRef.current = setInterval(() => void takeSnapshot(), SNAPSHOT_INTERVAL_MS);
 
     setPhase("live");
     await notify.toast({ title: "Monitored session started" });
-  }, [finalizeSession, takeSnapshot]);
+  }, [finalizeSession, takeSnapshot, noFaceSeverity, faceDetector]);
 
   const handleQuizSubmit = useCallback(() => {
     void finalizeSession({ terminated: false, violationCount: 0, violationLimit: 0 });
@@ -325,6 +382,17 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
     setTerminated(false);
     setViolationStanding(null);
     setPhase("intro");
+  }, []);
+
+  const handleToggleNoFaceSeverity = useCallback(() => {
+    setNoFaceSeverity((prev) => {
+      const next = prev === "medium" ? "high" : "medium";
+      // Flip it on the already-running engine too (not just for the next
+      // session) — see ProctorEngine.setNoFaceSeverity's doc comment for
+      // why this is a dedicated method rather than recreating the engine.
+      engineRef.current?.setNoFaceSeverity(next);
+      return next;
+    });
   }, []);
 
   async function handleToggleFullscreen() {
@@ -374,7 +442,13 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
   }
 
   if (phase === "identity") {
-    return <IdentityCheck fullName={fullName} onVerified={handleIdentityVerified} />;
+    return (
+      <IdentityCheck
+        fullName={fullName}
+        onVerified={handleIdentityVerified}
+        faceDetector={faceDetector}
+      />
+    );
   }
 
   if (phase === "ready") {
@@ -446,6 +520,15 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
             </CardContent>
           </Card>
         ) : null}
+
+        <ViolationHarness
+          engine={engineForDisplay}
+          disabled={terminated}
+          violationCount={violationStanding?.count ?? 0}
+          violationLimit={violationStanding?.limit ?? DEFAULT_VIOLATION_LIMIT}
+          noFaceSeverity={noFaceSeverity}
+          onToggleNoFaceSeverity={handleToggleNoFaceSeverity}
+        />
 
         <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
           <SampleQuiz disabled={terminated} onSubmit={handleQuizSubmit} />

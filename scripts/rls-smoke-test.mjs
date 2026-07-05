@@ -1008,6 +1008,144 @@ async function main() {
     );
   }
 
+  // === (l) Phase 1.6: face-presence detection events =========================
+  {
+    const { client: studentClient } = sessions.student;
+    const context = `smoke-test-face-detection-${Date.now()}`;
+
+    // l1. start a fresh session for this scenario.
+    const { data: sessionId, error: startErr } = await studentClient.rpc("start_proctor_session", {
+      context,
+      tier: 2,
+      claimed_index_number: "5201040845",
+      attested: true,
+    });
+    record(
+      "l1. student start_proctor_session succeeds for face-detection test",
+      !startErr && typeof sessionId === "string",
+      startErr?.message ?? `sessionId=${sessionId}`,
+    );
+
+    // l2. no_face_detected (debounced client-side already, so the server
+    // just needs to accept the vocabulary) logs fine at medium severity and
+    // does NOT count toward the violation limit.
+    const nowIso = new Date().toISOString();
+    const { data: noFaceBatch, error: noFaceErr } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [
+        {
+          event_type: "no_face_detected",
+          severity: "medium",
+          occurred_at: nowIso,
+          meta: { faceCount: 0, consecutiveMisses: 2 },
+        },
+      ],
+    });
+    record(
+      "l2. log_proctor_events accepts no_face_detected (medium) and does not bump violation_count",
+      !noFaceErr && noFaceBatch?.session_status === "active" && noFaceBatch?.violation_count === 0,
+      noFaceErr?.message ??
+        `session_status=${noFaceBatch?.session_status} violation_count=${noFaceBatch?.violation_count}`,
+    );
+
+    const { data: noFaceEvents, error: noFaceEventsErr } = await admin
+      .from("proctor_events")
+      .select("*")
+      .eq("session_id", sessionId)
+      .eq("event_type", "no_face_detected");
+    record(
+      "l3. no_face_detected event row persisted with meta.faceCount=0",
+      !noFaceEventsErr && noFaceEvents?.length === 1 && noFaceEvents[0].meta?.faceCount === 0,
+      noFaceEventsErr?.message ?? `rows=${noFaceEvents?.length}`,
+    );
+
+    // l4. multiple_faces_detected accepted at high severity and DOES count
+    // toward the violation limit — drive it to the default limit (3) with
+    // three high-severity multiple_faces_detected events and confirm
+    // auto-termination + report filing, exactly like the generic
+    // high-severity path in section (j), but exercising the new event type
+    // specifically end-to-end.
+    const { data: batch1, error: batch1Err } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [
+        {
+          event_type: "multiple_faces_detected",
+          severity: "high",
+          occurred_at: nowIso,
+          meta: { faceCount: 2 },
+        },
+        {
+          event_type: "multiple_faces_detected",
+          severity: "high",
+          occurred_at: nowIso,
+          meta: { faceCount: 2 },
+        },
+      ],
+    });
+    record(
+      "l4. two multiple_faces_detected (high) events accepted, violation_count=2, still active",
+      !batch1Err && batch1?.session_status === "active" && batch1?.violation_count === 2,
+      batch1Err?.message ??
+        `session_status=${batch1?.session_status} violation_count=${batch1?.violation_count}`,
+    );
+
+    const { data: batch2, error: batch2Err } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [
+        {
+          event_type: "multiple_faces_detected",
+          severity: "high",
+          occurred_at: nowIso,
+          meta: { faceCount: 3 },
+        },
+      ],
+    });
+    record(
+      "l5. 3rd multiple_faces_detected (high) event terminates the session (violation_limit reached)",
+      !batch2Err && batch2?.session_status === "terminated" && batch2?.violation_count === 3,
+      batch2Err?.message ??
+        `session_status=${batch2?.session_status} violation_count=${batch2?.violation_count}`,
+    );
+
+    const { data: sessionRow, error: sessionRowErr } = await admin
+      .from("proctor_sessions")
+      .select("status, ended_at")
+      .eq("id", sessionId)
+      .single();
+    record(
+      "l6. proctor_sessions row is status=terminated with ended_at set",
+      !sessionRowErr && sessionRow?.status === "terminated" && Boolean(sessionRow?.ended_at),
+      sessionRowErr?.message ?? `status=${sessionRow?.status} ended_at=${sessionRow?.ended_at}`,
+    );
+
+    const { data: reportRow, error: reportRowErr } = await admin
+      .from("proctor_reports")
+      .select("*")
+      .eq("session_id", sessionId)
+      .maybeSingle();
+    record(
+      "l7. proctor_reports row filed (reason=violation_limit_reached) after multiple_faces_detected reached the limit",
+      !reportRowErr &&
+        Boolean(reportRow) &&
+        reportRow?.reason === "violation_limit_reached" &&
+        reportRow?.summary?.by_type?.multiple_faces_detected === 3,
+      reportRowErr?.message ??
+        `reason=${reportRow?.reason} by_type=${JSON.stringify(reportRow?.summary?.by_type)}`,
+    );
+
+    // l8. an invalid event_type is still rejected (vocabulary is an
+    // allowlist, not "anything goes now that we added two more values").
+    const { error: invalidErr } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [{ event_type: "face_swap_detected", severity: "high", occurred_at: nowIso }],
+    });
+    record(
+      "l8. log_proctor_events still rejects an unrecognized event_type",
+      Boolean(invalidErr),
+      invalidErr?.message ?? "no error raised — SECURITY: arbitrary event_type accepted",
+    );
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the

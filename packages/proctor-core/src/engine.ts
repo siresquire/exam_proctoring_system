@@ -20,9 +20,12 @@ import type {
   ProctorLogResult,
   ProctorSeverity,
   ProctorTerminationListener,
+  ProctorViolationUpdateListener,
 } from "./types";
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 20000;
+/** Phase 1.6 default — see ProctorEngineOptions.noFaceThreshold doc comment in types.ts. */
+const DEFAULT_NO_FACE_THRESHOLD = 2;
 
 /**
  * Wires collectors -> severity mapping -> listeners + event queue. This is
@@ -38,9 +41,11 @@ export function createProctorEngine(config: ProctorEngineConfig): ProctorEngine 
   const { sessionId, adapters, options = {} } = config;
   const tier = options.tier ?? 2;
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+  const noFaceThreshold = options.noFaceThreshold ?? DEFAULT_NO_FACE_THRESHOLD;
 
   const listeners = new Set<ProctorEventListener>();
   const terminationListeners = new Set<ProctorTerminationListener>();
+  const violationUpdateListeners = new Set<ProctorViolationUpdateListener>();
   let terminated = false;
   let detachers: Detach[] = [];
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -68,6 +73,12 @@ export function createProctorEngine(config: ProctorEngineConfig): ProctorEngine 
     batchIntervalMs: options.batchIntervalMs,
     storageKeyPrefix: options.storageKeyPrefix,
     onResult(result: ProctorLogResult) {
+      // Fires on every accepted batch, terminal or not — lets a host app
+      // keep a live strike counter (ViolationHarness) in sync with the
+      // server's actual count, not just react at the moment of
+      // termination.
+      for (const listener of violationUpdateListeners) listener(result);
+
       // Fire at most once per session: the server has already appended
       // session_terminated to proctor_events and stopped accepting further
       // logs for this session, so repeated batches settling after
@@ -93,6 +104,65 @@ export function createProctorEngine(config: ProctorEngineConfig): ProctorEngine 
 
   function emit(event: ProctorEvent, meta?: Record<string, unknown>) {
     report(event, defaultSeverity(event, tier), meta);
+  }
+
+  // Phase 1.6 face-presence debounce state. Kept as plain closure variables
+  // (not a class) to match the rest of this file's style — see
+  // processSnapshot below for the actual debounce/threshold logic, unit
+  // tested in face-detection.test.ts with a fake FaceDetector.
+  let consecutiveNoFace = 0;
+  // Mutable (not read straight from `options`) so setNoFaceSeverity can
+  // change it on an already-running engine — see the doc comment on
+  // ProctorEngine.setNoFaceSeverity in types.ts.
+  let noFaceSeverity = options.noFaceSeverity ?? defaultSeverity("no_face_detected", tier);
+
+  async function processSnapshot(bitmap: ImageBitmap): Promise<void> {
+    const detector = adapters.faceDetector;
+    if (!detector) return;
+
+    let faceCount: number;
+    try {
+      const result = await detector.detect(bitmap);
+      faceCount = result.faceCount;
+    } catch {
+      // Detector failure (model not loaded, WASM crash, etc.) is not itself
+      // proctoring evidence — fail open rather than flag the student for an
+      // infrastructure problem on their device.
+      return;
+    }
+
+    if (faceCount >= 2) {
+      // Not debounced: a second face is a much stronger signal than a
+      // momentary miss. Still just a flag for human review (see the
+      // ProctorEvent doc comment in types.ts and RESEARCH.md §3).
+      consecutiveNoFace = 0;
+      report(
+        "multiple_faces_detected",
+        options.multipleFacesSeverity ?? defaultSeverity("multiple_faces_detected", tier),
+        { faceCount },
+      );
+      return;
+    }
+
+    if (faceCount === 0) {
+      consecutiveNoFace += 1;
+      if (consecutiveNoFace >= noFaceThreshold) {
+        report("no_face_detected", noFaceSeverity, {
+          faceCount,
+          consecutiveMisses: consecutiveNoFace,
+        });
+        // Reset after reporting so a continued absence produces one flag per
+        // threshold-sized run rather than one every single snapshot — still
+        // detects a student who stays away for the whole exam (it just
+        // fires again after another `noFaceThreshold` misses), without
+        // flooding the feed/violation count for a single continuous absence.
+        consecutiveNoFace = 0;
+      }
+      return;
+    }
+
+    // Exactly one face: the expected state. Reset the miss streak.
+    consecutiveNoFace = 0;
   }
 
   return {
@@ -128,7 +198,15 @@ export function createProctorEngine(config: ProctorEngineConfig): ProctorEngine 
       terminationListeners.add(listener);
       return () => terminationListeners.delete(listener);
     },
+    onViolationUpdate(listener) {
+      violationUpdateListeners.add(listener);
+      return () => violationUpdateListeners.delete(listener);
+    },
     report,
+    processSnapshot,
+    setNoFaceSeverity(severity) {
+      noFaceSeverity = severity;
+    },
     async flush() {
       await queue.flush();
     },

@@ -51,5 +51,7 @@ export type {
   ProctorEngine,
   ProctorLogResult,
   ProctorTerminationListener,
+  ProctorViolationUpdateListener,
   SnapshotMeta,
+  FaceDetector,
 } from "./types";

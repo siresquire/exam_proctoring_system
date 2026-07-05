@@ -15,6 +15,8 @@ import {
   ScreenShareOff,
   ShieldAlert,
   Unplug,
+  UserX,
+  Users,
   Video,
   VideoOff,
   XCircle,
@@ -53,6 +55,8 @@ const EVENT_LABELS: Record<ProctorEvent, string> = {
   concurrent_session_detected: "Concurrent session detected",
   identity_mismatch: "Identity mismatch flagged",
   session_terminated: "Session terminated (violation limit reached)",
+  no_face_detected: "No face detected",
+  multiple_faces_detected: "Multiple faces detected",
 };
 
 const EVENT_ICONS: Record<
@@ -81,6 +85,8 @@ const EVENT_ICONS: Record<
   concurrent_session_detected: AlertTriangle,
   identity_mismatch: ShieldAlert,
   session_terminated: XCircle,
+  no_face_detected: UserX,
+  multiple_faces_detected: Users,
 };
 
 const SEVERITY_VARIANT: Record<ProctorSeverity, "secondary" | "outline" | "destructive"> = {

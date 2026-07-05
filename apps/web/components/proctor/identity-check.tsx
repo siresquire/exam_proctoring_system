@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { startWebcam, type WebcamHandle } from "@proctor/core";
+import { startWebcam, type FaceDetector, type WebcamHandle } from "@proctor/core";
 import { Camera, IdCard, RotateCcw, ShieldCheck } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { notify } from "@/lib/notify";
+import { evaluatePortraitQuality, PORTRAIT_QUALITY_MESSAGES } from "@/lib/proctor/image-quality";
 
 const INDEX_NUMBER_PATTERN = /^\d{10}$/;
 
@@ -32,14 +33,23 @@ interface IdentityCheckProps {
   fullName: string | null;
   /** Called once the index number is valid, a portrait has been captured, and the attestation is checked. */
   onVerified: (result: IdentityCheckResult) => void | Promise<void>;
+  /**
+   * Phase 1.6: reused for portrait quality gating (exactly-one-face check)
+   * before a captured photo is accepted — the same MediaPipe-backed
+   * detector the live session later uses for no_face_detected/
+   * multiple_faces_detected. Optional so this component still renders (with
+   * the face-count check simply skipped) if a host app doesn't wire one up.
+   */
+  faceDetector?: FaceDetector;
 }
 
-type CameraState = "idle" | "starting" | "live" | "captured" | "denied" | "unsupported";
+type CameraState = "idle" | "starting" | "live" | "captured" | "checking" | "denied" | "unsupported";
 
 const CAMERA_STATE_TEXT: Record<CameraState, string> = {
   idle: "Camera not yet started.",
   starting: "Starting camera…",
   live: "Camera live. Position your face inside the outline, then take the photo.",
+  checking: "Checking photo quality…",
   captured: "Photo captured. Retake if it is unclear.",
   denied: "Camera access was denied or is unavailable. Grant camera permission and try again.",
   unsupported: "This browser does not support camera access. A different browser is required.",
@@ -54,13 +64,15 @@ const CAMERA_STATE_TEXT: Record<CameraState, string> = {
  * changes are announced via an aria-live region so screen-reader users get
  * the same "camera detected" feedback sighted users get from the preview.
  */
-export function IdentityCheck({ fullName, onVerified }: IdentityCheckProps) {
+export function IdentityCheck({ fullName, onVerified, faceDetector }: IdentityCheckProps) {
   const [indexNumber, setIndexNumber] = useState("");
   const [indexTouched, setIndexTouched] = useState(false);
   const [cameraState, setCameraState] = useState<CameraState>("idle");
   const [attested, setAttested] = useState(false);
   const [capturedUrl, setCapturedUrl] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  /** Phase 1.6: portrait quality-check outcome, announced via the same aria-live status region as camera state. */
+  const [qualityStatus, setQualityStatus] = useState<string | null>(null);
 
   const webcamRef = useRef<WebcamHandle | null>(null);
   const capturedBlobRef = useRef<Blob | null>(null);
@@ -118,9 +130,52 @@ export function IdentityCheck({ fullName, onVerified }: IdentityCheckProps) {
       );
       return;
     }
+
+    setCameraState("checking");
+    setQualityStatus("Checking photo quality…");
+
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(blob);
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("2d context unavailable");
+      ctx.drawImage(bitmap, 0, 0);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      // No faceDetector configured (host app didn't wire one up) -> skip the
+      // face-count check rather than block on a feature that isn't there;
+      // brightness/sharpness still run either way.
+      let faceCount = 1;
+      if (faceDetector) {
+        const result = await faceDetector.detect(bitmap);
+        faceCount = result.faceCount;
+      }
+
+      const quality = evaluatePortraitQuality(imageData, faceCount);
+      if (!quality.ok) {
+        const messages = quality.failures.map((f) => PORTRAIT_QUALITY_MESSAGES[f]);
+        setQualityStatus(messages.join(" "));
+        await notify.warning("Photo not accepted", messages.join(" "));
+        setCameraState("live");
+        return;
+      }
+    } catch (err) {
+      console.error("Portrait quality check failed", err);
+      // Fail open on a check-pipeline error (e.g. createImageBitmap
+      // unsupported) rather than blocking identity verification entirely —
+      // the photo itself is still evidence for a human reviewer even
+      // un-gated, same posture as every other soft signal in this repo.
+    } finally {
+      bitmap?.close();
+    }
+
     capturedBlobRef.current = blob;
     if (capturedUrl) URL.revokeObjectURL(capturedUrl);
     setCapturedUrl(URL.createObjectURL(blob));
+    setQualityStatus("Photo captured and passed quality checks.");
     setCameraState("captured");
   }
 
@@ -128,6 +183,7 @@ export function IdentityCheck({ fullName, onVerified }: IdentityCheckProps) {
     capturedBlobRef.current = null;
     if (capturedUrl) URL.revokeObjectURL(capturedUrl);
     setCapturedUrl(null);
+    setQualityStatus(null);
     setCameraState("live");
   }
 
@@ -283,10 +339,10 @@ export function IdentityCheck({ fullName, onVerified }: IdentityCheckProps) {
                 Start camera
               </Button>
             ) : null}
-            {cameraState === "live" ? (
-              <Button type="button" onClick={handleTakePhoto}>
+            {cameraState === "live" || cameraState === "checking" ? (
+              <Button type="button" onClick={handleTakePhoto} disabled={cameraState === "checking"}>
                 <Camera aria-hidden="true" />
-                Take photo
+                {cameraState === "checking" ? "Checking photo…" : "Take photo"}
               </Button>
             ) : null}
             {cameraState === "captured" ? (
@@ -299,12 +355,18 @@ export function IdentityCheck({ fullName, onVerified }: IdentityCheckProps) {
 
           {/* Non-visual feedback mirroring ConsentScreen's camera-check
               pattern — announced politely so screen-reader users learn the
-              camera state without relying on the preview/outline. */}
+              camera state without relying on the preview/outline. Includes
+              the Phase 1.6 portrait-quality outcome so a rejected photo's
+              reason reaches screen-reader users the same way the visible
+              notify.warning() toast does for sighted users. */}
           <p id={statusId} role="status" aria-live="polite" className="sr-only">
-            {CAMERA_STATE_TEXT[cameraState]}
+            {qualityStatus ?? CAMERA_STATE_TEXT[cameraState]}
           </p>
           {cameraState === "denied" || cameraState === "unsupported" ? (
             <p className="text-destructive text-sm">{CAMERA_STATE_TEXT[cameraState]}</p>
+          ) : null}
+          {qualityStatus && cameraState === "live" ? (
+            <p className="text-destructive text-sm">{qualityStatus}</p>
           ) : null}
         </section>
 
@@ -312,18 +374,34 @@ export function IdentityCheck({ fullName, onVerified }: IdentityCheckProps) {
           <h2 id="attest-heading" className="font-medium">
             Attestation
           </h2>
-          <div className="flex items-start gap-3">
+          {/* Phase 1.6 redesign: a single natural-flowing full-width
+              paragraph (not a narrow checkbox+text column) with the
+              student's name/index colour-coded inline. The checkbox sits
+              above the paragraph but both remain one accessible control —
+              the <Label> still wraps the full paragraph text, so clicking
+              anywhere in the sentence toggles the checkbox, exactly as the
+              previous layout did (same htmlFor/id association, same
+              accessible name), just restacked visually. */}
+          <div className="space-y-2">
             <Checkbox
               id="attestation-checkbox"
               checked={attested}
               onCheckedChange={(checked) => setAttested(checked === true)}
+              aria-describedby="attestation-text"
             />
-            <Label htmlFor="attestation-checkbox" className="text-sm font-normal leading-normal">
-              I confirm that I, {displayName}, index number{" "}
-              <span className="font-mono">{indexNumber || "__________"}</span>, am the person taking
-              this assessment. I understand that impersonation is an academic offense at USTED and
-              may lead to cancellation of examination results, withdrawal from the institution, and
-              other disciplinary measures.
+            <Label
+              htmlFor="attestation-checkbox"
+              id="attestation-text"
+              className="block w-full text-sm font-normal leading-relaxed"
+            >
+              I confirm that I,{" "}
+              <span className="text-primary font-semibold">{displayName}</span>, index number{" "}
+              <span className="text-primary font-mono font-semibold">
+                {indexNumber || <span className="text-muted-foreground font-sans">(not yet entered)</span>}
+              </span>
+              , am the person taking this assessment. I understand that impersonation is an academic
+              offense at USTED and may lead to cancellation of examination results, withdrawal from
+              the institution, and other disciplinary measures.
             </Label>
           </div>
         </section>

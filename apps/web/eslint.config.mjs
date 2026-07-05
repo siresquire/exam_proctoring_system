@@ -12,6 +12,11 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Phase 1.6: self-hosted MediaPipe Tasks Vision WASM loader JS —
+    // vendored third-party build output copied verbatim from
+    // node_modules/@mediapipe/tasks-vision/wasm/ (see
+    // apps/web/public/models/README.md), not source we maintain.
+    "public/mediapipe/**",
   ]),
   {
     // DESIGN.md §4: lib/notify.ts is the single SweetAlert2 gateway.

@@ -326,6 +326,61 @@ sets it for `student@usted.test` only — staff profiles stay `NULL`.
   persisted + applied before first paint (no flash of unscaled text), the
   same technique `next-themes` uses for color scheme.
 
+### Face-presence detection & portrait quality gating (Phase 1.6)
+
+`packages/proctor-core` defines a framework-agnostic `FaceDetector` interface
+(`detect(bitmap) -> Promise<{ faceCount }>`) — the engine calls it once per
+webcam snapshot (`engine.processSnapshot(bitmap)`) but never imports any ML
+runtime itself. `apps/web/lib/proctor/face-detector.ts` is the only place
+`@mediapipe/tasks-vision` is imported: it wraps MediaPipe Tasks Vision's
+BlazeFace short-range detector and is injected into the engine by
+`proctor-demo.tsx`. **Self-hosted**: the WASM runtime
+(`apps/web/public/mediapipe/`, copied from
+`node_modules/@mediapipe/tasks-vision/wasm/`) and the model file
+(`apps/web/public/models/blaze_face_short_range.tflite`, downloaded from
+Google's model store) are committed static assets served same-origin, for
+offline/low-bandwidth resilience — see `apps/web/public/models/README.md`
+for the regeneration commands. `face-detector.ts` falls back to the
+jsdelivr/Google-Storage CDN only if those local files are ever missing, with
+a console warning in development and a `TODO(production)` comment — treat
+that path as a safety net, not the intended production setup.
+
+Two new events, both a soft signal that only ever feeds the same
+human-review pipeline as every other proctoring flag (never an automatic
+penalty — RESEARCH.md §3 documents face-detector accuracy gaps in low light
+and for darker skin tones, which is exactly why this is debounced and
+reviewer-gated):
+
+- `no_face_detected` — **debounced**: only emitted after `noFaceThreshold`
+  (default 2) *consecutive* no-face snapshots (~40s at the default 20s
+  snapshot interval). A face reappearing resets the streak. Default severity
+  `medium`, overridable per-engine via `noFaceSeverity` (the demo harness
+  lets you flip it to `high` to watch it start counting toward the 3-strike
+  termination limit).
+- `multiple_faces_detected` — **not** debounced (2+ faces in a single frame
+  is a stronger signal than one bad frame). Default severity `high`,
+  overridable via `multipleFacesSeverity`.
+
+Both event types were added to `proctor-core`'s `ProctorEvent` union and to
+the server-side vocabulary in
+`supabase/migrations/20260705000003_proctor_face_detection_events.sql` (the
+`proctor_events.event_type` CHECK constraint and `log_proctor_events`'s
+inline validation list — copied from 20260705000001's version with just the
+two new values added). Unit tests for the debounce/threshold/reset/
+severity-override logic live in
+`packages/proctor-core/src/face-detection.test.ts` (a fake `FaceDetector`,
+no real ML).
+
+`IdentityCheck` (`apps/web/components/proctor/identity-check.tsx`) reuses the
+same MediaPipe detector to **gate** the identity portrait itself before
+accepting it: brightness (mean luma), sharpness (a Laplacian-variance-style
+high-frequency-energy heuristic), and exactly-one-face, all client-side on
+the captured canvas. A failing photo is rejected with specific guidance
+(too dark/bright, blurry, no face, multiple faces) via `notify.*` and an
+aria-live status update, and the student stays on the retake step — glasses
+are never blocked (only advisory text), since eyewear detection isn't
+attempted.
+
 ## Design system review
 
 Run the dev server and open `/design` — it exercises every notification
