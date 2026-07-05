@@ -189,7 +189,39 @@ deliverability on free tiers — impractical for the demo. So student onboarding
   "high-severity strikes N/3" counter, and a clear statement of which events at 3×
   terminate the session and file a report.
 
-### Phase 3 — Platform core: classes, banks, exams (week 6–10)
+### Phase 2b — Apps Script submission cross-check (added 2026-07-05)
+Detects the core Forms-wrapper bypass: a student opening the raw Google Form URL
+instead of going through the proctored wrapper. The lecturer installs a small
+Apps Script (`apps-script/`) on their form; its `onFormSubmit` trigger POSTs
+submission metadata (respondent email — requires the form's "collect email
+addresses" setting — + timestamp + form id) to a platform webhook authenticated
+by a per-exam shared secret. The webhook cross-checks each submission against
+`proctor_sessions` for that form: **no matching proctored session = flagged
+bypass**; submitted outside the session window = flagged. Results surface in the
+lecturer's Forms-exam results. Honest limit: matching is by email, so the form
+must collect it; a determined student sharing a link is still caught only as an
+anomaly for review, not hard-prevented (consistent with §0 "evidence + deterrence").
+
+### Phase 3 — Platform core (decomposed into sub-phases; week 6–12)
+Run sequentially, each its own reviewable slice:
+- **3a — Classes, enrollment & onboarding**: classes + class_members; CSV student
+  import; **temp-password generation** on enrollment; **roster export (CSV/XLSX)**
+  with login URL + index + temp password for mail-merge; pluggable **SMS adapter**
+  (dev/log provider now, Hubtel provider behind env keys — live send deferred).
+- **3b — Question banks**: category tree + tags + difficulty; **versioned** questions
+  (never edited in place); authoring UI per type (MCQ single/multi, true/false,
+  numeric, short answer, essay); **bulk import** — CSV/XLSX template with
+  validation-preview-before-import + Aiken + GIFT.
+- **3c — Exam builder**: exam entity; sections; **N-from-pool random draw** +
+  per-student question/option shuffle; scheduling window; per-exam tier + violation
+  policy (reusing Phase 1.7).
+- **3d — Exam room + grading**: one-question-at-a-time delivery, autosave,
+  resume-on-disconnect, server-authoritative timer (+ accommodations extra-time);
+  submit; auto-grade objective types + manual grading queue for essays; results
+  release. Proctoring engine attaches here by tier (this is the original Phase 4
+  "integrated proctoring" for System 2).
+
+#### (original Phase 3 scope, now covered by 3a–3d)
 Classes + enrollment (CSV import), **temp-password generation + roster export
 (CSV/XLSX) + Hubtel bulk-SMS onboarding** (see "Student onboarding" above), question
 banks with category tree/tags/difficulty and question versioning. **Question
