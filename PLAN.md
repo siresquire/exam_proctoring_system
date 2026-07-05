@@ -132,11 +132,46 @@ session, surviving refreshes and network drops.
 **Exit:** a real lecturer runs a real quiz through it. This is the quick win — System 1
 is in lecturers' hands while System 2 is still being built.
 
+### Student onboarding without a domain (settled 2026-07-05)
+Real transactional email (magic links) needs a verified sending domain and has poor
+deliverability on free tiers — impractical for the demo. So student onboarding does
+**not** depend on email:
+- **Login by Email OR Index Number** (10-digit USTED index). Index resolves to the
+  account server-side (service role, mapping never exposed to the client), then normal
+  password auth. Implemented in Phase 1.6.
+- **Temp passwords** auto-generated when an admin/lecturer/super_admin creates a class
+  and enrolls students (Phase 3). Fallback for email delays.
+- **Export class roster** (CSV/XLSX: name, index, login URL, temp password) for Google/
+  Microsoft **mail-merge** (Phase 3).
+- **Bulk SMS** (Hubtel or other Ghana provider) to send login URL + index + temp
+  password directly from the platform (Phase 3, pluggable provider adapter).
+- App URL is a `vercel.app` subdomain until a domain is purchased — functional as-is.
+
+### Phase 1.6 — Feedback fixes (added 2026-07-05, from live demo)
+- **Fix session-lost-on-refresh** (verify Supabase SSR token-refresh survives token
+  rotation; reproduce with short JWT expiry).
+- **Login by Email or Index Number** (server-side index→account resolution).
+- **Portrait quality gating**: reject the identity photo unless it passes brightness,
+  sharpness, and exactly-one-face checks (guidance + forced retake).
+- **Face-presence proctoring**: client-side face detection on each snapshot →
+  `no_face_detected` (debounced over consecutive misses) and `multiple_faces_detected`
+  violations. Fairness: never auto-fail on AI alone; severity configurable; routes to
+  human review (documented bias risk in RESEARCH.md).
+- **Attestation redesign**: single natural flowing paragraph, name + index inline and
+  colour-coded.
+- **Flag-for-review redesign**: flagged palette state integrated (not a tacked-on
+  corner icon).
+- **Demo violation harness**: controls to trigger each violation type/severity, a live
+  "high-severity strikes N/3" counter, and a clear statement of which events at 3×
+  terminate the session and file a report.
+
 ### Phase 3 — Platform core: classes, banks, exams (week 6–10)
-Classes + enrollment (CSV import), question banks with category tree/tags/difficulty
-and question versioning. **Question authoring**: form-based editor per type, plus
-**bulk import** — CSV/XLSX template with validation-preview-before-import, and
-Aiken + GIFT plain-text formats (Moodle-compatible migration path). Exam builder (MCQ single/multi, true/false, numeric, short
+Classes + enrollment (CSV import), **temp-password generation + roster export
+(CSV/XLSX) + Hubtel bulk-SMS onboarding** (see "Student onboarding" above), question
+banks with category tree/tags/difficulty and question versioning. **Question
+authoring**: form-based editor per type, plus **bulk import** — CSV/XLSX template with
+validation-preview-before-import, and Aiken + GIFT plain-text formats (Moodle-compatible
+migration path). Exam builder (MCQ single/multi, true/false, numeric, short
 answer, essay first; sections, N-from-pool random draw, per-student shuffling),
 scheduling windows, exam room UI (one-question-at-a-time, autosave every answer,
 resume-on-disconnect, server-authoritative timer), auto-grading for objective types +
