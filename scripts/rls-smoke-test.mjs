@@ -482,6 +482,210 @@ async function main() {
     );
   }
 
+  // === (i) proctoring: sessions/events/media RLS + RPCs =====================
+  // Phase 1. Uses a fresh 'smoke-test' context so it never collides with a
+  // real 'demo' session the same student might have open in a browser tab.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const context = `smoke-test-${Date.now()}`;
+
+    // i1. student starts a session via RPC.
+    const { data: sessionId, error: startErr } = await studentClient.rpc("start_proctor_session", {
+      context,
+      tier: 2,
+    });
+    record(
+      "i1. student start_proctor_session succeeds and returns a session id",
+      !startErr && typeof sessionId === "string" && sessionId.length > 0,
+      startErr?.message ?? `sessionId=${sessionId}`,
+    );
+
+    // i2. student logs a valid event batch.
+    const nowIso = new Date().toISOString();
+    const { error: logErr } = await studentClient.rpc("log_proctor_events", {
+      session_id: sessionId,
+      events: [
+        { event_type: "tab_hidden", severity: "medium", occurred_at: nowIso, meta: { source: "smoke-test" } },
+      ],
+    });
+    record("i2. student log_proctor_events (valid batch) succeeds", !logErr, logErr?.message);
+
+    // i2b. student can SELECT the event just logged.
+    const { data: ownEvents, error: ownEventsErr } = await studentClient
+      .from("proctor_events")
+      .select("*")
+      .eq("session_id", sessionId)
+      .eq("event_type", "tab_hidden");
+    record(
+      "i2b. student SELECT own proctor_events returns the logged event",
+      !ownEventsErr && (ownEvents?.length ?? 0) >= 1,
+      ownEventsErr?.message ?? `rows=${ownEvents?.length}`,
+    );
+
+    // i3. student cannot log events to another user's session.
+    const { data: lecturerSessionId, error: lecturerStartErr } = await lecturerClient.rpc(
+      "start_proctor_session",
+      { context: `${context}-lecturer`, tier: 2 },
+    );
+    if (lecturerStartErr) {
+      record("i3. student log_proctor_events on another user's session FAILS", false, lecturerStartErr.message);
+    } else {
+      const { error: crossLogErr } = await studentClient.rpc("log_proctor_events", {
+        session_id: lecturerSessionId,
+        events: [{ event_type: "tab_hidden", severity: "low", occurred_at: nowIso }],
+      });
+      record(
+        "i3. student log_proctor_events on another user's session FAILS",
+        Boolean(crossLogErr),
+        crossLogErr?.message ?? "no error raised — SECURITY: student wrote events into another user's session",
+      );
+      // Clean up the lecturer's throwaway session.
+      await lecturerClient.rpc("end_proctor_session", { session_id: lecturerSessionId });
+    }
+
+    // i4. student cannot INSERT directly into proctor_sessions/events/media
+    // (RPCs are the only sanctioned write path).
+    const { error: directSessionErr } = await studentClient.from("proctor_sessions").insert({
+      user_id: studentId,
+      context: "forged",
+      consent_given_at: nowIso,
+    });
+    record(
+      "i4a. student direct INSERT into proctor_sessions FAILS",
+      isDenied(directSessionErr) || Boolean(directSessionErr),
+      directSessionErr?.message ?? "no error raised — SECURITY: direct session insert succeeded",
+    );
+
+    const { error: directEventErr } = await studentClient.from("proctor_events").insert({
+      session_id: sessionId,
+      event_type: "tab_hidden",
+      severity: "low",
+      occurred_at: nowIso,
+    });
+    record(
+      "i4b. student direct INSERT into proctor_events FAILS",
+      isDenied(directEventErr) || Boolean(directEventErr),
+      directEventErr?.message ?? "no error raised — SECURITY: direct event insert succeeded",
+    );
+
+    const { error: directMediaErr } = await studentClient.from("proctor_media").insert({
+      session_id: sessionId,
+      storage_path: `${sessionId}/forged.jpg`,
+      kind: "snapshot",
+      captured_at: nowIso,
+    });
+    record(
+      "i4c. student direct INSERT into proctor_media FAILS",
+      isDenied(directMediaErr) || Boolean(directMediaErr),
+      directMediaErr?.message ?? "no error raised — SECURITY: direct media insert succeeded",
+    );
+
+    // i5. events UPDATE/DELETE denied (append-only, belt-and-braces trigger).
+    const { data: eventRow } = await admin
+      .from("proctor_events")
+      .select("id")
+      .eq("session_id", sessionId)
+      .eq("event_type", "tab_hidden")
+      .limit(1)
+      .maybeSingle();
+
+    if (eventRow) {
+      const { error: updEventErr } = await studentClient
+        .from("proctor_events")
+        .update({ severity: "high" })
+        .eq("id", eventRow.id);
+      record(
+        "i5a. student UPDATE proctor_events FAILS",
+        isDenied(updEventErr) || Boolean(updEventErr),
+        updEventErr?.message ?? "no error raised — SECURITY: proctor_events is mutable",
+      );
+
+      const { error: delEventErr } = await studentClient
+        .from("proctor_events")
+        .delete()
+        .eq("id", eventRow.id);
+      record(
+        "i5b. student DELETE proctor_events FAILS",
+        isDenied(delEventErr) || Boolean(delEventErr),
+        delEventErr?.message ?? "no error raised — SECURITY: proctor_events rows can be deleted",
+      );
+    } else {
+      record("i5a. student UPDATE proctor_events FAILS", false, "skipped — no event row found");
+      record("i5b. student DELETE proctor_events FAILS", false, "skipped — no event row found");
+    }
+
+    // i6. a second start_proctor_session for the same context abandons the
+    // first and logs a concurrent_session_detected event on it.
+    const { data: secondSessionId, error: secondStartErr } = await studentClient.rpc(
+      "start_proctor_session",
+      { context, tier: 2 },
+    );
+    record(
+      "i6a. second start_proctor_session (same context) succeeds",
+      !secondStartErr && typeof secondSessionId === "string" && secondSessionId !== sessionId,
+      secondStartErr?.message ?? `secondSessionId=${secondSessionId}`,
+    );
+
+    const { data: firstSessionAfter, error: firstSessionAfterErr } = await admin
+      .from("proctor_sessions")
+      .select("status")
+      .eq("id", sessionId)
+      .single();
+    record(
+      "i6b. original session is now status=abandoned",
+      !firstSessionAfterErr && firstSessionAfter?.status === "abandoned",
+      firstSessionAfterErr?.message ?? `status=${firstSessionAfter?.status}`,
+    );
+
+    const { data: concurrentEvents, error: concurrentErr } = await admin
+      .from("proctor_events")
+      .select("*")
+      .eq("session_id", sessionId)
+      .eq("event_type", "concurrent_session_detected");
+    record(
+      "i6c. concurrent_session_detected event logged on the abandoned session",
+      !concurrentErr && (concurrentEvents?.length ?? 0) >= 1,
+      concurrentErr?.message ?? `rows=${concurrentEvents?.length}`,
+    );
+
+    // i7. lecturer can SELECT the student's session and events.
+    const { data: lecturerSeesSession, error: lecturerSeesSessionErr } = await lecturerClient
+      .from("proctor_sessions")
+      .select("*")
+      .eq("id", secondSessionId ?? sessionId);
+    record(
+      "i7a. lecturer SELECT student's proctor_sessions row succeeds",
+      !lecturerSeesSessionErr && (lecturerSeesSession?.length ?? 0) >= 1,
+      lecturerSeesSessionErr?.message ?? `rows=${lecturerSeesSession?.length}`,
+    );
+
+    const { data: lecturerSeesEvents, error: lecturerSeesEventsErr } = await lecturerClient
+      .from("proctor_events")
+      .select("*")
+      .eq("session_id", sessionId);
+    record(
+      "i7b. lecturer SELECT student's proctor_events succeeds",
+      !lecturerSeesEventsErr && (lecturerSeesEvents?.length ?? 0) >= 1,
+      lecturerSeesEventsErr?.message ?? `rows=${lecturerSeesEvents?.length}`,
+    );
+
+    // i8. end_proctor_session by a non-owner fails.
+    const { error: nonOwnerEndErr } = await lecturerClient.rpc("end_proctor_session", {
+      session_id: secondSessionId,
+    });
+    record(
+      "i8. end_proctor_session by non-owner FAILS",
+      Boolean(nonOwnerEndErr),
+      nonOwnerEndErr?.message ?? "no error raised — SECURITY: a non-owner ended another user's session",
+    );
+
+    // Cleanup: end the second session as its rightful owner so this test is idempotent.
+    if (secondSessionId) {
+      await studentClient.rpc("end_proctor_session", { session_id: secondSessionId });
+    }
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the

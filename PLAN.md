@@ -96,6 +96,28 @@ purpose, retention). Severity mapping per the industry taxonomy in RESEARCH.md.
 **Exit:** a demo page produces a complete, timestamped event + snapshot trail for a
 session, surviving refreshes and network drops.
 
+### Phase 1.5 — Identity, violation policy, branding (added 2026-07-05, user requirements)
+- **Violation threshold**: configurable strikes (default 3 high-severity violations)
+  → server-side auto-termination of the session + a report record queued for review
+  by the issuing lecturer/admin. Enforced in the `log_proctor_events` RPC (client
+  can't dodge it); client reacts by locking the exam UI and informing the student.
+- **Identity verification before every proctored session**: clear face portrait
+  capture (stored as session evidence) + index number entry + explicit attestation:
+  impersonation is an academic offense at USTED punishable by exam cancellation,
+  withdrawal from the institution, and other disciplinary measures.
+- **USTED index numbers**: ~10-digit numeric (e.g. 5201040845; serials vary by
+  admission year and programme). Validate `^\d{10}$` client-side and as a DB CHECK
+  on `profiles.student_number`; entered index number is cross-checked against the
+  profile's student_number when set, mismatch = high-severity flag (not a hard block —
+  registry data may lag; the portrait is the primary evidence).
+- **Branding**: official AAMUSTED logo (cropped-AAMUSTED-NEW-LOGO-26.png) in header +
+  login; brand palette derived from it (maroon primary, gold accent, green success)
+  applied across light/dark/high-contrast themes with WCAG-verified contrast.
+- **Font-size control**: user-adjustable text scaling (100–150%) persisted per user,
+  alongside the theme toggle (WCAG 1.4.4 beyond browser zoom).
+- Demo page gets **sample quiz questions** so violations are experienced in a
+  realistic test-taking flow.
+
 ### Phase 2 — **System 1 ships: proctored Google Forms wrapper** (week 4–6)
 - `/proctor/[token]` page: consent → camera check → iframes the lecturer's Google Form
   → proctor-core runs around it → submit confirmation.
@@ -112,7 +134,9 @@ is in lecturers' hands while System 2 is still being built.
 
 ### Phase 3 — Platform core: classes, banks, exams (week 6–10)
 Classes + enrollment (CSV import), question banks with category tree/tags/difficulty
-and question versioning, exam builder (MCQ single/multi, true/false, numeric, short
+and question versioning. **Question authoring**: form-based editor per type, plus
+**bulk import** — CSV/XLSX template with validation-preview-before-import, and
+Aiken + GIFT plain-text formats (Moodle-compatible migration path). Exam builder (MCQ single/multi, true/false, numeric, short
 answer, essay first; sections, N-from-pool random draw, per-student shuffling),
 scheduling windows, exam room UI (one-question-at-a-time, autosave every answer,
 resume-on-disconnect, server-authoritative timer), auto-grading for objective types +

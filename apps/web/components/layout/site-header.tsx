@@ -9,6 +9,7 @@ const NAV_LINKS = [
   { href: "/dashboard/lecturer", label: "Lecturer" },
   { href: "/dashboard/admin", label: "Admin" },
   { href: "/dashboard/super-admin", label: "Super Admin" },
+  { href: "/proctor-demo", label: "Proctoring demo" },
   { href: "/design", label: "Design system" },
 ];
 

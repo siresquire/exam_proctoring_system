@@ -1,0 +1,152 @@
+/**
+ * Shared types for @proctor/core. No React, no DOM-lib-only globals at the
+ * type level beyond what `lib: ["ES2021", "DOM"]` already provides (see
+ * tsconfig.json) — this package must stay usable from any framework.
+ */
+
+/**
+ * The full set of client-observable integrity events the proctoring engine
+ * can emit, plus the session lifecycle/heartbeat events the server also
+ * accepts (see supabase/migrations/20260704000006_proctor_sessions_events_media.sql
+ * — the `event_type` CHECK constraint there is the source of truth this
+ * union must stay in sync with).
+ */
+export type ProctorEvent =
+  | "tab_hidden"
+  | "tab_visible"
+  | "window_blur"
+  | "window_focus"
+  | "fullscreen_exit"
+  | "fullscreen_enter"
+  | "copy_attempt"
+  | "paste_attempt"
+  | "cut_attempt"
+  | "contextmenu"
+  | "connection_lost"
+  | "connection_restored"
+  | "snapshot_captured"
+  | "camera_lost"
+  | "multi_monitor_detected"
+  | "page_unload"
+  | "heartbeat"
+  | "session_start"
+  | "session_end"
+  | "concurrent_session_detected";
+
+export type ProctorSeverity = "info" | "low" | "medium" | "high";
+
+/** Integrity tiers, PLAN.md §2 (T1 quiz .. T4 high-stakes). */
+export type ProctorTier = 1 | 2 | 3 | 4;
+
+/** A single event as queued client-side, before being batched/sent. */
+export interface ProctorEventPayload {
+  event_type: ProctorEvent;
+  severity: ProctorSeverity;
+  /** Client-reported timestamp (ISO 8601). The server stamps its own received_at separately. */
+  occurred_at: string;
+  meta?: Record<string, unknown>;
+}
+
+/** Emitted to `engine.on()` listeners — same shape plus nothing sensitive. */
+export interface ProctorEngineEvent extends ProctorEventPayload {}
+
+/**
+ * Transport adapter: how batched events leave the browser. Implemented in
+ * apps/web (Supabase RPC) — the engine itself never imports @supabase/*.
+ */
+export interface ProctorTransportAdapter {
+  /** Send a batch of events for a session. Throwing means "retry me". */
+  sendEvents(sessionId: string, events: ProctorEventPayload[]): Promise<void>;
+}
+
+export interface SnapshotMeta {
+  capturedAt: string;
+  /** e.g. "image/jpeg" */
+  mimeType: string;
+}
+
+/**
+ * Storage adapter: where webcam snapshots/clips land. Local Supabase
+ * Storage today (see supabase/migrations/20260704000007_proctor_rls_and_storage.sql);
+ * swapping in Cloudflare R2 later (PLAN.md §1) means writing a new adapter
+ * that implements this interface, not touching the engine. Keep it this
+ * thin on purpose — presigned-URL uploads (R2) and direct-to-Supabase
+ * uploads both fit "hand me a blob + metadata, you deal with the bytes."
+ */
+export interface ProctorStorageAdapter {
+  uploadSnapshot(sessionId: string, blob: Blob, meta: SnapshotMeta): Promise<void>;
+}
+
+export interface ProctorEngineAdapters {
+  transport: ProctorTransportAdapter;
+  storage?: ProctorStorageAdapter;
+}
+
+export interface ProctorEngineOptions {
+  /** How often to capture a webcam snapshot, ms. Default 20000. Ignored if webcam isn't started. */
+  snapshotIntervalMs?: number;
+  /** How often to emit a heartbeat event, ms. Default 20000. */
+  heartbeatIntervalMs?: number;
+  /** How often to flush the queued event batch, ms. Default 5000. */
+  batchIntervalMs?: number;
+  tier?: ProctorTier;
+  /** localStorage key prefix for the offline buffer. Default "proctor-core". */
+  storageKeyPrefix?: string;
+}
+
+export interface ProctorEngineConfig {
+  sessionId: string;
+  adapters: ProctorEngineAdapters;
+  options?: ProctorEngineOptions;
+}
+
+export type ProctorEventListener = (event: ProctorEngineEvent) => void;
+
+export interface ProctorEngine {
+  start(): void;
+  stop(): void;
+  on(listener: ProctorEventListener): () => void;
+  /** Manually enqueue+emit an event (used by webcam snapshot capture, or a host app's own signal). */
+  report(event: ProctorEvent, severity: ProctorSeverity, meta?: Record<string, unknown>): void;
+  /** Best-effort immediate flush (e.g. before navigating away). */
+  flush(): Promise<void>;
+}
+
+/** Severity mapping per RESEARCH.md §3's industry taxonomy. Tier-aware: some signals escalate at higher tiers. */
+export function defaultSeverity(event: ProctorEvent, tier: ProctorTier = 2): ProctorSeverity {
+  switch (event) {
+    case "tab_hidden":
+      return "medium";
+    case "tab_visible":
+    case "window_focus":
+    case "fullscreen_enter":
+    case "connection_restored":
+    case "snapshot_captured":
+    case "session_start":
+    case "session_end":
+    case "heartbeat":
+      return "info";
+    case "window_blur":
+      return "low";
+    case "fullscreen_exit":
+      return tier >= 3 ? "high" : "medium";
+    case "copy_attempt":
+    case "paste_attempt":
+    case "cut_attempt":
+      return tier >= 3 ? "medium" : "low";
+    case "contextmenu":
+      return "low";
+    case "connection_lost":
+      return "low";
+    case "camera_lost":
+      return "high";
+    case "multi_monitor_detected":
+      return "info";
+    case "page_unload":
+      return "medium";
+    case "concurrent_session_detected":
+      return "high";
+    default:
+      return "info";
+  }
+}

@@ -5,10 +5,14 @@ packages:
 # Explicitly allow install/postinstall scripts for these trusted deps
 # (Next.js image optimization + eslint native resolver). Required because
 # pnpm blocks arbitrary lifecycle scripts by default (supply-chain safety).
+# esbuild: true — required by vite/vitest (packages/proctor-core test
+# runner), well-known trusted build tool.
 allowBuilds:
+  esbuild: true
   sharp: true
   unrs-resolver: true
 
 onlyBuiltDependencies:
+  - esbuild
   - sharp
   - unrs-resolver

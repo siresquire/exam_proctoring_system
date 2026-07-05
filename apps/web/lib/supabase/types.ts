@@ -10,6 +10,9 @@ export type Json = string | number | boolean | null | { [key: string]: Json | un
 
 export type UserRole = "super_admin" | "admin" | "lecturer" | "student";
 
+export type ProctorSessionStatus = "active" | "ended" | "abandoned";
+export type ProctorSeverity = "info" | "low" | "medium" | "high";
+
 export interface Database {
   public: {
     Tables: {
@@ -86,6 +89,54 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      proctor_sessions: {
+        Row: {
+          id: string;
+          user_id: string;
+          context: string;
+          status: ProctorSessionStatus;
+          integrity_tier: number;
+          consent_given_at: string;
+          user_agent: string | null;
+          started_at: string;
+          ended_at: string | null;
+          last_heartbeat_at: string | null;
+        };
+        // Writable only via start_proctor_session/end_proctor_session RPCs
+        // (security definer) — no client INSERT/UPDATE policy exists.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      proctor_events: {
+        Row: {
+          id: number;
+          session_id: string;
+          event_type: string;
+          severity: ProctorSeverity;
+          occurred_at: string;
+          received_at: string;
+          meta: Json;
+        };
+        // Writable only via log_proctor_events() RPC.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      proctor_media: {
+        Row: {
+          id: number;
+          session_id: string;
+          storage_path: string;
+          kind: "snapshot" | "clip";
+          captured_at: string;
+          created_at: string;
+        };
+        // Writable only via record_proctor_media() RPC.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -114,6 +165,22 @@ export interface Database {
         Args: { target: string; new_role: UserRole };
         Returns: undefined;
       };
+      start_proctor_session: {
+        Args: { context: string; tier?: number };
+        Returns: string;
+      };
+      end_proctor_session: {
+        Args: { session_id: string };
+        Returns: undefined;
+      };
+      log_proctor_events: {
+        Args: { session_id: string; events: Json };
+        Returns: undefined;
+      };
+      record_proctor_media: {
+        Args: { session_id: string; storage_path: string; kind: string; captured_at: string };
+        Returns: number;
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -123,3 +190,6 @@ export interface Database {
 }
 
 export type Profile = Database["public"]["Tables"]["profiles"]["Row"];
+export type ProctorSessionRow = Database["public"]["Tables"]["proctor_sessions"]["Row"];
+export type ProctorEventRow = Database["public"]["Tables"]["proctor_events"]["Row"];
+export type ProctorMediaRow = Database["public"]["Tables"]["proctor_media"]["Row"];
