@@ -2691,6 +2691,299 @@ async function main() {
     }
   }
 
+  // === (r) Phase 3b: question banks, categories, VERSIONED questions =======
+  // Covers: create_question_bank/create_question are lecturer-or-higher
+  // only (student denied); a student cannot SELECT question_banks/
+  // questions/question_versions at all (RLS, not just RPC-gating);
+  // add_question_version increments version_no and repoints
+  // current_version_id while the OLD version row still exists (proves
+  // versioning preserves history, not just "the new value stuck"); a
+  // version row cannot be UPDATEd (immutability trigger) even via the
+  // owner's own client; retire/reactivate works; category tree insert +
+  // cascade-delete (children cascade, questions under a deleted category
+  // become uncategorized, not deleted).
+  //
+  // Note on the "lock down trusting helpers" rule (20260705000006 pattern):
+  // can_manage_question_bank and every RPC in
+  // 20260705000010_question_banks.sql re-derive the caller's authority from
+  // auth.uid() + has_role()/bank ownership themselves — none of them trust
+  // a pre-validated payload the way _create_proctor_session/
+  // match_forms_submission do, so none need an EXECUTE revoke. r1/r2 below
+  // are the negative-authorization proof for that claim.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const suffix = Date.now();
+
+    // r1. student cannot call create_question_bank.
+    const { data: studentBankId, error: studentBankErr } = await studentClient.rpc("create_question_bank", {
+      name: `Student-forged bank ${suffix}`,
+    });
+    record(
+      "r1. student rpc create_question_bank FAILS",
+      Boolean(studentBankErr) && !studentBankId,
+      studentBankErr?.message ?? "no error raised — SECURITY: a student created a question bank",
+    );
+
+    // Lecturer creates a real bank for the rest of this section.
+    const { data: bankId, error: bankErr } = await lecturerClient.rpc("create_question_bank", {
+      name: `Smoke test bank ${suffix}`,
+      description: "Created by rls-smoke-test.mjs",
+    });
+    record("r2. lecturer rpc create_question_bank succeeds", !bankErr && typeof bankId === "string", bankErr?.message);
+
+    if (bankId) {
+      // r3. student SELECT question_banks returns 0 rows (RLS, not RPC-gating).
+      const { data: studentBankRows, error: studentBankSelErr } = await studentClient
+        .from("question_banks")
+        .select("*")
+        .eq("id", bankId);
+      record(
+        "r3. student SELECT question_banks (by id) returns 0 rows",
+        !studentBankSelErr && (studentBankRows?.length ?? 0) === 0,
+        studentBankSelErr?.message ?? `rows=${studentBankRows?.length}`,
+      );
+
+      // r4. student cannot call create_question against this bank.
+      const { data: studentQId, error: studentQErr } = await studentClient.rpc("create_question", {
+        bank_id: bankId,
+        type: "true_false",
+        prompt: "Forged question",
+        body: { correct: true, marks: 1 },
+      });
+      record(
+        "r4. student rpc create_question FAILS",
+        Boolean(studentQErr) && !studentQId,
+        studentQErr?.message ?? "no error raised — SECURITY: a student created a question",
+      );
+
+      // r5. lecturer creates a category tree: Topic -> Subtopic.
+      const { data: topicId, error: topicErr } = await lecturerClient.rpc("create_question_category", {
+        bank_id: bankId,
+        name: "Topic",
+      });
+      record("r5a. lecturer create_question_category (top-level) succeeds", !topicErr && typeof topicId === "string", topicErr?.message);
+
+      const { data: subtopicId, error: subtopicErr } = await lecturerClient.rpc("create_question_category", {
+        bank_id: bankId,
+        name: "Subtopic",
+        parent_id: topicId,
+      });
+      record(
+        "r5b. lecturer create_question_category (nested under Topic) succeeds",
+        !subtopicErr && typeof subtopicId === "string",
+        subtopicErr?.message,
+      );
+
+      // r6. student cannot SELECT question_categories for this bank.
+      const { data: studentCatRows, error: studentCatErr } = await studentClient
+        .from("question_categories")
+        .select("*")
+        .eq("bank_id", bankId);
+      record(
+        "r6. student SELECT question_categories returns 0 rows",
+        !studentCatErr && (studentCatRows?.length ?? 0) === 0,
+        studentCatErr?.message ?? `rows=${studentCatRows?.length}`,
+      );
+
+      // r7. lecturer creates one question of each type; assert create_question
+      // rejects an obviously-bad body (mcq with < 2 options) too.
+      const { data: badMcqId, error: badMcqErr } = await lecturerClient.rpc("create_question", {
+        bank_id: bankId,
+        type: "mcq_single",
+        prompt: "Bad mcq (1 option)",
+        body: { options: [{ id: "A", text: "only one" }], correct: ["A"], marks: 1 },
+      });
+      record(
+        "r7. create_question rejects mcq_single with < 2 options",
+        Boolean(badMcqErr) && !badMcqId,
+        badMcqErr?.message ?? "no error raised — SECURITY/INTEGRITY: malformed mcq body accepted",
+      );
+
+      const { data: questionId, error: questionErr } = await lecturerClient.rpc("create_question", {
+        bank_id: bankId,
+        category_id: subtopicId,
+        type: "mcq_single",
+        difficulty: "easy",
+        tags: ["smoke-test"],
+        prompt: "What is 2 + 2?",
+        body: {
+          options: [
+            { id: "A", text: "3" },
+            { id: "B", text: "4" },
+          ],
+          correct: ["B"],
+          marks: 1,
+        },
+      });
+      record(
+        "r8. lecturer create_question (mcq_single, valid body) succeeds",
+        !questionErr && typeof questionId === "string",
+        questionErr?.message,
+      );
+
+      if (questionId) {
+        // r9. bank_questions shows version_no=1 with the category resolved.
+        const { data: rows1, error: rows1Err } = await lecturerClient.rpc("bank_questions", { bank_id: bankId });
+        const row1 = (rows1 ?? []).find((r) => r.question_id === questionId);
+        record(
+          "r9. bank_questions shows the new question at version_no=1 with category_name=Subtopic",
+          !rows1Err && row1?.version_no === 1 && row1?.category_name === "Subtopic",
+          rows1Err?.message ?? `version_no=${row1?.version_no} category_name=${row1?.category_name}`,
+        );
+
+        const firstVersionId = row1?.current_version_id;
+
+        // r10. student cannot SELECT question_versions for this question.
+        const { data: studentVerRows, error: studentVerErr } = await studentClient
+          .from("question_versions")
+          .select("*")
+          .eq("question_id", questionId);
+        record(
+          "r10. student SELECT question_versions returns 0 rows",
+          !studentVerErr && (studentVerRows?.length ?? 0) === 0,
+          studentVerErr?.message ?? `rows=${studentVerRows?.length}`,
+        );
+
+        // r11. student cannot call add_question_version.
+        const { data: studentEditId, error: studentEditErr } = await studentClient.rpc("add_question_version", {
+          question_id: questionId,
+          prompt: "Forged edit",
+          body: { options: [{ id: "A", text: "x" }, { id: "B", text: "y" }], correct: ["A"], marks: 1 },
+        });
+        record(
+          "r11. student rpc add_question_version FAILS",
+          Boolean(studentEditErr) && !studentEditId,
+          studentEditErr?.message ?? "no error raised — SECURITY: a student edited another user's question",
+        );
+
+        // r12. lecturer edits the question: add_question_version ->
+        // version_no=2, current_version_id repointed, OLD version row STILL
+        // EXISTS (this is the actual versioning guarantee, not just "the
+        // new value stuck").
+        const { data: secondVersionId, error: secondVerErr } = await lecturerClient.rpc("add_question_version", {
+          question_id: questionId,
+          prompt: "What is 2 + 2? (edited)",
+          body: {
+            options: [
+              { id: "A", text: "3" },
+              { id: "B", text: "4" },
+              { id: "C", text: "5" },
+            ],
+            correct: ["B"],
+            marks: 2,
+          },
+        });
+        record(
+          "r12. lecturer add_question_version succeeds and returns a NEW version id",
+          !secondVerErr && typeof secondVersionId === "string" && secondVersionId !== firstVersionId,
+          secondVerErr?.message ?? `secondVersionId=${secondVersionId}`,
+        );
+
+        const { data: rows2, error: rows2Err } = await lecturerClient.rpc("bank_questions", { bank_id: bankId });
+        const row2 = (rows2 ?? []).find((r) => r.question_id === questionId);
+        record(
+          "r13. bank_questions now shows version_no=2 and current_version_id repointed to the new version",
+          !rows2Err && row2?.version_no === 2 && row2?.current_version_id === secondVersionId,
+          rows2Err?.message ?? `version_no=${row2?.version_no} current_version_id=${row2?.current_version_id}`,
+        );
+
+        const { data: oldVersionStillExists, error: oldVerErr } = await admin
+          .from("question_versions")
+          .select("id, version_no, prompt")
+          .eq("id", firstVersionId)
+          .maybeSingle();
+        record(
+          "r14. VERSIONING PROOF: the OLD version row (version_no=1) still exists after editing, unmutated",
+          !oldVerErr &&
+            oldVersionStillExists?.version_no === 1 &&
+            oldVersionStillExists?.prompt === "What is 2 + 2?",
+          oldVerErr?.message ?? `row=${JSON.stringify(oldVersionStillExists)}`,
+        );
+
+        // r15. IMMUTABILITY: even the bank owner cannot UPDATE an existing
+        // version row directly — the trigger blocks it regardless of RLS.
+        const { error: updateVersionErr } = await lecturerClient
+          .from("question_versions")
+          .update({ prompt: "tampered" })
+          .eq("id", firstVersionId);
+        record(
+          "r15. UPDATE on an existing question_versions row FAILS (immutability trigger)",
+          Boolean(updateVersionErr),
+          updateVersionErr?.message ?? "no error raised — SECURITY: a question_versions row was mutated in place",
+        );
+
+        // r16. retire / reactivate.
+        const { error: retireErr } = await lecturerClient.rpc("set_question_status", {
+          question_id: questionId,
+          status: "retired",
+        });
+        record("r16a. lecturer set_question_status(retired) succeeds", !retireErr, retireErr?.message);
+
+        const { data: retiredRow } = await admin
+          .from("questions")
+          .select("status")
+          .eq("id", questionId)
+          .single();
+        record(
+          "r16b. questions.status is now 'retired'",
+          retiredRow?.status === "retired",
+          `status=${retiredRow?.status}`,
+        );
+
+        const { error: reactivateErr } = await lecturerClient.rpc("set_question_status", {
+          question_id: questionId,
+          status: "active",
+        });
+        record("r16c. lecturer set_question_status(active) [cleanup] succeeds", !reactivateErr, reactivateErr?.message);
+
+        // r17. student cannot call set_question_status either.
+        const { error: studentStatusErr } = await studentClient.rpc("set_question_status", {
+          question_id: questionId,
+          status: "retired",
+        });
+        record(
+          "r17. student rpc set_question_status FAILS",
+          Boolean(studentStatusErr),
+          studentStatusErr?.message ?? "no error raised — SECURITY: a student retired another user's question",
+        );
+      }
+
+      // r18. category cascade: deleting "Topic" cascades to "Subtopic" AND
+      // sets the question's category_id to null (set null, not deleted).
+      const { error: deleteCatErr } = await lecturerClient.rpc("delete_question_category", { category_id: topicId });
+      record("r18a. lecturer delete_question_category (parent) succeeds", !deleteCatErr, deleteCatErr?.message);
+
+      const { data: subtopicAfterDelete } = await admin
+        .from("question_categories")
+        .select("id")
+        .eq("id", subtopicId)
+        .maybeSingle();
+      record(
+        "r18b. CASCADE: child category (Subtopic) was deleted along with its parent",
+        !subtopicAfterDelete,
+        `row=${JSON.stringify(subtopicAfterDelete)}`,
+      );
+
+      if (questionId) {
+        const { data: questionAfterCatDelete } = await admin
+          .from("questions")
+          .select("category_id, status")
+          .eq("id", questionId)
+          .single();
+        record(
+          "r18c. SET NULL: the question that was filed under the deleted category is now uncategorized, not deleted",
+          questionAfterCatDelete?.category_id === null && questionAfterCatDelete?.status === "active",
+          `row=${JSON.stringify(questionAfterCatDelete)}`,
+        );
+      }
+
+      // Cleanup: delete the whole bank (service role; cascades to
+      // categories/questions/versions via FK ON DELETE CASCADE).
+      await admin.from("question_banks").delete().eq("id", bankId);
+    }
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the

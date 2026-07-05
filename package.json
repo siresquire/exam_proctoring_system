@@ -9,6 +9,7 @@
     "build": "pnpm --filter web build",
     "lint": "pnpm --filter web lint",
     "typecheck": "pnpm -r typecheck",
+    "test:questions": "node --experimental-strip-types --test scripts/question-import-parsers.test.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

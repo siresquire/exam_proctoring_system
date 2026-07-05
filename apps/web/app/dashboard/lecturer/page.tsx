@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { FileSpreadsheet, Users } from "lucide-react";
+import { BookOpen, FileSpreadsheet, Users } from "lucide-react";
 
 import { DashboardShell } from "@/components/dashboard-shell";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,7 +7,7 @@ import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/ca
 export default function LecturerDashboard() {
   return (
     <div>
-      <div className="mx-auto grid max-w-6xl gap-4 px-4 pt-10 sm:grid-cols-2 sm:px-6">
+      <div className="mx-auto grid max-w-6xl gap-4 px-4 pt-10 sm:grid-cols-2 sm:px-6 lg:grid-cols-3">
         <Link href="/dashboard/lecturer/classes" className="block">
           <Card className="hover:bg-muted/50 h-full transition-colors">
             <CardHeader>
@@ -18,6 +18,20 @@ export default function LecturerDashboard() {
               <CardDescription>
                 Create classes, import students by CSV, and export a roster with login details —
                 no student email address required.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+        </Link>
+        <Link href="/dashboard/lecturer/question-banks" className="block">
+          <Card className="hover:bg-muted/50 h-full transition-colors">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <BookOpen aria-hidden className="text-primary" />
+                Question banks
+              </CardTitle>
+              <CardDescription>
+                Author versioned questions by type, organize them into categories, and bulk-import
+                from CSV, Aiken, or GIFT.
               </CardDescription>
             </CardHeader>
           </Card>
@@ -39,9 +53,8 @@ export default function LecturerDashboard() {
       </div>
       <DashboardShell
         title="Lecturer Dashboard"
-        description="Build question banks, schedule exams, and review proctoring flags for your classes. Placeholder shell — wired up in later phases."
+        description="Schedule exams and review proctoring flags for your classes. Placeholder shell — wired up in later phases."
         cards={[
-          { title: "Question banks", description: "Author and version exam questions." },
           { title: "Exams", description: "Schedule exams, set proctoring tier, review results." },
           {
             title: "Live monitoring",

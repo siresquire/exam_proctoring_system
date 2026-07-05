@@ -791,6 +791,164 @@ creation → index-number login resolution → real password sign-in →
 self-service flag clear) using the exact synthetic-email scheme
 `create-student.ts` uses.
 
+## Question banks & authoring (Phase 3b)
+
+Under **Lecturer dashboard → Question banks**: create a bank, organize it
+with a category tree, author questions per type, and bulk-import from
+CSV/Aiken/GIFT. This is authoring only — the exam builder (draw/shuffle
+from a pool) is Phase 3c and the exam room is Phase 3d; nothing here lets a
+student see a bank or a question (RLS grants zero access to any of the four
+tables below to the `student` role — exam delivery will expose only the
+drawn, sanitized question content through its own RPC, never these tables).
+
+### Schema
+
+`question_banks` (owner + name/description) → `question_categories` (a
+self-referencing tree scoped to one bank, `unique(bank_id, parent_id,
+name)`) → `questions` (the logical question: type, difficulty, tags,
+status, `current_version_id`) → `question_versions` (the actual content).
+RLS on all four is owner-or-lecturer-or-higher for manage/select (the same
+"any lecturer" simplification as `classes`/`forms_exams` elsewhere in this
+codebase — Phase 4 scopes it to ownership/co-teaching) and **zero** rows
+for `student`.
+
+### The versioning model — edit = new version
+
+`question_versions` rows are **immutable**: `question_versions_no_update`
+(a trigger) plus an explicit `revoke update ... from anon, authenticated`
+both block mutating an existing version (belt-and-braces — RLS alone would
+have let the UPDATE silently match 0 rows and report success instead of
+erroring, which the smoke test caught). "Editing" a question means calling
+`add_question_version(question_id, prompt, body)`: it inserts
+`version_no = max+1` and repoints `questions.current_version_id` at the new
+row — **the old version row stays in the table forever**, addressable by
+id. This is why versioning exists at all: once Phase 3c/3d exam attempts
+record which exact `version_id` a student was served, that row's wording
+can never change under them, even if the question is edited a dozen times
+afterward. The authoring UI's edit screen states this plainly ("Saving
+creates version N+1 — the old version is kept for any past exam attempts
+that already used it") and asks for confirmation before saving.
+
+Category, difficulty, tags, and status are metadata on the `questions` row
+itself, not versioned content — they're not part of what an exam attempt
+needs to stay faithful to, so they update in place via their own RPCs
+(`set_question_status` for retire/reactivate; category/difficulty/tags
+editing beyond creation isn't wired to a dedicated RPC in this phase — the
+type is locked entirely once created, since draw logic in 3c will assume it
+never changes for a given question id).
+
+### Per-type body shapes
+
+Documented as the source of truth on `question_versions`' table comment in
+the migration:
+
+| Type | `body` shape |
+|---|---|
+| `mcq_single` / `mcq_multi` | `{options:[{id,text}], correct:[optionId,...], marks}` — exactly 1 correct id for `mcq_single`, ≥1 for `mcq_multi` |
+| `true_false` | `{correct:boolean, marks}` |
+| `numeric` | `{correct:number, tolerance:number, marks}` |
+| `short_answer` | `{accepted:[string,...], case_sensitive:boolean, marks}` — enables optional auto-grading later |
+| `essay` | `{marks, rubric:string}` — always manually graded (Phase 3d) |
+
+`create_question`/`add_question_version` do minimal server-side shape
+validation (options present, ≥2 for mcq, marks > 0, numeric fields actually
+numeric, etc.) — enough to protect grading integrity, not full pedagogical
+review.
+
+### RPCs and why none need the EXECUTE-lockdown pattern
+
+`create_question_bank`, `create_question`, `add_question_version`,
+`set_question_status`, `create_question_category`,
+`rename_question_category`, `delete_question_category`, and `bank_questions`
+are all security-definer with `set search_path = ''`. Unlike
+`_create_proctor_session` (20260705000006) or `match_forms_submission`,
+**none of these trust a pre-validated payload from another function** —
+each one independently re-derives the caller's authority from `auth.uid()`
+plus `has_role('lecturer')` or bank ownership (via the shared
+`can_manage_question_bank(bank_id)` helper), the same model 3a's
+`create_class`/`enroll_existing_student` use. That means a student calling
+any of them directly over PostgREST is rejected by the function's own logic,
+not by a missing grant — verified by the RLS smoke test's negative-
+authorization checks (section `(r)`, e.g. `r1`, `r4`, `r11`, `r17`).
+
+### Authoring UI
+
+A per-type editor (`components/questions/question-editor.tsx`) switches its
+fields by `type`: MCQ (dynamic option rows added/removed by button, never
+drag — DESIGN.md 2.5.7 — correct answers via radio for single-answer or
+checkboxes for multi-answer), true/false (a radio pair), numeric (value +
+tolerance), short answer (a list of accepted answers + case-sensitivity
+toggle), essay (marks + a rubric textarea). Full a11y: every field has a
+visible label, option groups use `fieldset`/`legend`, validation errors
+surface as a focus-managed error summary (`role="alert"`) plus the
+individual messages, and every save/confirm goes through `notify.*`
+(`lib/notify.ts`). The category tree
+(`components/questions/category-tree.tsx`) is a plain nested list with
+explicit add/rename/delete buttons at every node — fully keyboard-operable,
+no drag-and-drop.
+
+### Bulk import — CSV, Aiken, GIFT
+
+One import screen (`components/questions/question-import-form.tsx`) with a
+format picker, paste-or-upload, a **preview table before anything is
+created**, and a confirm step — same "never trust the client's parsed rows"
+posture as the Phase 3a roster importer: `previewQuestionImport` and
+`commitQuestionImport` (`app/dashboard/lecturer/question-banks/[id]/import/actions.ts`)
+both re-parse the raw text server-side. The three format parsers
+(`apps/web/lib/questions/import/{csv,aiken,gift}.ts`) are pure,
+dependency-free functions, unit-tested by
+`scripts/question-import-parsers.test.mjs` (Node's built-in test runner +
+Node 22+'s native TypeScript type-stripping — no vitest/tsx dependency
+added to `apps/web`; run via `pnpm test:questions`).
+
+**CSV/TSV** — header `type,prompt,options,correct,difficulty,tags,marks,category`.
+`options`/accepted answers are pipe- or semicolon-separated; `correct` is a
+1-based index or a letter for MCQ, `true`/`false` for true/false,
+`value` or `value:tolerance` for numeric, pipe/semicolon-separated accepted
+answers for short answer. `category` is a slash-separated path
+(`"Topic/Subtopic"`) — missing categories are created on commit.
+
+**Aiken** — the classic format: a prompt line, `A. `/`B. ` option lines (any
+number of options), then `ANSWER: <letter>`. Every item becomes
+`mcq_single`; multiple items are separated by blank lines.
+
+**GIFT** — a documented **subset** of Moodle GIFT:
+
+- Supported: `::title::` prefix (stripped), `$CATEGORY:` lines (applies to
+  subsequent items until the next one), multiple choice
+  `{ =correct ~wrong ~wrong }`, true/false `{TRUE}`/`{FALSE}`/`{T}`/`{F}`,
+  short answer `{ =ans1 =ans2 }` (only `=` entries, no `~`), numeric
+  `{#answer:tolerance}` or `{#answer}`, `\:` `\~` `\=` `\#` `\{` `\}`
+  escapes, `//` line comments.
+- **Not** supported, rejected with a clear per-row reason rather than
+  silently mis-imported: per-option feedback (`# text` — parsed out and
+  discarded, not preserved anywhere in this schema), per-option weights
+  (`%50%` — this schema has no partial-credit model for MCQ options),
+  matching/Cloze sub-questions, and empty `{}` essay-style items (GIFT's
+  essay marker carries no rubric text and this schema requires one — author
+  essays via the editor UI or CSV instead).
+
+Every format's preview flags invalid items with a specific reason (e.g. "mcq
+questions require at least 2 options", "per-option weights are not
+supported") and the confirm button only commits the valid subset — the
+result toast reports "Imported N of M; K skipped."
+
+### Verifying locally
+
+The RLS smoke test's section `(r)` (`scripts/rls-smoke-test.mjs`) covers:
+`create_question_bank`/`create_question` are lecturer-or-higher only
+(student denied); a student cannot `SELECT` `question_banks`/`questions`/
+`question_versions`/`question_categories` at all (RLS, not just RPC
+gating); `add_question_version` increments `version_no` and repoints
+`current_version_id` while the **old version row still exists**
+(`r12`–`r14` — the actual versioning guarantee, not just "the new value
+stuck"); a version row cannot be `UPDATE`d even by the bank owner (`r15`);
+retire/reactivate works; category tree insert + cascade-delete (child
+categories cascade, orphaned questions become uncategorized rather than
+being deleted, `r18`). Run `node scripts/rls-smoke-test.mjs` (needs the dev
+server running for the unrelated Phase 2b webhook checks earlier in the
+same script) and `pnpm test:questions` for the parser unit tests.
+
 ## Design system review
 
 Run the dev server and open `/design` — it exercises every notification

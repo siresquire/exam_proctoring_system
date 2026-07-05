@@ -10,6 +10,11 @@ export type Json = string | number | boolean | null | { [key: string]: Json | un
 
 export type UserRole = "super_admin" | "admin" | "lecturer" | "student";
 
+/** Phase 3b: questions.type — see supabase/migrations/20260705000010_question_banks.sql for the documented body jsonb shape per type. */
+export type QuestionTypeDb = "mcq_single" | "mcq_multi" | "true_false" | "numeric" | "short_answer" | "essay";
+export type QuestionDifficultyDb = "easy" | "medium" | "hard";
+export type QuestionStatusDb = "active" | "retired";
+
 export type ProctorSessionStatus = "active" | "ended" | "abandoned" | "terminated";
 export type ProctorSeverity = "info" | "low" | "medium" | "high";
 export type ProctorReportStatus = "pending_review" | "reviewed";
@@ -313,6 +318,85 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      question_banks: {
+        Row: {
+          id: string;
+          owner_id: string;
+          name: string;
+          description: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          owner_id: string;
+          name: string;
+          description?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          owner_id?: string;
+          name?: string;
+          description?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
+      question_categories: {
+        Row: {
+          id: string;
+          bank_id: string;
+          parent_id: string | null;
+          name: string;
+          created_at: string;
+        };
+        // Writable only via create_question_category()/rename_question_category()/
+        // delete_question_category() RPCs — no client INSERT/UPDATE/DELETE policy.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      questions: {
+        Row: {
+          id: string;
+          bank_id: string;
+          category_id: string | null;
+          type: QuestionTypeDb;
+          difficulty: QuestionDifficultyDb;
+          tags: string[];
+          status: QuestionStatusDb;
+          current_version_id: string | null;
+          created_by: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        // Writable only via create_question()/add_question_version()/
+        // set_question_status() RPCs — no client INSERT/UPDATE/DELETE policy.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      question_versions: {
+        Row: {
+          id: string;
+          question_id: string;
+          version_no: number;
+          prompt: string;
+          /** Shape per parent question's type — see the migration's table comment for the documented per-type body shape. */
+          body: Json;
+          created_by: string | null;
+          created_at: string;
+        };
+        // Writable only via create_question()/add_question_version() RPCs.
+        // Rows are immutable once created (question_versions_no_update
+        // trigger) — "editing" always inserts a new version.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -494,6 +578,87 @@ export interface Database {
           enrolled_at: string;
         }[];
       };
+      create_question_bank: {
+        // Phase 3b: lecturer-or-higher only (has_role('lecturer')). Mirrors
+        // create_class. Returns the new bank id. Audit-logged.
+        Args: { name: string; description?: string | null };
+        Returns: string;
+      };
+      can_manage_question_bank: {
+        // Phase 3b: true when the caller is lecturer-or-higher OR owns the
+        // given bank. Safe to call directly (re-derives authority from
+        // auth.uid(), no lock-down needed) — shared by every RPC below.
+        Args: { bank_id: string };
+        Returns: boolean;
+      };
+      create_question: {
+        // Phase 3b: owner-or-lecturer-or-higher (can_manage_question_bank).
+        // Creates the question + its version 1 in one transaction and
+        // returns the new question id. Validates type/difficulty against
+        // the fixed vocabularies and does minimal per-type body shape
+        // validation — see the migration's question_versions comment for
+        // the documented body shape per type.
+        Args: {
+          bank_id: string;
+          type: QuestionTypeDb;
+          category_id?: string | null;
+          difficulty?: QuestionDifficultyDb;
+          tags?: string[];
+          prompt?: string;
+          body?: Json;
+        };
+        Returns: string;
+      };
+      add_question_version: {
+        // Phase 3b: THIS is how "editing" a question works — inserts
+        // version_no = max+1 and repoints questions.current_version_id.
+        // Never mutates an existing version row. Same authority as
+        // create_question. Returns the new version id.
+        Args: { question_id: string; prompt: string; body: Json };
+        Returns: string;
+      };
+      set_question_status: {
+        // Phase 3b: retire/reactivate. Owner-or-lecturer-or-higher only.
+        Args: { question_id: string; status: QuestionStatusDb };
+        Returns: undefined;
+      };
+      create_question_category: {
+        // Phase 3b: creates a category, optionally nested under parent_id
+        // (must belong to the same bank). Owner-or-lecturer-or-higher only.
+        Args: { bank_id: string; name: string; parent_id?: string | null };
+        Returns: string;
+      };
+      rename_question_category: {
+        Args: { category_id: string; name: string };
+        Returns: undefined;
+      };
+      delete_question_category: {
+        // Phase 3b: child categories cascade-delete; questions filed under
+        // it become uncategorized (category_id set null), never deleted.
+        Args: { category_id: string };
+        Returns: undefined;
+      };
+      bank_questions: {
+        // Phase 3b: owner-or-lecturer-or-higher question list for the
+        // authoring UI — one row per question with its CURRENT version's
+        // prompt/body inlined and category name resolved.
+        Args: { bank_id: string };
+        Returns: {
+          question_id: string;
+          type: QuestionTypeDb;
+          difficulty: QuestionDifficultyDb;
+          tags: string[];
+          status: QuestionStatusDb;
+          category_id: string | null;
+          category_name: string | null;
+          current_version_id: string | null;
+          version_no: number | null;
+          prompt: string | null;
+          body: Json | null;
+          created_at: string;
+          updated_at: string;
+        }[];
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -516,3 +681,8 @@ export type FormsExamSubmissionRow =
 export type ClassRow = Database["public"]["Tables"]["classes"]["Row"];
 export type ClassMemberRow = Database["public"]["Tables"]["class_members"]["Row"];
 export type ClassRosterRow = Database["public"]["Functions"]["class_roster"]["Returns"][number];
+export type QuestionBankRow = Database["public"]["Tables"]["question_banks"]["Row"];
+export type QuestionCategoryRow = Database["public"]["Tables"]["question_categories"]["Row"];
+export type QuestionRow = Database["public"]["Tables"]["questions"]["Row"];
+export type QuestionVersionRow = Database["public"]["Tables"]["question_versions"]["Row"];
+export type BankQuestionRow = Database["public"]["Functions"]["bank_questions"]["Returns"][number];
