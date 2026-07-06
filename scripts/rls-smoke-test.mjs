@@ -4365,6 +4365,484 @@ async function main() {
     if (tOtherClassId) await admin.from("classes").delete().eq("id", tOtherClassId);
   }
 
+  // === (u) Phase 3d-ii: proctored exam room by tier, server-side
+  // termination tie, essay grading, results release =========================
+  // Covers (task brief's exact list): T2+ start_exam_attempt creates a
+  // linked proctor_session using the EXAM's own tier+policy (never
+  // client-supplied) while T1 creates none; driving the linked session to
+  // its violation limit terminates BOTH the session AND the exam_attempt
+  // (status=terminated, submitted_at set, objective answers graded) with NO
+  // client action; grade_essay_slot is owner/lecturer-only (student
+  // denied), clamps marks, only essay slots, and finalize sets 'graded';
+  // results gating (after_close/manual/immediate) on get_attempt_result,
+  // and it never returns another student's result; exam_results is
+  // owner/lecturer-only; new answer-adjacent helpers are EXECUTE-denied to
+  // a direct student call.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const suffix = Date.now();
+
+    const { data: uClassId } = await lecturerClient.rpc("create_class", { name: `Smoke proctored class ${suffix}` });
+    if (uClassId) {
+      await lecturerClient.rpc("enroll_existing_student", { class_id: uClassId, student_id: studentId });
+    }
+
+    const { data: uBankId } = await lecturerClient.rpc("create_question_bank", { name: `Smoke proctored bank ${suffix}` });
+
+    let uMcqId = null;
+    let uEssayId = null;
+    if (uBankId) {
+      const { data: mcqId } = await lecturerClient.rpc("create_question", {
+        bank_id: uBankId,
+        type: "mcq_single",
+        prompt: `Proctored mcq ${suffix}`,
+        body: { options: [{ id: "A", text: "wrong" }, { id: "B", text: "right" }], correct: ["B"], marks: 4 },
+      });
+      uMcqId = mcqId ?? null;
+      const { data: essayId } = await lecturerClient.rpc("create_question", {
+        bank_id: uBankId,
+        type: "essay",
+        prompt: `Proctored essay ${suffix}`,
+        body: { marks: 10, rubric: "SECRET RUBRIC" },
+      });
+      uEssayId = essayId ?? null;
+    }
+    record(
+      "u1. setup: proctored-exam class + bank + mcq/essay questions created",
+      Boolean(uClassId && uBankId && uMcqId && uEssayId),
+      `class=${Boolean(uClassId)} bank=${Boolean(uBankId)} mcq=${Boolean(uMcqId)} essay=${Boolean(uEssayId)}`,
+    );
+
+    /** Builds+publishes a T{tier} exam (in-window, no duration limit) with one mcq + one essay fixed section, scoped to uClassId. Returns the exam id or null. */
+    async function buildProctoredExam(tier, titleSuffix) {
+      if (!uClassId || !uMcqId || !uEssayId) return null;
+      const { data: examId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke ${titleSuffix} ${suffix}`,
+        class_id: uClassId,
+      });
+      if (!examId) return null;
+      const { data: sectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: examId, title: "S1" });
+      if (sectionId) {
+        await lecturerClient.rpc("add_section_source", { section_id: sectionId, source_type: "fixed", question_id: uMcqId });
+        await lecturerClient.rpc("add_section_source", { section_id: sectionId, source_type: "fixed", question_id: uEssayId });
+      }
+      await lecturerClient.rpc("update_exam", {
+        exam_id: examId,
+        title: `Smoke ${titleSuffix} ${suffix}`,
+        class_id: uClassId,
+        integrity_tier: tier,
+        results_release: "after_close",
+      });
+      await lecturerClient.rpc("set_exam_status", { exam_id: examId, status: "published" });
+      return examId;
+    }
+
+    // u2/u3. T1 creates NO proctor session; T2 creates one with the exam's
+    // own tier+policy (never client-supplied — start_exam_attempt has no
+    // tier/policy parameter at all for the student to pass).
+    const uT1ExamId = await buildProctoredExam(1, "T1 exam");
+    let uT1AttemptId = null;
+    if (uT1ExamId) {
+      const { data: attemptId, error: attemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: uT1ExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      uT1AttemptId = attemptErr ? null : attemptId;
+    }
+    if (uT1AttemptId) {
+      const { data: row } = await admin.from("exam_attempts").select("proctor_session_id").eq("id", uT1AttemptId).maybeSingle();
+      record(
+        "u2. T1 start_exam_attempt creates NO linked proctor_session",
+        row?.proctor_session_id == null,
+        `proctor_session_id=${row?.proctor_session_id}`,
+      );
+    } else {
+      record("u2. T1 start_exam_attempt creates NO linked proctor_session", false, "skipped — setup failed");
+    }
+
+    const uT2ExamId = await buildProctoredExam(2, "T2 exam");
+    let uT2AttemptId = null;
+    let uT2SessionId = null;
+    if (uT2ExamId) {
+      const { data: attemptId, error: attemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: uT2ExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      uT2AttemptId = attemptErr ? null : attemptId;
+    }
+    if (uT2AttemptId) {
+      const { data: row } = await admin
+        .from("exam_attempts")
+        .select("proctor_session_id")
+        .eq("id", uT2AttemptId)
+        .maybeSingle();
+      uT2SessionId = row?.proctor_session_id ?? null;
+      let sessionTierPolicyOk = false;
+      let sessionDetail = "no session row";
+      if (uT2SessionId) {
+        const { data: sessionRow } = await admin
+          .from("proctor_sessions")
+          .select("integrity_tier, violation_policy, context")
+          .eq("id", uT2SessionId)
+          .maybeSingle();
+        const { data: examRow } = await admin.from("exams").select("integrity_tier, violation_policy").eq("id", uT2ExamId).maybeSingle();
+        sessionTierPolicyOk =
+          Boolean(sessionRow) &&
+          sessionRow.integrity_tier === examRow?.integrity_tier &&
+          JSON.stringify(sessionRow.violation_policy) === JSON.stringify(examRow?.violation_policy) &&
+          sessionRow.context === `exam:${uT2AttemptId}`;
+        sessionDetail = JSON.stringify({ sessionRow, examTier: examRow?.integrity_tier });
+      }
+      record(
+        "u3. T2 start_exam_attempt creates a linked proctor_session using the EXAM's own tier+policy (never client-supplied)",
+        Boolean(uT2SessionId) && sessionTierPolicyOk,
+        sessionDetail,
+      );
+    } else {
+      record("u3. T2 start_exam_attempt creates a linked proctor_session using the EXAM's own tier+policy (never client-supplied)", false, "skipped — setup failed");
+    }
+
+    // u4. get_attempt_questions surfaces integrity_tier + proctor_session_id
+    // so the client knows whether/what to attach the engine to.
+    if (uT2AttemptId) {
+      const { data: q, error: qErr } = await studentClient.rpc("get_attempt_questions", { attempt_id: uT2AttemptId });
+      record(
+        "u4. get_attempt_questions returns integrity_tier=2 and the matching proctor_session_id",
+        !qErr && q?.integrity_tier === 2 && q?.proctor_session_id === uT2SessionId,
+        JSON.stringify({ integrity_tier: q?.integrity_tier, proctor_session_id: q?.proctor_session_id }),
+      );
+    } else {
+      record("u4. get_attempt_questions returns integrity_tier=2 and the matching proctor_session_id", false, "skipped — setup failed");
+    }
+
+    // u5/u6. TERMINATION TIE: drive uT2SessionId to its violation limit by
+    // logging policy-counted high-severity events AS THE STUDENT (the
+    // session owner — log_proctor_events is owner-only), with NO client
+    // action on the exam_attempts row itself. Assert BOTH the session and
+    // the linked exam_attempt end up terminated, submitted_at is set, and
+    // the mcq slot got auto-graded (answered correctly below before
+    // terminating).
+    if (uT2AttemptId && uT2SessionId) {
+      const { data: uQuestions } = await studentClient.rpc("get_attempt_questions", { attempt_id: uT2AttemptId });
+      const mcqRef = uQuestions?.sections?.[0]?.questions?.find((q) => q.type === "mcq_single")?.question_ref;
+      if (mcqRef) {
+        await studentClient.rpc("save_exam_answer", {
+          attempt_id: uT2AttemptId,
+          question_ref: mcqRef,
+          response: { selected: "B" },
+          flagged: false,
+        });
+      }
+
+      const { data: sessionBefore } = await admin
+        .from("proctor_sessions")
+        .select("violation_limit")
+        .eq("id", uT2SessionId)
+        .maybeSingle();
+      const limit = sessionBefore?.violation_limit ?? 3;
+
+      let lastLogResult = null;
+      for (let i = 0; i < limit; i += 1) {
+        const { data: logResult } = await studentClient.rpc("log_proctor_events", {
+          session_id: uT2SessionId,
+          events: [{ event_type: "tab_hidden", occurred_at: new Date().toISOString() }],
+        });
+        lastLogResult = logResult;
+      }
+
+      record(
+        "u5. Driving the linked session to its violation limit terminates the SESSION server-side",
+        lastLogResult?.session_status === "terminated",
+        JSON.stringify(lastLogResult),
+      );
+
+      // Give the AFTER UPDATE trigger's own transaction (part of the same
+      // log_proctor_events call, already committed by the time the RPC
+      // returns) a moment to be visible — no sleep actually needed since
+      // triggers run synchronously within the same transaction as the
+      // UPDATE that fired them, but re-select fresh via the admin client to
+      // avoid any client-side caching illusion.
+      const { data: attemptAfter } = await admin
+        .from("exam_attempts")
+        .select("status, submitted_at, auto_score, needs_manual_grading")
+        .eq("id", uT2AttemptId)
+        .maybeSingle();
+
+      record(
+        "u6. TERMINATION TIE: the linked exam_attempt is ALSO closed server-side — status=terminated, submitted_at set, objective answers graded — with NO client action",
+        attemptAfter?.status === "terminated" &&
+          attemptAfter?.submitted_at != null &&
+          attemptAfter?.auto_score === 4 &&
+          attemptAfter?.needs_manual_grading === true,
+        JSON.stringify(attemptAfter),
+      );
+    } else {
+      record("u5. Driving the linked session to its violation limit terminates the SESSION server-side", false, "skipped — setup failed");
+      record(
+        "u6. TERMINATION TIE: the linked exam_attempt is ALSO closed server-side — status=terminated, submitted_at set, objective answers graded — with NO client action",
+        false,
+        "skipped — setup failed",
+      );
+    }
+
+    // u7/u8/u9/u10. grade_essay_slot: student denied, lecturer succeeds +
+    // clamps out-of-range marks, only essay slots, and finalize sets
+    // 'graded' once every essay is graded (auto-finalized here since the
+    // terminated attempt from u6 has exactly one essay slot).
+    if (uT2AttemptId) {
+      const { data: uQuestions } = await studentClient.rpc("get_attempt_questions", { attempt_id: uT2AttemptId });
+      const essayRef = uQuestions?.sections?.[0]?.questions?.find((q) => q.type === "essay")?.question_ref;
+      const mcqRef = uQuestions?.sections?.[0]?.questions?.find((q) => q.type === "mcq_single")?.question_ref;
+
+      if (essayRef) {
+        const { error: studentGradeErr } = await studentClient.rpc("grade_essay_slot", {
+          attempt_id: uT2AttemptId,
+          question_ref: essayRef,
+          marks_awarded: 10,
+        });
+        record(
+          "u7. grade_essay_slot DENIED for a student (not the exam owner/lecturer)",
+          Boolean(studentGradeErr),
+          studentGradeErr?.message ?? "no error raised — SECURITY: a student graded an essay slot",
+        );
+
+        if (mcqRef) {
+          const { error: wrongTypeErr } = await lecturerClient.rpc("grade_essay_slot", {
+            attempt_id: uT2AttemptId,
+            question_ref: mcqRef,
+            marks_awarded: 1,
+          });
+          record(
+            "u8. grade_essay_slot REJECTS a non-essay slot (mcq_single)",
+            Boolean(wrongTypeErr),
+            wrongTypeErr?.message ?? "no error raised — CORRECTNESS: graded a non-essay slot as an essay",
+          );
+        }
+
+        // Slot is worth 10 marks; award 999 and expect it clamped to 10.
+        const { error: lecturerGradeErr } = await lecturerClient.rpc("grade_essay_slot", {
+          attempt_id: uT2AttemptId,
+          question_ref: essayRef,
+          marks_awarded: 999,
+          feedback: "Good structure, clamped smoke test.",
+        });
+        record("u9. lecturer grade_essay_slot succeeds", !lecturerGradeErr, lecturerGradeErr?.message);
+
+        const { data: gradedAnswer } = await admin
+          .from("exam_answers")
+          .select("marks_awarded, feedback")
+          .eq("attempt_id", uT2AttemptId)
+          .eq("question_ref", essayRef)
+          .maybeSingle();
+        record(
+          "u9b. grade_essay_slot CLAMPS marks_awarded to the slot's max (10), not the requested 999",
+          gradedAnswer?.marks_awarded === 10,
+          JSON.stringify(gradedAnswer),
+        );
+
+        const { data: finalAttempt } = await admin
+          .from("exam_attempts")
+          .select("status, auto_score, needs_manual_grading")
+          .eq("id", uT2AttemptId)
+          .maybeSingle();
+        record(
+          "u10. finalize (auto-triggered once every essay is graded) sets status='graded' and auto_score = objective(4) + essay(10) = 14",
+          finalAttempt?.status === "graded" && finalAttempt?.auto_score === 14 && finalAttempt?.needs_manual_grading === false,
+          JSON.stringify(finalAttempt),
+        );
+      } else {
+        for (const label of [
+          "u7. grade_essay_slot DENIED for a student (not the exam owner/lecturer)",
+          "u8. grade_essay_slot REJECTS a non-essay slot (mcq_single)",
+          "u9. lecturer grade_essay_slot succeeds",
+          "u9b. grade_essay_slot CLAMPS marks_awarded to the slot's max (10), not the requested 999",
+          "u10. finalize (auto-triggered once every essay is graded) sets status='graded' and auto_score = objective(4) + essay(10) = 14",
+        ]) {
+          record(label, false, "skipped — no essay question_ref available");
+        }
+      }
+    }
+
+    // u11/u12/u13/u14. get_attempt_result gating: after_close before close =
+    // hidden, manual before release = hidden then shown after
+    // release_exam_results, immediate = shown, and NEVER another student's
+    // result (re-verified structurally: get_attempt_result is owner-only,
+    // same as get_attempt_questions — proven here by a second student-like
+    // check using the ALREADY-terminated/graded uT2AttemptId itself, whose
+    // exam is after_close and still open, so results must be hidden).
+    if (uT2AttemptId) {
+      const { data: hiddenResult, error: hiddenErr } = await studentClient.rpc("get_attempt_result", { attempt_id: uT2AttemptId });
+      record(
+        "u11. get_attempt_result HIDES results for an after_close exam that has not closed yet",
+        !hiddenErr && hiddenResult?.released === false && hiddenResult?.reason === "not_yet_released",
+        JSON.stringify(hiddenResult),
+      );
+
+      // Close the exam early (lecturer action) — after_close now permits release.
+      await lecturerClient.rpc("set_exam_status", { exam_id: uT2ExamId, status: "closed" });
+      const { data: releasedResult, error: releasedErr } = await studentClient.rpc("get_attempt_result", { attempt_id: uT2AttemptId });
+      record(
+        "u12. get_attempt_result REVEALS results once the after_close exam is closed, with correct per-question breakdown",
+        !releasedErr &&
+          releasedResult?.released === true &&
+          releasedResult?.auto_score === 14 &&
+          Array.isArray(releasedResult?.per_question) &&
+          releasedResult.per_question.length === 2,
+        JSON.stringify(releasedResult),
+      );
+    } else {
+      record("u11. get_attempt_result HIDES results for an after_close exam that has not closed yet", false, "skipped — setup failed");
+      record("u12. get_attempt_result REVEALS results once the after_close exam is closed, with correct per-question breakdown", false, "skipped — setup failed");
+    }
+
+    // u13. manual release gating: build a manual-release exam, submit, hide
+    // before release_exam_results, then show after.
+    let uManualExamId = null;
+    let uManualAttemptId = null;
+    if (uClassId && uMcqId) {
+      const { data: examId } = await lecturerClient.rpc("create_exam", { title: `Smoke manual-release exam ${suffix}`, class_id: uClassId });
+      uManualExamId = examId ?? null;
+      if (uManualExamId) {
+        const { data: sectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: uManualExamId, title: "S1" });
+        if (sectionId) {
+          await lecturerClient.rpc("add_section_source", { section_id: sectionId, source_type: "fixed", question_id: uMcqId });
+        }
+        await lecturerClient.rpc("update_exam", {
+          exam_id: uManualExamId,
+          title: `Smoke manual-release exam ${suffix}`,
+          class_id: uClassId,
+          integrity_tier: 1,
+          results_release: "manual",
+        });
+        await lecturerClient.rpc("set_exam_status", { exam_id: uManualExamId, status: "published" });
+
+        const { data: attemptId } = await studentClient.rpc("start_exam_attempt", {
+          exam_id: uManualExamId,
+          claimed_index_number: "5201040845",
+          attested: true,
+        });
+        uManualAttemptId = attemptId ?? null;
+        if (uManualAttemptId) {
+          const { data: mq } = await studentClient.rpc("get_attempt_questions", { attempt_id: uManualAttemptId });
+          const ref = mq?.sections?.[0]?.questions?.[0]?.question_ref;
+          if (ref) {
+            await studentClient.rpc("save_exam_answer", { attempt_id: uManualAttemptId, question_ref: ref, response: { selected: "B" }, flagged: false });
+          }
+          await studentClient.rpc("submit_exam_attempt", { attempt_id: uManualAttemptId });
+        }
+      }
+    }
+    if (uManualAttemptId) {
+      const { data: beforeRelease } = await studentClient.rpc("get_attempt_result", { attempt_id: uManualAttemptId });
+      record(
+        "u13. get_attempt_result HIDES results for a manual-release exam before release_exam_results is called",
+        beforeRelease?.released === false && beforeRelease?.reason === "not_yet_released",
+        JSON.stringify(beforeRelease),
+      );
+
+      const { error: studentReleaseErr } = await studentClient.rpc("release_exam_results", { exam_id: uManualExamId });
+      record(
+        "u13b. release_exam_results DENIED for a student",
+        Boolean(studentReleaseErr),
+        studentReleaseErr?.message ?? "no error raised — SECURITY: a student released exam results",
+      );
+
+      const { error: releaseErr } = await lecturerClient.rpc("release_exam_results", { exam_id: uManualExamId });
+      record("u13c. lecturer release_exam_results succeeds", !releaseErr, releaseErr?.message);
+
+      const { data: afterRelease } = await studentClient.rpc("get_attempt_result", { attempt_id: uManualAttemptId });
+      record(
+        "u14. get_attempt_result REVEALS results for the manual-release exam once released",
+        afterRelease?.released === true && afterRelease?.auto_score === 4,
+        JSON.stringify(afterRelease),
+      );
+    } else {
+      record("u13. get_attempt_result HIDES results for a manual-release exam before release_exam_results is called", false, "skipped — setup failed");
+      record("u13b. release_exam_results DENIED for a student", false, "skipped — setup failed");
+      record("u13c. lecturer release_exam_results succeeds", false, "skipped — setup failed");
+      record("u14. get_attempt_result REVEALS results for the manual-release exam once released", false, "skipped — setup failed");
+    }
+
+    // u15. get_attempt_result NEVER returns another student's result: a
+    // second student-role account would be needed for a true cross-account
+    // check, and this codebase's smoke test only seeds one student — so
+    // this is proven the same way t17 proves the cross-student case for
+    // exam_attempts: schema-level, by confirming get_attempt_result raises
+    // "You may only view your own result" (the exact ownership check) when
+    // called by the LECTURER account (which is not this attempt's student
+    // and holds no can_manage_exam bypass in get_attempt_result — the
+    // function has no such branch at all, unlike exam_results).
+    if (uManualAttemptId) {
+      const { data: staffResult, error: staffErr } = await lecturerClient.rpc("get_attempt_result", { attempt_id: uManualAttemptId });
+      record(
+        "u15. get_attempt_result DENIED for a non-owning caller (lecturer), proving it never returns another user's result",
+        Boolean(staffErr) && !staffResult,
+        staffErr?.message ?? `no error raised — SECURITY: get_attempt_result returned ${JSON.stringify(staffResult)} to a non-owner`,
+      );
+    } else {
+      record("u15. get_attempt_result DENIED for a non-owning caller (lecturer), proving it never returns another user's result", false, "skipped — setup failed");
+    }
+
+    // u16/u17. exam_results is owner/lecturer-only, and surfaces the
+    // integrity summary for the tier-2 attempt (violation_count/limit/
+    // session_status/has_report) alongside grading state.
+    if (uT2ExamId) {
+      const { data: studentResults, error: studentResultsErr } = await studentClient.rpc("exam_results", { exam_id: uT2ExamId });
+      record(
+        "u16. exam_results DENIED for a student",
+        Boolean(studentResultsErr) && !studentResults,
+        studentResultsErr?.message ?? "no error raised — SECURITY: a student read exam_results",
+      );
+
+      const { data: lecturerResults, error: lecturerResultsErr } = await lecturerClient.rpc("exam_results", { exam_id: uT2ExamId });
+      const row = (lecturerResults ?? []).find((r) => r.attempt_id === uT2AttemptId);
+      record(
+        "u17. lecturer exam_results shows the terminated attempt's grading state + integrity summary (violation_count >= limit, has_report=true)",
+        !lecturerResultsErr &&
+          Boolean(row) &&
+          row.status === "graded" &&
+          row.violation_count >= row.violation_limit &&
+          row.session_status === "terminated" &&
+          row.has_report === true,
+        JSON.stringify(row),
+      );
+    } else {
+      record("u16. exam_results DENIED for a student", false, "skipped — setup failed");
+      record("u17. lecturer exam_results shows the terminated attempt's grading state + integrity summary (violation_count >= limit, has_report=true)", false, "skipped — setup failed");
+    }
+
+    // u18. LOCKDOWN: sync_exam_attempt_on_proctor_termination is a trigger
+    // function (not directly RPC-callable at all — Postgres trigger
+    // functions return type `trigger` and cannot be invoked via SQL/RPC by
+    // any role, client or otherwise), so the meaningful lockdown proof here
+    // is that grade_essay_slot/finalize_attempt_grade/release_exam_results/
+    // get_attempt_result/exam_results all re-derive authority themselves
+    // (proven above in u7/u13b/u15/u16) rather than trusting a client claim
+    // — already covered. Additionally re-confirm grade_objective_slot
+    // (reused by the new termination-tie trigger) is STILL locked down
+    // after this migration re-touches the grading path.
+    const { data: lockdownData, error: lockdownErr } = await studentClient.rpc("grade_objective_slot", {
+      question_type: "mcq_single",
+      body: { options: [{ id: "A", text: "x" }, { id: "B", text: "y" }], correct: ["B"], marks: 1 },
+      response: { selected: "B" },
+    });
+    record(
+      "u18. LOCKDOWN (re-confirmed post-migration): grade_objective_slot still NOT directly callable by an authenticated client",
+      Boolean(lockdownErr) && (lockdownData === undefined || lockdownData === null),
+      lockdownErr?.message ?? `no error raised — SECURITY: grade_objective_slot returned ${JSON.stringify(lockdownData)} directly to a client`,
+    );
+
+    // Cleanup.
+    for (const id of [uT1ExamId, uT2ExamId, uManualExamId]) {
+      if (id) await admin.from("exams").delete().eq("id", id);
+    }
+    if (uBankId) await admin.from("question_banks").delete().eq("id", uBankId);
+    if (uClassId) await admin.from("classes").delete().eq("id", uClassId);
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the

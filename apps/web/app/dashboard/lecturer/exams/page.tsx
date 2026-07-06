@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { FileText, PlusCircle } from "lucide-react";
+import { BarChart3, FileText, PlusCircle } from "lucide-react";
 
 import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
@@ -66,8 +66,8 @@ export default async function ExamsPage() {
         <ul className="grid gap-4 sm:grid-cols-2">
           {exams.map((exam) => (
             <li key={exam.id}>
-              <Link href={`/dashboard/lecturer/exams/${exam.id}`} className="block">
-                <Card className="hover:bg-muted/50 transition-colors">
+              <Card className="hover:bg-muted/50 transition-colors">
+                <Link href={`/dashboard/lecturer/exams/${exam.id}`} className="block">
                   <CardHeader>
                     <div className="flex items-center justify-between gap-2">
                       <CardTitle className="flex items-center gap-2 text-base">
@@ -78,8 +78,16 @@ export default async function ExamsPage() {
                     </div>
                     <CardDescription>{exam.description || "No description"}</CardDescription>
                   </CardHeader>
-                </Card>
-              </Link>
+                </Link>
+                <CardContent className="pt-0">
+                  <Button asChild variant="outline" size="sm">
+                    <Link href={`/dashboard/lecturer/exams/${exam.id}/results`}>
+                      <BarChart3 aria-hidden />
+                      Results
+                    </Link>
+                  </Button>
+                </CardContent>
+              </Card>
             </li>
           ))}
         </ul>

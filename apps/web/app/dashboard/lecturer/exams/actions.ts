@@ -6,6 +6,7 @@ import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
 import type {
   ExamDraw,
+  ExamResultRow,
   ExamResultsRelease,
   ExamSectionSourceType,
   ExamValidationResult,
@@ -305,4 +306,88 @@ export async function fetchPoolAvailableCount(
   }
 
   return { count: data as unknown as number };
+}
+
+// --- Phase 3d-ii: grading + results release --------------------------------
+
+export interface ExamResultsResult {
+  error?: string;
+  rows?: ExamResultRow[];
+}
+
+export async function fetchExamResults(examId: string): Promise<ExamResultsResult> {
+  await requireRole("lecturer", "admin");
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { data, error } = await supabase.rpc("exam_results", { exam_id: examId });
+  if (error) {
+    return { error: error.message };
+  }
+
+  return { rows: (data ?? []) as ExamResultRow[] };
+}
+
+export async function gradeEssaySlot(
+  attemptId: string,
+  questionRef: string,
+  marksAwarded: number,
+  feedback: string,
+): Promise<ActionResult> {
+  await requireRole("lecturer", "admin");
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { error } = await supabase.rpc("grade_essay_slot", {
+    attempt_id: attemptId,
+    question_ref: questionRef,
+    marks_awarded: marksAwarded,
+    feedback: feedback.trim() || null,
+  });
+
+  if (error) {
+    return { error: error.message };
+  }
+
+  revalidatePath(`${EXAMS_PATH}/${attemptId}/grade`);
+  return {};
+}
+
+export async function finalizeAttemptGrade(attemptId: string): Promise<ActionResult> {
+  await requireRole("lecturer", "admin");
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { error } = await supabase.rpc("finalize_attempt_grade", { attempt_id: attemptId });
+  if (error) {
+    return { error: error.message };
+  }
+
+  return {};
+}
+
+export async function releaseExamResults(examId: string): Promise<ActionResult> {
+  await requireRole("lecturer", "admin");
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { error } = await supabase.rpc("release_exam_results", { exam_id: examId });
+  if (error) {
+    return { error: error.message };
+  }
+
+  revalidatePath(`${EXAMS_PATH}/${examId}/results`);
+  return { id: examId };
 }

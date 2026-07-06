@@ -1253,6 +1253,268 @@ gates per-question correctness by `results_release`
 `node scripts/rls-smoke-test.mjs` (dev server must be running for the
 unrelated Phase 2b webhook checks earlier in the script).
 
+## Proctored exams, grading & results (Phase 3d-ii)
+
+Phase 3d-ii attaches the real proctoring engine to the Phase 3d-i exam room
+**by tier**, ties a proctor session's server-decided termination to the
+exam attempt (tamper-proof — no client cooperation needed), adds manual
+essay grading + finalization, and results-release gating including the one
+RPC that may ever hand a student a correct answer. It reuses every Phase
+1/2 proctoring building block (`ConsentScreen`, `IdentityCheck`,
+`proctor-core`'s engine, the Supabase adapters, MediaPipe face detection) —
+nothing proctoring-related was reinvented for this phase. The full Phase 4
+review workspace (video timeline, per-flag reviewer verdicts, student
+appeals) is **not** built here; this phase only surfaces an integrity
+summary (violation count, session status, whether a `proctor_reports` row
+exists) plus a handle to the session id.
+
+`supabase/migrations/20260705000013_proctored_exams_grading.sql` is the
+migration for all of the below.
+
+### Tier-based proctoring attachment
+
+`exam_attempts.proctor_session_id` links an attempt to a `proctor_sessions`
+row. `start_exam_attempt` (rewritten, same signature) now checks the
+**exam's own** `integrity_tier`:
+
+- **Tier 1**: unchanged from 3d-i. No session, no camera — server-side
+  anti-cheat only (randomization, timing, session/window checks).
+- **Tier 2+**: after creating the attempt, calls the same internal
+  `_create_proctor_session(context, tier, policy, claimed_index, attested)`
+  helper the Phase 2a Forms wrapper uses (`20260705000005`/`000006`,
+  already locked down — `EXECUTE` revoked from `public`/`anon`/
+  `authenticated`, reachable only through a security-definer entry point),
+  passing the **exam's** `integrity_tier` + `violation_policy` —
+  `start_exam_attempt` has no tier/policy parameter for the client to
+  override, the same structural guarantee `start_forms_exam_session` relies
+  on. `context = 'exam:' || attempt_id` (attempt-scoped, since each attempt
+  is its own proctored session, distinct from the Forms wrapper's
+  `'form:' || forms_exam_id`). The new session id is stored on
+  `exam_attempts.proctor_session_id` and returned to the client via
+  `get_attempt_questions` (also newly returns `integrity_tier`), so the
+  exam room knows whether to run the engine and — on a page-refresh resume
+  — which existing session to reattach to rather than minting a second one.
+
+### Exam room wiring (`apps/web/components/exam-room/`)
+
+`ExamAttemptWrapper` now branches on `exam.integrity_tier` fetched
+server-side with the exam row (never chosen client-side):
+
+- **Tier 1**: identical to 3d-i — `ExamAttemptIntro` → `start_exam_attempt`
+  → `get_attempt_questions` → the plain `ExamRoom`.
+- **Tier 2+**: `ConsentScreen` → `IdentityCheck` (index number + portrait +
+  attestation, reusing the Phase 1.5/2a component verbatim, including its
+  Phase 1.6 portrait-quality gate) → `start_exam_attempt` (now also starts
+  the linked session) → `get_attempt_questions` → **`ProctoredExamRoom`**
+  (new), which wraps the unmodified `ExamRoom` with:
+  - `createProctorEngine` from `@proctor/core`, started against the
+    server-created session (never a client-chosen tier/policy), using the
+    same `createSupabaseTransportAdapter` / `createMediaPipeFaceDetectorAdapter`
+    the Forms wrapper and proctoring demo use.
+  - A monitoring panel (live event feed + recent snapshot thumbnails,
+    `<details>`-collapsible) reusing `components/proctor/event-feed.tsx`.
+  - A "Proctoring active — tier N · strikes X of Y" status strip, live via
+    `engine.onViolationUpdate`.
+  - `engine.onTerminated` — fired when the *server's* response to a batched
+    event upload reports `session_status: 'terminated'` — stops local
+    collection, calls `notify.error` with calm wording ("Session ended:
+    violation limit reached" / "Your attempt was submitted for review — no
+    automatic penalty"), and renders a locked summary card. By the time
+    this fires the attempt is **already** closed server-side (see below);
+    the client is only catching up to a fact the database already recorded.
+  - Fullscreen/tab/clipboard/display-change collectors run automatically —
+    `proctor-core`'s `start()` wires them unconditionally; nothing new was
+    needed here for T3+, since the collectors and `defaultSeverity(event,
+    tier)` already exist from Phase 1/1.7.
+  - Accessibility: accommodations continue to suppress/annotate AT-triggered
+    false flags at the **server** severity-assignment layer
+    (`log_proctor_events`, unchanged) — this phase adds no new client-side
+    hard-fail path for AT users. `notify.examWarning` (never the alarming
+    "error" red) is used for every in-session integrity toast.
+  - Honest limitation: on a page-refresh **resume**, there is no webcam
+    stream to reuse (it was only ever handed off once, during identity
+    verification, in the same browser session) — the panel says so plainly
+    ("Camera not reattached after resume — non-camera monitoring is still
+    active") rather than silently doing nothing. All non-camera signals
+    (fullscreen, tab, clipboard, connection, display-change) still run.
+
+### Server-side termination tie (the tamper-proof part)
+
+`log_proctor_events` (Phase 1.7, unchanged) already terminates a session
+server-side and files a `proctor_reports` row when `violation_count`
+reaches `violation_limit` — entirely from server-assigned severity, never
+trusting the client. This phase adds a **trigger**,
+`sync_exam_attempt_on_proctor_termination`, `AFTER UPDATE ON
+proctor_sessions`: when a session's `status` transitions into `terminated`
+or `abandoned` and its `context` matches `'exam:%'`, it finds the linked
+`in_progress` `exam_attempts` row (via `proctor_session_id`) and, in the
+same transaction:
+
+1. Re-grades every objective slot answered so far by reusing
+   `grade_objective_slot` (the same locked-down helper `submit_exam_attempt`
+   calls) — essay slots contribute 0 and set `needs_manual_grading`.
+2. Sets `status = 'terminated'`, `submitted_at = now()`,
+   `auto_score`/`max_score`/`needs_manual_grading` accordingly.
+3. Audit-logs `proctor_termination_closed_attempt`.
+
+No client call is involved anywhere in this path — a student who hits the
+violation limit has their attempt closed and partially graded purely as a
+side effect of the server processing their own (or the last) batched event
+upload. The trigger no-ops if no matching `in_progress` attempt is found
+(e.g. the student had already submitted normally through
+`submit_exam_attempt`, which ends the session via `end_proctor_session`
+with `status='ended'`, a status this trigger deliberately ignores).
+
+### Manual essay grading
+
+- **`grade_essay_slot(attempt_id, question_ref, marks_awarded, feedback)`**
+  — owner/lecturer-or-higher only (re-derived via `can_manage_exam`, never
+  trusting a client claim), only for `essay`-type slots of a
+  submitted/auto_submitted/terminated/graded attempt. Re-derives the slot's
+  real max marks from the frozen paper (never a client-supplied max) and
+  **clamps** `marks_awarded` to `[0, slot marks]` rather than rejecting an
+  out-of-range value. Stores the grade + optional feedback in two new
+  `exam_answers` columns (`marks_awarded`, `feedback`). Auto-calls
+  `finalize_attempt_grade` once every essay slot in the paper has a grade,
+  so grading every essay in one sitting needs no separate "finalize" click.
+- **`finalize_attempt_grade(attempt_id)`** — recomputes
+  `auto_score = (the objective auto_score already stored) + sum(graded
+  essay marks_awarded)`, sets `status = 'graded'`,
+  `needs_manual_grading = false`. Owner/lecturer-or-higher only, idempotent,
+  independently callable (e.g. to finalize with a no-show essay left
+  ungraded at 0).
+- **`get_attempt_for_grading(attempt_id)`** — the lecturer-facing detail RPC
+  the grading UI reads: every slot's prompt + the student's response, plus
+  (for essays) the **rubric** + current `marks_awarded`/`feedback`, and
+  (for objective types) the auto-computed score for reference. Owner/
+  lecturer-or-higher only, **not** release-gated (a lecturer must be able
+  to grade before releasing) and never student-reachable — distinct from
+  both `get_attempt_result` (student-only, release-gated, no rubric) and
+  `exam_results` (summary only, no question content).
+
+UI: `apps/web/app/dashboard/lecturer/exams/[id]/grade/[attemptId]/page.tsx`
++ `components/exams/essay-grading-form.tsx` — one accessible marks input
+(0..max) + feedback textarea per essay, a "Save grade" button per slot, and
+a "Finalize grade" button.
+
+### Results release gating + the one answer-revealing path
+
+`exams` gains `results_released_at` (set only by `release_exam_results`,
+for `results_release = 'manual'` exams). Release logic, applied
+consistently everywhere results are read:
+
+| `results_release` | Released when |
+|---|---|
+| `immediate` | Always, once submitted (unchanged from 3d-i) |
+| `after_close` | `now() > closes_at` **or** the lecturer has set `status = 'closed'` |
+| `manual` | `exams.results_released_at is not null` |
+
+- **`release_exam_results(exam_id)`** — owner/lecturer-or-higher only;
+  raises for any exam whose `results_release` isn't `'manual'` (the other
+  two release automatically, there is nothing to "click").
+- **`get_attempt_result(attempt_id)`** — **the one and only place in the
+  entire schema a correct answer may reach a student.** Owner-only
+  (`auth.uid()` must be the attempt's `student_id` — never another
+  student's result, proven by a negative smoke-test call from a different
+  role). Before release: `{released: false, reason: 'not_submitted' |
+  'not_yet_released'}`, nothing answer-adjacent leaves the function. After
+  release: total score + a per-question breakdown — the student's own
+  response, the correct/accepted answer (plus a bare `{id,text}` options
+  list so the client can render "Accra" instead of a raw option id),
+  marks earned/available for objective types, and
+  `marks_awarded`/`feedback`/`needs_manual_grading` for essays.
+- **`exam_results(exam_id)`** — the lecturer results/integrity-summary RPC:
+  one row per attempt with student identity, grading state
+  (`status`/`auto_score`/`max_score`/`needs_manual_grading`), and — for
+  tier≥2 attempts — the linked session's `violation_count`/
+  `violation_limit`/`session_status`/`has_report` (a plain boolean, not the
+  report content). Owner/lecturer-or-higher only.
+
+UI: `apps/web/app/dashboard/lecturer/exams/[id]/results/page.tsx` +
+`components/exams/exam-results-table.tsx` (status/score/needs-grading
+badges + the integrity column) + `components/exams/release-results-button.tsx`
+(only rendered for `results_release = 'manual'` exams, `notify.confirm`
+gated). Student side: `apps/web/app/exam/attempt/[attemptId]/result/page.tsx`
++ `components/exams/attempt-result-view.tsx` (a friendly "not yet released"
+state, or the full breakdown once released) and
+`components/exams/my-results-list.tsx` on the student dashboard (every
+attempt past `in_progress`, linking to its result page — the list itself
+shows no score, only status, since release-gating happens per-attempt on
+the result page).
+
+### Locked-down / re-derived-authority helpers introduced this phase
+
+Same posture as every prior migration — nothing here trusts a client
+argument for authority or answer content:
+
+- `grade_essay_slot`, `finalize_attempt_grade`, `release_exam_results`,
+  `get_attempt_for_grading`, `exam_results` — all re-derive
+  owner-or-lecturer-or-higher via `can_manage_exam(exam_id)`, independently
+  of any client claim.
+- `get_attempt_result` re-derives ownership via `auth.uid() =
+  exam_attempts.student_id`.
+- `sync_exam_attempt_on_proctor_termination` is a trigger function — not
+  RPC-callable by any role at all (Postgres trigger functions can't be
+  invoked outside their trigger context), so there is no lockdown grant to
+  revoke; it is inherently unreachable except by the `UPDATE` on
+  `proctor_sessions` that fires it.
+- `grade_objective_slot` (Phase 3d-i, answer-adjacent, already
+  `EXECUTE`-revoked from `public`/`anon`/`authenticated`) is reused by both
+  `submit_exam_attempt` and the new termination trigger — re-verified still
+  locked down after this migration (smoke test `u18`).
+
+### Verifying locally
+
+The RLS smoke test's section `(u)` (18 checks) covers: T1 creates no
+proctor session while T2 creates one using the **exam's** tier+policy
+(verified byte-for-byte against the exam row, never a client-supplied
+value); driving the linked session to its violation limit (via
+`log_proctor_events`, called as the student/session-owner — the *only*
+client action in the whole flow) terminates **both** the session and the
+`exam_attempts` row (`status='terminated'`, `submitted_at` set, the
+objective slot answered beforehand graded, essay slot flagged
+`needs_manual_grading`) with no separate client call; `grade_essay_slot` is
+denied to a student, rejects a non-essay slot, clamps an out-of-range mark
+to the slot's real maximum, and auto-finalizes to the correct total;
+`get_attempt_result` hides results for `after_close` before close and for
+`manual` before release, reveals them correctly afterward (including the
+resolved option text), and is denied to a non-owning caller; and
+`exam_results` is denied to a student. Run
+`node scripts/rls-smoke-test.mjs` (dev server running, for the Phase 2b
+webhook checks earlier in the script).
+
+A manual browser pass (documented in this phase's implementation notes):
+as a lecturer, create a T2 exam (essay + mcq, manual release) on an
+enrolled class and publish it; as the student, go through consent →
+identity (a synthetic canvas-drawn "face" — a real face is not otherwise
+available in a headless verification session, and MediaPipe's BlazeFace
+model correctly rejected a plain shape before a face-like image was
+supplied, confirming the Phase 1.6 quality gate is doing real work) →
+take the exam with the monitoring panel visible, live strike counter, and
+autosave → submit; as the lecturer, see the attempt in results with its
+integrity summary, grade the essay (rubric visible only to staff, marks
+clamped), see the total recompute and status flip to `graded`, and release
+results; as the student, see the released result with the full
+per-question breakdown. Separately, forcing enough `tab_hidden` events
+through the live session to reach the violation limit produced the calm
+termination screen client-side **and** an independently-verified
+server-side `exam_attempts.status = 'terminated'` with `submitted_at` set
+and a `proctor_reports` row — with no submit call ever issued by the
+client.
+
+### Deferred to Phase 4
+
+The full proctoring **review workspace** — a video/snapshot timeline with
+clickable flag markers, a per-flag human verdict, a session-level
+pass/escalate/violation decision, and the student **appeals** flow — is
+explicitly out of scope for 3d-ii. Today a lecturer sees only: whether a
+`proctor_reports` row exists (`has_report`), the session's final
+`violation_count`/`violation_limit`/`status`, and can open Studio directly
+against the `proctor_session_id` for the raw event/snapshot history. Also
+deferred: re-attaching a webcam stream on page-refresh resume (see "Exam
+room wiring" above), and a standing scheduler for genuinely abandoned
+attempts (still lazy-enforced, per 3d-i).
+
 ## Design system review
 
 Run the dev server and open `/design` — it exercises every notification

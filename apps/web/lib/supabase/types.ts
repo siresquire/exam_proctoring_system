@@ -421,6 +421,8 @@ export interface Database {
           shuffle_questions: boolean;
           shuffle_options: boolean;
           results_release: ExamResultsRelease;
+          /** Phase 3d-ii: set by release_exam_results() for a results_release='manual' exam. Null = not yet released; irrelevant for 'immediate'/'after_close'. */
+          results_released_at: string | null;
           created_at: string;
           updated_at: string;
         };
@@ -481,6 +483,8 @@ export interface Database {
           auto_score: number | null;
           max_score: number | null;
           needs_manual_grading: boolean;
+          /** Phase 3d-ii: the linked proctor_sessions row for integrity_tier >= 2 attempts (null for tier 1, which runs no camera/engine). Set once at start_exam_attempt time from the exam's own tier+policy — never client-supplied. */
+          proctor_session_id: string | null;
           created_at: string;
         };
         // Writable only via start_exam_attempt()/submit_exam_attempt() RPCs
@@ -498,6 +502,10 @@ export interface Database {
           question_ref: string;
           response: Json | null;
           flagged: boolean;
+          /** Phase 3d-ii: manual essay grade, set only via grade_essay_slot (owner/lecturer-only). Null for non-essay slots and ungraded essays. */
+          marks_awarded: number | null;
+          /** Phase 3d-ii: optional lecturer feedback for a manually-graded essay slot. */
+          feedback: string | null;
           updated_at: string;
         };
         // Writable only via save_exam_answer() RPC (security definer).
@@ -943,6 +951,10 @@ export interface Database {
             }[];
           }[];
           answers: { question_ref: string; response: Json | null; flagged: boolean }[];
+          /** Phase 3d-ii: the parent exam's integrity_tier (1..4) — drives whether the client attaches the proctoring engine at all. */
+          integrity_tier: number;
+          /** Phase 3d-ii: the linked proctor session id for tier>=2 attempts (null for tier 1), so a resumed/refreshed exam room reattaches to the SAME session rather than starting a new one. */
+          proctor_session_id: string | null;
         };
       };
       save_exam_answer: {
@@ -969,6 +981,105 @@ export interface Database {
           results_released: boolean;
           per_question: { question_ref: string; score?: number; max?: number; needs_manual_grading?: boolean }[] | null;
         };
+      };
+      grade_essay_slot: {
+        // Phase 3d-ii: owner/lecturer-or-higher only. Re-derives the slot's
+        // max marks from the frozen paper (never trusts a client-supplied
+        // max) and clamps marks_awarded to [0, slot marks]. Auto-finalizes
+        // the attempt once every essay slot has a grade.
+        Args: { attempt_id: string; question_ref: string; marks_awarded: number; feedback?: string | null };
+        Returns: undefined;
+      };
+      finalize_attempt_grade: {
+        // Phase 3d-ii: recomputes auto_score = objective auto_score + sum of
+        // graded essay marks_awarded, sets status='graded'. Owner/lecturer-
+        // or-higher only. Idempotent.
+        Args: { attempt_id: string };
+        Returns: undefined;
+      };
+      release_exam_results: {
+        // Phase 3d-ii: for a results_release='manual' exam only, stamps
+        // exams.results_released_at = now(). Owner/lecturer-or-higher only.
+        Args: { exam_id: string };
+        Returns: undefined;
+      };
+      get_attempt_result: {
+        // Phase 3d-ii: THE single answer-revealing student-facing RPC.
+        // Owner-only (the attempt's own student). Returns {released:false,
+        // reason} until the exam's results_release condition is met;
+        // afterward returns the total plus a per-question breakdown
+        // (response, correct/accepted answer, score/max for objective
+        // types; marks_awarded/feedback/needs_manual_grading for essays).
+        Args: { attempt_id: string };
+        Returns: {
+          released: boolean;
+          reason?: "not_submitted" | "not_yet_released";
+          results_release?: ExamResultsRelease;
+          status?: ExamAttemptStatus;
+          auto_score?: number | null;
+          max_score?: number | null;
+          needs_manual_grading?: boolean;
+          per_question?: {
+            question_ref: string;
+            prompt: string;
+            type: QuestionTypeDb;
+            response: Json | null;
+            correct?: Json;
+            /** Bare {id,text} pairs for mcq_single/mcq_multi/true_false, so the client can render option text instead of a raw id. Null for types without options. */
+            options?: { id: string; text: string }[] | null;
+            score?: number;
+            max: number;
+            marks_awarded?: number | null;
+            feedback?: string | null;
+            needs_manual_grading?: boolean;
+          }[];
+        };
+      };
+      get_attempt_for_grading: {
+        // Phase 3d-ii lecturer-facing grading detail. Owner/lecturer-or-
+        // higher only, NOT release-gated (a lecturer grades before
+        // release). Every slot's prompt + student response, plus rubric/
+        // marks_awarded/feedback for essays and auto-score/max for
+        // objective types.
+        Args: { attempt_id: string };
+        Returns: {
+          attempt_id: string;
+          status: ExamAttemptStatus;
+          per_question: {
+            question_ref: string;
+            prompt: string;
+            type: QuestionTypeDb;
+            response: Json | null;
+            rubric?: Json;
+            marks_awarded?: number | null;
+            feedback?: string | null;
+            score?: number;
+            max: number;
+          }[];
+        };
+      };
+      exam_results: {
+        // Phase 3d-ii lecturer results view: one row per attempt with
+        // grading state + (for tier>=2 attempts) the linked proctor
+        // session's integrity summary. Owner/lecturer-or-higher only.
+        Args: { exam_id: string };
+        Returns: {
+          attempt_id: string;
+          student_id: string;
+          full_name: string | null;
+          student_number: string | null;
+          status: ExamAttemptStatus;
+          auto_score: number | null;
+          max_score: number | null;
+          needs_manual_grading: boolean;
+          started_at: string;
+          submitted_at: string | null;
+          proctor_session_id: string | null;
+          violation_count: number | null;
+          violation_limit: number | null;
+          session_status: string | null;
+          has_report: boolean;
+        }[];
       };
     };
     Enums: {
@@ -1008,3 +1119,8 @@ export type AttemptQuestions = Database["public"]["Functions"]["get_attempt_ques
 export type AttemptSection = AttemptQuestions["sections"][number];
 export type AttemptQuestion = AttemptSection["questions"][number];
 export type SubmitAttemptResult = Database["public"]["Functions"]["submit_exam_attempt"]["Returns"];
+export type AttemptResult = Database["public"]["Functions"]["get_attempt_result"]["Returns"];
+export type AttemptResultQuestion = NonNullable<AttemptResult["per_question"]>[number];
+export type ExamResultRow = Database["public"]["Functions"]["exam_results"]["Returns"][number];
+export type AttemptGradingDetail = Database["public"]["Functions"]["get_attempt_for_grading"]["Returns"];
+export type AttemptGradingQuestion = AttemptGradingDetail["per_question"][number];
