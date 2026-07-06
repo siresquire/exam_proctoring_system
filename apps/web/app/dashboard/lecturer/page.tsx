@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { BookOpen, FileSpreadsheet, Users } from "lucide-react";
+import { BookOpen, FileSpreadsheet, FileText, Users } from "lucide-react";
 
 import { DashboardShell } from "@/components/dashboard-shell";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -50,12 +50,25 @@ export default function LecturerDashboard() {
             </CardHeader>
           </Card>
         </Link>
+        <Link href="/dashboard/lecturer/exams" className="block">
+          <Card className="hover:bg-muted/50 h-full transition-colors">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <FileText aria-hidden className="text-primary" />
+                Exams (System 2)
+              </CardTitle>
+              <CardDescription>
+                Build exams from sections and question banks — fixed picks or randomized N-from-pool
+                draws, per-student shuffling, scheduling, and integrity tier.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+        </Link>
       </div>
       <DashboardShell
         title="Lecturer Dashboard"
         description="Schedule exams and review proctoring flags for your classes. Placeholder shell — wired up in later phases."
         cards={[
-          { title: "Exams", description: "Schedule exams, set proctoring tier, review results." },
           {
             title: "Live monitoring",
             description: "Watch active exam sessions and respond to flags.",

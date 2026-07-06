@@ -949,6 +949,127 @@ being deleted, `r18`). Run `node scripts/rls-smoke-test.mjs` (needs the dev
 server running for the unrelated Phase 2b webhook checks earlier in the
 same script) and `pnpm test:questions` for the parser unit tests.
 
+## Exam builder (Phase 3c)
+
+The exam builder defines exams that draw questions from Phase 3b banks and
+attach to a Phase 3a class. It stops at the **definition** of an exam and a
+**server-side draw function** for Phase 3d to call at attempt-start — it does
+not build the exam room, attempt storage, proctoring integration, or grading.
+
+### Schema
+
+`exams` (`supabase/migrations/20260705000011_exams.sql`) — one row per exam:
+`owner_id`, `class_id` (the cohort that may take it; null = not takeable by
+any student yet), `status` (`draft`/`published`/`closed`, mirrors
+`forms_exams`), `opens_at`/`closes_at`/`duration_minutes`, `integrity_tier`,
+`violation_policy` (same shape as `proctor_sessions.violation_policy`,
+reusing `ViolationPolicyEditor` wholesale in the builder UI),
+`shuffle_questions`/`shuffle_options`, `results_release`.
+
+`exam_sections` — an ordered section within an exam (`unique(exam_id,
+ordinal)`; reordered via `reorder_exam_section`'s up/down swap, never
+drag-only — DESIGN.md accessibility requirement).
+
+`exam_section_sources` — one row per question SOURCE within a section, not
+one row per question. A `CHECK` constraint enforces the right columns per
+`source_type`:
+- **`fixed`**: pins exactly one `question_id` — the same wording every
+  attempt (subject only to option shuffling).
+- **`pool`**: `bank_id` + optional `category_id`/`difficulty`/`tags` +
+  `draw_count` — that many **active** matching questions are drawn
+  pseudo-randomly per attempt. A section may freely mix fixed and pool
+  sources.
+
+### Fixed vs pool draw, and the per-attempt seeded randomization
+
+Per-student randomized draw is a core anti-cheat layer (`docs/RESEARCH.md`
+§4): every student who opens the same exam can get a different set of
+pool-drawn questions and a different option order, while grading and
+after-the-fact audit still need to reproduce **exactly** what a given
+student was shown. The design resolves that tension with **deterministic
+seeding** rather than true randomness: `draw_exam_for_attempt(exam_id,
+seed)` orders candidates by `md5(seed || ...)` — same `(exam_id, seed)`
+always returns the identical question set and order; a different seed
+(one per attempt, assigned by Phase 3d) almost always produces a different
+one. `current_version_id` is resolved and embedded **at call time**
+("frozen") — a later edit to a question (`add_question_version`) never
+retroactively changes an already-drawn attempt, because the attempt's
+recorded `version_id` is a specific immutable row, not the mutable
+`current_version_id` pointer.
+
+`draw_exam_for_attempt` returns the **full frozen structure including
+correct answers** — Phase 3d is expected to store that server-side and
+serve the student only a sanitized view with no `correct` fields.
+
+### Why the draw function is locked down
+
+Because `draw_exam_for_attempt` returns correct answers, it must never be
+directly reachable by a client. `EXECUTE` is revoked from
+`public`/`anon`/`authenticated` immediately after creation — the exact
+same lock-down pattern as `_create_proctor_session`
+(`20260705000006_lock_down_create_proctor_session_helper.sql`). It stays
+reachable by:
+- The **service role** (Phase 3d's future attempt-creation code — the
+  smoke test's determinism/retired-exclusion/frozen-version proofs call it
+  this way, mirroring how Phase 3d is expected to call it).
+- **`preview_exam_draw`**, a `SECURITY DEFINER` wrapper that independently
+  re-derives "is this caller the owner or a lecturer" via `can_manage_exam`
+  before delegating — a direct student RPC call to either function fails
+  with a clean `permission denied for function` / an authority-check
+  exception, not a business-logic error.
+
+Every other RPC in the migration (`create_exam`, `update_exam`,
+`add_exam_section`, `reorder_exam_section`, `add_section_source`,
+`validate_exam`, `set_exam_status`, ...) re-derives authority from
+`auth.uid()` + `has_role()`/`can_manage_exam()`/`can_manage_question_bank()`
+themselves, exactly like 3a/3b's RPCs — none of them trust a client-supplied
+claim, so none of them need the lock-down treatment.
+
+### Validation-gated publish
+
+`validate_exam(exam_id)` checks: every section has at least one source,
+every pool source has enough **active** matching questions for its
+`draw_count`, every fixed source still points at an active question, and a
+class is assigned. It returns `{ok, issues: string[]}`. `set_exam_status`
+calls `validate_exam` before allowing a transition to `published` and
+raises with the full issue list if not `ok` — publishing is only possible
+through this one RPC, so this is a real enforcement point, not just a UI
+nicety.
+
+### Student visibility is class-scoped
+
+Students get **no** `SELECT` policy at all on `exam_sections` or
+`exam_section_sources` — even for a published, in-window exam they can see,
+a direct client query on either table returns zero rows. The one student
+policy on `exams` itself requires **all** of: `status = 'published'`,
+`now()` inside `[opens_at, closes_at]` (nulls unbounded), and a
+`class_members` row for that student and the exam's `class_id`. Reassigning
+a published exam to a different class immediately revokes visibility for
+students not enrolled in the new class (verified in the smoke test, `s21`).
+
+### Verifying locally
+
+The RLS smoke test's section `(s)` covers: `create_exam` is
+lecturer-or-higher only; a student cannot see a draft exam nor any
+sections/sources; a student sees a published+open exam for a class they are
+enrolled in but not one for a class they are not; `validate_exam` catches
+an under-filled pool and blocks publish via `set_exam_status`; **both** a
+student's and the owning lecturer's own direct `draw_exam_for_attempt` RPC
+call are denied (lock-down regression, `s22`); `preview_exam_draw` is
+owner/lecturer-only; same-seed determinism, distinct selections across
+different seeds, retired-question exclusion, and frozen-version proofs
+(`s25`–`s28`). Run `node scripts/rls-smoke-test.mjs` (dev server must be
+running for the unrelated Phase 2b webhook checks earlier in the script).
+
+### What's deferred to Phase 3d
+
+Attempt-taking, per-student attempt records, answer storage,
+autosave/resume, the server-authoritative timer, auto-grading, the manual
+grading queue, results release logic, and attaching the proctoring engine
+by tier are all out of scope here. The student dashboard's "Upcoming exams"
+list shows a disabled "Start" button with a note that taking exams opens in
+a later phase.
+
 ## Design system review
 
 Run the dev server and open `/design` — it exercises every notification

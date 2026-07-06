@@ -26,6 +26,11 @@ export type FormsExamStatus = "draft" | "published" | "closed";
 /** Phase 2b: forms_submissions.match_status — see the migration comment on the column for the full classification rules. */
 export type FormsSubmissionMatchStatus = "matched" | "no_session" | "out_of_window" | "no_email";
 
+/** Phase 3c: exams.status. draft is never visible to students; published (+ in-window + enrolled) is what the student SELECT policy allows; closed stops new attempts (Phase 3d). */
+export type ExamStatus = "draft" | "published" | "closed";
+export type ExamResultsRelease = "immediate" | "after_close" | "manual";
+export type ExamSectionSourceType = "fixed" | "pool";
+
 export interface Database {
   public: {
     Tables: {
@@ -397,6 +402,68 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      exams: {
+        Row: {
+          id: string;
+          owner_id: string;
+          class_id: string | null;
+          title: string;
+          description: string | null;
+          status: ExamStatus;
+          opens_at: string | null;
+          closes_at: string | null;
+          duration_minutes: number | null;
+          integrity_tier: number;
+          violation_policy: Json;
+          shuffle_questions: boolean;
+          shuffle_options: boolean;
+          results_release: ExamResultsRelease;
+          created_at: string;
+          updated_at: string;
+        };
+        // Writable only via create_exam()/update_exam()/set_exam_status()
+        // RPCs (security definer) — no client INSERT/UPDATE policy exists;
+        // DELETE has no client policy either (owner-or-lecturer can delete
+        // via the RLS delete policy directly, mirroring classes/question_banks).
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      exam_sections: {
+        Row: {
+          id: string;
+          exam_id: string;
+          title: string;
+          description: string | null;
+          ordinal: number;
+          created_at: string;
+          updated_at: string;
+        };
+        // Writable only via add_exam_section()/reorder_exam_section()/
+        // remove_exam_section() RPCs — no client INSERT/UPDATE/DELETE policy.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      exam_section_sources: {
+        Row: {
+          id: string;
+          section_id: string;
+          source_type: ExamSectionSourceType;
+          ordinal: number;
+          question_id: string | null;
+          bank_id: string | null;
+          category_id: string | null;
+          difficulty: QuestionDifficultyDb | null;
+          tags: string[] | null;
+          draw_count: number | null;
+          created_at: string;
+        };
+        // Writable only via add_section_source()/remove_section_source() RPCs.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -659,6 +726,135 @@ export interface Database {
           updated_at: string;
         }[];
       };
+      can_manage_exam: {
+        // Phase 3c: true when the caller is lecturer-or-higher OR owns the
+        // given exam. Safe to call directly (re-derives authority).
+        Args: { exam_id: string };
+        Returns: boolean;
+      };
+      pool_available_count: {
+        // Phase 3c: count of ACTIVE questions in bank_id matching the
+        // optional category/difficulty/tags filter. Used by validate_exam
+        // and the builder's live "N matching available" indicator.
+        Args: { bank_id: string; category_id?: string | null; difficulty?: string | null; tags?: string[] | null };
+        Returns: number;
+      };
+      create_exam: {
+        // Phase 3c: lecturer-or-higher only. Creates a draft exam and
+        // returns its id. Audit-logged.
+        Args: { title: string; description?: string | null; class_id?: string | null };
+        Returns: string;
+      };
+      update_exam: {
+        // Phase 3c: owner-or-lecturer-or-higher only. Validates + merges
+        // violation_policy exactly like start_proctor_session. Does not
+        // change status — see set_exam_status.
+        Args: {
+          exam_id: string;
+          title: string;
+          description?: string | null;
+          class_id?: string | null;
+          opens_at?: string | null;
+          closes_at?: string | null;
+          duration_minutes?: number | null;
+          integrity_tier?: number;
+          violation_policy?: Json | null;
+          shuffle_questions?: boolean;
+          shuffle_options?: boolean;
+          results_release?: ExamResultsRelease;
+        };
+        Returns: undefined;
+      };
+      add_exam_section: {
+        // Phase 3c: appends a section at the end (ordinal = max + 1).
+        // Owner-or-lecturer-or-higher only.
+        Args: { exam_id: string; title: string; description?: string | null };
+        Returns: string;
+      };
+      reorder_exam_section: {
+        // Phase 3c: swaps ordinal with the immediate up/down neighbor
+        // (accessibility: up/down buttons, never drag-only). No-op at the
+        // edge. Owner-or-lecturer-or-higher only.
+        Args: { section_id: string; direction: "up" | "down" };
+        Returns: undefined;
+      };
+      remove_exam_section: {
+        // Phase 3c: deletes a section (cascades to its sources).
+        Args: { section_id: string };
+        Returns: undefined;
+      };
+      add_section_source: {
+        // Phase 3c: adds a fixed or pool source to a section, appended at
+        // the end. Fixed requires question_id; pool requires bank_id +
+        // draw_count. Re-checks can_manage_question_bank on the referenced
+        // bank in addition to can_manage_exam on the exam.
+        Args: {
+          section_id: string;
+          source_type: ExamSectionSourceType;
+          question_id?: string | null;
+          bank_id?: string | null;
+          category_id?: string | null;
+          difficulty?: QuestionDifficultyDb | null;
+          tags?: string[] | null;
+          draw_count?: number | null;
+        };
+        Returns: string;
+      };
+      remove_section_source: {
+        Args: { source_id: string };
+        Returns: undefined;
+      };
+      validate_exam: {
+        // Phase 3c: readiness check — every section has >=1 source, every
+        // pool source has enough ACTIVE matching questions for its
+        // draw_count, fixed sources still point at active questions, and a
+        // class is assigned. set_exam_status(published) calls this and
+        // refuses to publish when ok=false.
+        Args: { exam_id: string };
+        Returns: { ok: boolean; issues: string[] };
+      };
+      set_exam_status: {
+        // Phase 3c: publishing calls validate_exam first and raises with
+        // the issue list if not ok. Owner-or-lecturer-or-higher only.
+        Args: { exam_id: string; status: ExamStatus };
+        Returns: undefined;
+      };
+      draw_exam_for_attempt: {
+        // Phase 3c: THE core per-attempt deterministic seeded draw. Same
+        // (exam_id, seed) always returns the same result (md5(seed || ...)
+        // ordering, never actual randomness). Freezes current_version_id at
+        // call time. Returns FULL body INCLUDING correct answers — LOCKED
+        // DOWN: EXECUTE revoked from public/anon/authenticated. Only the
+        // service role (future Phase 3d attempt-creation code) and
+        // preview_exam_draw may call it. A direct client call fails with
+        // "permission denied for function" (42501), not a business-logic
+        // error — that IS the security boundary.
+        Args: { exam_id: string; seed: string };
+        Returns: {
+          exam_id: string;
+          seed: string;
+          sections: {
+            section_id: string;
+            title: string;
+            description: string | null;
+            questions: {
+              question_id: string;
+              version_id: string;
+              type: QuestionTypeDb;
+              prompt: string;
+              body: Json;
+            }[];
+          }[];
+        };
+      };
+      preview_exam_draw: {
+        // Phase 3c: owner-or-lecturer-or-higher-only preview of a sample
+        // drawn paper (fresh throwaway seed each call). Answers ARE
+        // included — acceptable because the caller already has authoring
+        // access to every question here. Never exposed to students.
+        Args: { exam_id: string };
+        Returns: Database["public"]["Functions"]["draw_exam_for_attempt"]["Returns"];
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -686,3 +882,8 @@ export type QuestionCategoryRow = Database["public"]["Tables"]["question_categor
 export type QuestionRow = Database["public"]["Tables"]["questions"]["Row"];
 export type QuestionVersionRow = Database["public"]["Tables"]["question_versions"]["Row"];
 export type BankQuestionRow = Database["public"]["Functions"]["bank_questions"]["Returns"][number];
+export type ExamRow = Database["public"]["Tables"]["exams"]["Row"];
+export type ExamSectionRow = Database["public"]["Tables"]["exam_sections"]["Row"];
+export type ExamSectionSourceRow = Database["public"]["Tables"]["exam_section_sources"]["Row"];
+export type ExamValidationResult = Database["public"]["Functions"]["validate_exam"]["Returns"];
+export type ExamDraw = Database["public"]["Functions"]["draw_exam_for_attempt"]["Returns"];

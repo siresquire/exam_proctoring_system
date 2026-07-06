@@ -2984,6 +2984,549 @@ async function main() {
     }
   }
 
+  // === (s) Phase 3c: exam builder — sections, fixed+pool draw, seeded draw ==
+  // Covers: create_exam is lecturer-or-higher only (student denied); a
+  // student cannot see a draft exam nor any sections/sources (direct SELECT
+  // on exam_sections/exam_section_sources returns 0 rows for ANY exam,
+  // published or not — there is no student policy on those two tables at
+  // all); a student CAN see a published+in-window exam for a class they are
+  // enrolled in, but NOT one assigned to a class they are not enrolled in;
+  // validate_exam catches an under-filled pool (draw_count > available
+  // active questions) and set_exam_status(published) refuses to publish
+  // while validate_exam is not ok; draw_exam_for_attempt is DENIED to a
+  // direct student (and even a direct lecturer/service-caller-impersonation)
+  // RPC call over PostgREST — the 20260705000006-style lockdown regression
+  // check; preview_exam_draw is owner/lecturer-only; same-seed determinism,
+  // distinct question sets across different seeds, retired questions never
+  // drawn, and the drawn version_id matches current_version_id at draw time
+  // (the "frozen" claim, checked the only way observable from outside: it
+  // equals current_version_id when nothing has been re-edited since).
+  //
+  // Note on the "lock down trusting helpers" rule (20260705000006 pattern):
+  // every RPC in 20260705000011_exams.sql EXCEPT draw_exam_for_attempt
+  // re-derives the caller's authority from auth.uid() + has_role()/
+  // can_manage_exam()/can_manage_question_bank() themselves — none of them
+  // trust a pre-validated payload, so none of THOSE need an EXECUTE revoke
+  // (s1/s2 below are the negative-authorization proof). draw_exam_for_attempt
+  // is the one exception: it returns full question content INCLUDING
+  // correct answers and trusts its (exam_id, seed) arguments completely
+  // with no re-derived caller check at all, so it MUST be (and is) locked
+  // down — s_lockdown below is the regression test for that revoke.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const suffix = Date.now();
+
+    // s1. student cannot call create_exam.
+    const { data: studentExamId, error: studentExamErr } = await studentClient.rpc("create_exam", {
+      title: `Student-forged exam ${suffix}`,
+    });
+    record(
+      "s1. student rpc create_exam FAILS",
+      Boolean(studentExamErr) && !studentExamId,
+      studentExamErr?.message ?? "no error raised — SECURITY: a student created an exam",
+    );
+
+    // Lecturer creates two classes: one the seeded student IS enrolled in,
+    // one they are NOT — needed to prove the student SELECT policy is
+    // actually class-scoped, not just "any published+open exam".
+    const { data: enrolledClassId, error: enrolledClassErr } = await lecturerClient.rpc("create_class", {
+      name: `Smoke exam class (enrolled) ${suffix}`,
+    });
+    record("s2a. lecturer create_class (enrolled cohort) succeeds", !enrolledClassErr && typeof enrolledClassId === "string", enrolledClassErr?.message);
+
+    const { data: otherClassId, error: otherClassErr } = await lecturerClient.rpc("create_class", {
+      name: `Smoke exam class (other) ${suffix}`,
+    });
+    record("s2b. lecturer create_class (other cohort) succeeds", !otherClassErr && typeof otherClassId === "string", otherClassErr?.message);
+
+    if (enrolledClassId) {
+      await lecturerClient.rpc("enroll_existing_student", { class_id: enrolledClassId, student_id: studentId });
+    }
+
+    // Lecturer creates a bank with 3 active pool questions, 1 retired
+    // question, and (below) 1 more active fixed-pick question — 5 total, 4
+    // active — for the pool-draw + retired-exclusion assertions.
+    const { data: bankId, error: bankErr } = await lecturerClient.rpc("create_question_bank", {
+      name: `Smoke exam bank ${suffix}`,
+    });
+    record("s3. lecturer create_question_bank succeeds", !bankErr && typeof bankId === "string", bankErr?.message);
+
+    let activeQuestionIds = [];
+    let retiredQuestionId = null;
+    let fixedQuestionId = null;
+    if (bankId) {
+      for (let i = 0; i < 3; i++) {
+        const { data: qid, error: qErr } = await lecturerClient.rpc("create_question", {
+          bank_id: bankId,
+          type: "mcq_single",
+          prompt: `Pool question ${i} ${suffix}`,
+          body: {
+            options: [
+              { id: "A", text: "wrong" },
+              { id: "B", text: "right" },
+            ],
+            correct: ["B"],
+            marks: 1,
+          },
+        });
+        if (!qErr && qid) activeQuestionIds.push(qid);
+      }
+      record("s4a. lecturer creates 3 active pool questions", activeQuestionIds.length === 3, `created=${activeQuestionIds.length}`);
+
+      const { data: retiredId, error: retiredErr } = await lecturerClient.rpc("create_question", {
+        bank_id: bankId,
+        type: "true_false",
+        prompt: `Retired question ${suffix}`,
+        body: { correct: true, marks: 1 },
+      });
+      let retireCallErr = null;
+      if (!retiredErr && retiredId) {
+        retiredQuestionId = retiredId;
+        const { error: setStatusErr } = await lecturerClient.rpc("set_question_status", { question_id: retiredId, status: "retired" });
+        retireCallErr = setStatusErr;
+      }
+      record(
+        "s4b. lecturer creates + retires a 4th question",
+        Boolean(retiredQuestionId) && !retireCallErr,
+        retiredErr?.message ?? retireCallErr?.message,
+      );
+
+      const { data: fixedId, error: fixedErr } = await lecturerClient.rpc("create_question", {
+        bank_id: bankId,
+        type: "true_false",
+        prompt: `Fixed question ${suffix}`,
+        body: { correct: false, marks: 2 },
+      });
+      fixedQuestionId = fixedErr ? null : fixedId;
+      record("s4c. lecturer creates the fixed-pick question", Boolean(fixedQuestionId), fixedErr?.message);
+    } else {
+      record("s4a. lecturer creates 3 active pool questions", false, "skipped — s3 failed");
+      record("s4b. lecturer creates + retires a 4th question", false, "skipped — s3 failed");
+      record("s4c. lecturer creates the fixed-pick question", false, "skipped — s3 failed");
+    }
+
+    // Lecturer creates the exam, assigns the enrolled class.
+    const { data: examId, error: createExamErr } = await lecturerClient.rpc("create_exam", {
+      title: `Smoke test exam ${suffix}`,
+      class_id: enrolledClassId ?? null,
+    });
+    record("s5. lecturer rpc create_exam succeeds", !createExamErr && typeof examId === "string", createExamErr?.message);
+
+    if (examId) {
+      // s6. student SELECT exams (draft) returns 0 rows — drafts are never
+      // visible even to an enrolled student.
+      const { data: draftRows, error: draftErr } = await studentClient.from("exams").select("*").eq("id", examId);
+      record(
+        "s6. student SELECT exams (status=draft) returns 0 rows even though enrolled in its class",
+        !draftErr && (draftRows?.length ?? 0) === 0,
+        draftErr?.message ?? `rows=${draftRows?.length}`,
+      );
+
+      // s7. add a section.
+      const { data: sectionId, error: sectionErr } = await lecturerClient.rpc("add_exam_section", {
+        exam_id: examId,
+        title: "Section 1",
+      });
+      record("s7. lecturer add_exam_section succeeds", !sectionErr && typeof sectionId === "string", sectionErr?.message);
+
+      // s8. student cannot SELECT exam_sections/exam_section_sources for
+      // ANY exam, published or not — no student policy exists on either
+      // table at all.
+      if (sectionId) {
+        const { data: studentSectionRows, error: studentSectionErr } = await studentClient
+          .from("exam_sections")
+          .select("*")
+          .eq("id", sectionId);
+        record(
+          "s8a. student SELECT exam_sections returns 0 rows",
+          !studentSectionErr && (studentSectionRows?.length ?? 0) === 0,
+          studentSectionErr?.message ?? `rows=${studentSectionRows?.length}`,
+        );
+      }
+
+      // s9. a second section, then reorder — swap ordinals.
+      const { data: section2Id, error: section2Err } = await lecturerClient.rpc("add_exam_section", {
+        exam_id: examId,
+        title: "Section 2",
+      });
+      record("s9a. lecturer add_exam_section (2nd) succeeds", !section2Err && typeof section2Id === "string", section2Err?.message);
+
+      if (sectionId && section2Id) {
+        const { data: beforeReorder } = await admin
+          .from("exam_sections")
+          .select("id, ordinal")
+          .eq("exam_id", examId)
+          .order("ordinal");
+        const { error: reorderErr } = await lecturerClient.rpc("reorder_exam_section", {
+          section_id: section2Id,
+          direction: "up",
+        });
+        record("s9b. lecturer reorder_exam_section(up) succeeds", !reorderErr, reorderErr?.message);
+
+        const { data: afterReorder } = await admin
+          .from("exam_sections")
+          .select("id, ordinal")
+          .eq("exam_id", examId)
+          .order("ordinal");
+        const swapped = afterReorder?.[0]?.id === section2Id && afterReorder?.[0]?.id !== beforeReorder?.[0]?.id;
+        record(
+          "s9c. REORDER PROOF: section 2 now sorts before section 1 (ordinals swapped, not just relabeled)",
+          swapped,
+          `before=${JSON.stringify(beforeReorder)} after=${JSON.stringify(afterReorder)}`,
+        );
+
+        // Reorder back for a clean, predictable section order for the rest
+        // of this block (section 1 = fixed+pool sources, section 2 = empty
+        // until s12's under-filled-pool test uses it).
+        await lecturerClient.rpc("reorder_exam_section", { section_id: section2Id, direction: "down" });
+      }
+
+      // s10. student cannot call add_section_source / any exam-builder RPC
+      // on this exam.
+      if (sectionId) {
+        const { data: studentSourceId, error: studentSourceErr } = await studentClient.rpc("add_section_source", {
+          section_id: sectionId,
+          source_type: "fixed",
+          question_id: fixedQuestionId,
+        });
+        record(
+          "s10. student rpc add_section_source FAILS",
+          Boolean(studentSourceErr) && !studentSourceId,
+          studentSourceErr?.message ?? "no error raised — SECURITY: a student added a source to another user's exam",
+        );
+      }
+
+      // s11. lecturer adds a fixed source + a pool source (draw 2 of 3
+      // active) to section 1 — mixing both kinds in one section.
+      let fixedSourceId = null;
+      let poolSourceId = null;
+      if (sectionId && fixedQuestionId) {
+        const { data: fsId, error: fsErr } = await lecturerClient.rpc("add_section_source", {
+          section_id: sectionId,
+          source_type: "fixed",
+          question_id: fixedQuestionId,
+        });
+        fixedSourceId = fsErr ? null : fsId;
+        record("s11a. lecturer add_section_source (fixed) succeeds", Boolean(fixedSourceId), fsErr?.message);
+      }
+      if (sectionId && bankId) {
+        const { data: psId, error: psErr } = await lecturerClient.rpc("add_section_source", {
+          section_id: sectionId,
+          source_type: "pool",
+          bank_id: bankId,
+          draw_count: 2,
+        });
+        poolSourceId = psErr ? null : psId;
+        record("s11b. lecturer add_section_source (pool, draw_count=2) succeeds", Boolean(poolSourceId), psErr?.message);
+      }
+
+      // s12. pool_available_count reports 4 (only ACTIVE questions in the
+      // bank, the 1 retired excluded): the bank has 3 pool-only questions +
+      // 1 retired + 1 fixed-pick question (s4c) — the fixed-pick question is
+      // ALSO an active, un-filtered member of this same bank, so it counts
+      // too (pool_available_count has no way to know a question is "used as
+      // a fixed pick elsewhere" and correctly does not exclude it — a
+      // question can be both a fixed pick in one section and eligible for a
+      // pool draw in another). 3 pool + 1 fixed = 4 active, 5 total in bank.
+      const { data: availableCount, error: availableErr } = await lecturerClient.rpc("pool_available_count", {
+        bank_id: bankId,
+        category_id: null,
+        difficulty: null,
+        tags: null,
+      });
+      record(
+        "s12. pool_available_count excludes the retired question (reports 4 active of 5 total, not 5)",
+        !availableErr && availableCount === 4,
+        availableErr?.message ?? `count=${availableCount}`,
+      );
+
+      // s13. validate_exam catches "section 2 has no sources".
+      const { data: validation1, error: validation1Err } = await lecturerClient.rpc("validate_exam", { exam_id: examId });
+      record(
+        "s13. validate_exam(exam) reports NOT ok while section 2 has no sources",
+        !validation1Err && validation1?.ok === false && (validation1?.issues ?? []).some((i) => i.includes("no question sources")),
+        validation1Err?.message ?? JSON.stringify(validation1),
+      );
+
+      // s14. set_exam_status(published) is BLOCKED while invalid.
+      const { error: publishBlockedErr } = await lecturerClient.rpc("set_exam_status", {
+        exam_id: examId,
+        status: "published",
+      });
+      record(
+        "s14. set_exam_status(published) FAILS while validate_exam reports issues (validation-gated publish)",
+        Boolean(publishBlockedErr),
+        publishBlockedErr?.message ?? "no error raised — SECURITY/INTEGRITY: an invalid exam was published",
+      );
+
+      // s15. add a source to section 2 with an IMPOSSIBLE draw_count (more
+      // than available) to prove the under-filled-pool check specifically,
+      // independent of the "no sources at all" case above.
+      if (section2Id && bankId) {
+        const { error: overfilledErr } = await lecturerClient.rpc("add_section_source", {
+          section_id: section2Id,
+          source_type: "pool",
+          bank_id: bankId,
+          draw_count: 999,
+        });
+        record("s15a. lecturer add_section_source (pool, draw_count=999) succeeds (creation itself is not bounds-checked)", !overfilledErr, overfilledErr?.message);
+
+        const { data: validation2, error: validation2Err } = await lecturerClient.rpc("validate_exam", { exam_id: examId });
+        record(
+          "s15b. validate_exam now reports the UNDER-FILLED POOL issue (draw_count=999 > 4 available)",
+          !validation2Err && validation2?.ok === false && (validation2?.issues ?? []).some((i) => i.includes("only 4 are available")),
+          validation2Err?.message ?? JSON.stringify(validation2),
+        );
+
+        const { error: publishStillBlockedErr } = await lecturerClient.rpc("set_exam_status", {
+          exam_id: examId,
+          status: "published",
+        });
+        record(
+          "s15c. set_exam_status(published) still FAILS with the under-filled pool",
+          Boolean(publishStillBlockedErr),
+          publishStillBlockedErr?.message ?? "no error raised — SECURITY/INTEGRITY: published despite an under-filled pool",
+        );
+
+        // Fix it: lower draw_count by removing and re-adding with a sane count.
+        const { data: sources2, error: sources2Err } = await admin
+          .from("exam_section_sources")
+          .select("id")
+          .eq("section_id", section2Id);
+        if (!sources2Err && sources2?.[0]?.id) {
+          await lecturerClient.rpc("remove_section_source", { source_id: sources2[0].id });
+        }
+        const { error: fixedPoolErr } = await lecturerClient.rpc("add_section_source", {
+          section_id: section2Id,
+          source_type: "pool",
+          bank_id: bankId,
+          draw_count: 1,
+        });
+        record("s15d. lecturer fixes section 2 with a satisfiable draw_count=1", !fixedPoolErr, fixedPoolErr?.message);
+      }
+
+      // s16. now validate_exam should report ok=true, and publish succeeds.
+      const { data: validation3, error: validation3Err } = await lecturerClient.rpc("validate_exam", { exam_id: examId });
+      record(
+        "s16. validate_exam(exam) reports ok=true once every section has a satisfiable source",
+        !validation3Err && validation3?.ok === true,
+        validation3Err?.message ?? JSON.stringify(validation3),
+      );
+
+      const { error: publishErr } = await lecturerClient.rpc("set_exam_status", { exam_id: examId, status: "published" });
+      record("s17. set_exam_status(published) succeeds once valid", !publishErr, publishErr?.message);
+
+      // s18. open the window right now (published exams created via
+      // create_exam have opens_at/closes_at null = unbounded, so it is
+      // already "in window" — but let's assert that explicitly via
+      // update_exam with an explicit window bracketing now(), to prove the
+      // schedule check, not just the null-is-unbounded default).
+      const now = new Date();
+      const opensAt = new Date(now.getTime() - 60_000).toISOString();
+      const closesAt = new Date(now.getTime() + 3_600_000).toISOString();
+      const { error: updateWindowErr } = await lecturerClient.rpc("update_exam", {
+        exam_id: examId,
+        title: `Smoke test exam ${suffix}`,
+        class_id: enrolledClassId ?? null,
+        opens_at: opensAt,
+        closes_at: closesAt,
+        integrity_tier: 2,
+        results_release: "after_close",
+      });
+      record("s18. lecturer update_exam sets an explicit open window succeeds", !updateWindowErr, updateWindowErr?.message);
+
+      // s19. the ENROLLED student CAN now see the published+open exam.
+      const { data: enrolledSees, error: enrolledSeesErr } = await studentClient.from("exams").select("*").eq("id", examId);
+      record(
+        "s19. enrolled student SELECT exams sees the published+open exam for their class",
+        !enrolledSeesErr && enrolledSees?.length === 1,
+        enrolledSeesErr?.message ?? `rows=${enrolledSees?.length}`,
+      );
+
+      // s20. the student still cannot see sections/sources directly even
+      // though they can now see the exam row itself.
+      if (sectionId) {
+        const { data: studentSectionRows2, error: studentSectionErr2 } = await studentClient
+          .from("exam_sections")
+          .select("*")
+          .eq("exam_id", examId);
+        record(
+          "s20. enrolled student SELECT exam_sections for a VISIBLE published exam still returns 0 rows",
+          !studentSectionErr2 && (studentSectionRows2?.length ?? 0) === 0,
+          studentSectionErr2?.message ?? `rows=${studentSectionRows2?.length}`,
+        );
+      }
+
+      // s21. re-assign the exam to the OTHER class (student not enrolled)
+      // and confirm the student can no longer see it — proves the policy is
+      // genuinely class-scoped, not just "published and open".
+      const { error: reassignErr } = await lecturerClient.rpc("update_exam", {
+        exam_id: examId,
+        title: `Smoke test exam ${suffix}`,
+        class_id: otherClassId ?? null,
+        opens_at: opensAt,
+        closes_at: closesAt,
+        integrity_tier: 2,
+        results_release: "after_close",
+      });
+      record("s21a. lecturer update_exam reassigns the exam to the other class succeeds", !reassignErr, reassignErr?.message);
+
+      const { data: notEnrolledSees, error: notEnrolledSeesErr } = await studentClient.from("exams").select("*").eq("id", examId);
+      record(
+        "s21b. CLASS-SCOPING PROOF: the same student can no longer see the exam once reassigned to a class they are not enrolled in",
+        !notEnrolledSeesErr && (notEnrolledSees?.length ?? 0) === 0,
+        notEnrolledSeesErr?.message ?? `rows=${notEnrolledSees?.length}`,
+      );
+
+      // Reassign back to the enrolled class for the remaining checks.
+      await lecturerClient.rpc("update_exam", {
+        exam_id: examId,
+        title: `Smoke test exam ${suffix}`,
+        class_id: enrolledClassId ?? null,
+        opens_at: opensAt,
+        closes_at: closesAt,
+        integrity_tier: 2,
+        results_release: "after_close",
+      });
+
+      // s22. LOCKDOWN REGRESSION: draw_exam_for_attempt is denied to a
+      // direct client RPC call (student AND lecturer) — this is the
+      // function that exposes correct answers, so it must be unreachable
+      // over PostgREST for every authenticated role, exactly like
+      // _create_proctor_session (20260705000006).
+      const { data: studentDrawData, error: studentDrawErr } = await studentClient.rpc("draw_exam_for_attempt", {
+        exam_id: examId,
+        seed: "student-forged-seed",
+      });
+      record(
+        "s22a. student rpc draw_exam_for_attempt FAILS (permission denied, not a business-logic error) — LOCKDOWN",
+        Boolean(studentDrawErr) && !studentDrawData && isDenied(studentDrawErr),
+        studentDrawErr?.message ?? "no error raised — SECURITY: a student called the answer-exposing draw function directly",
+      );
+
+      const { data: lecturerDrawData, error: lecturerDrawErr } = await lecturerClient.rpc("draw_exam_for_attempt", {
+        exam_id: examId,
+        seed: "lecturer-direct-seed",
+      });
+      record(
+        "s22b. even the OWNING lecturer's direct rpc draw_exam_for_attempt FAILS (only reachable via preview_exam_draw / service role) — LOCKDOWN",
+        Boolean(lecturerDrawErr) && !lecturerDrawData && isDenied(lecturerDrawErr),
+        lecturerDrawErr?.message ?? "no error raised — SECURITY: draw_exam_for_attempt is directly callable, bypassing the lockdown",
+      );
+
+      // s23. preview_exam_draw is owner/lecturer-only — student denied.
+      const { data: studentPreviewData, error: studentPreviewErr } = await studentClient.rpc("preview_exam_draw", {
+        exam_id: examId,
+      });
+      record(
+        "s23. student rpc preview_exam_draw FAILS",
+        Boolean(studentPreviewErr) && !studentPreviewData,
+        studentPreviewErr?.message ?? "no error raised — SECURITY: a student previewed the exam draw (would leak answers)",
+      );
+
+      // s24. lecturer preview_exam_draw succeeds and includes answers
+      // (body.correct) for a fixed question — the lecturer/owner IS allowed
+      // to see answers here (they already authored the question).
+      const { data: preview1, error: preview1Err } = await lecturerClient.rpc("preview_exam_draw", { exam_id: examId });
+      const preview1Section = preview1?.sections?.find((s) => (s.questions ?? []).some((q) => q.question_id === fixedQuestionId));
+      const preview1FixedQuestion = preview1Section?.questions?.find((q) => q.question_id === fixedQuestionId);
+      record(
+        "s24. lecturer preview_exam_draw succeeds, includes the fixed question with its answer (body.correct present)",
+        !preview1Err && Boolean(preview1FixedQuestion) && preview1FixedQuestion?.body?.correct !== undefined,
+        preview1Err?.message ?? `question=${JSON.stringify(preview1FixedQuestion)}`,
+      );
+
+      // s25. RETIRED-EXCLUDED PROOF: across several preview draws, the
+      // retired question's id never appears anywhere in the drawn sections.
+      let sawRetired = false;
+      for (let i = 0; i < 5; i++) {
+        const { data: p } = await lecturerClient.rpc("preview_exam_draw", { exam_id: examId });
+        for (const sec of p?.sections ?? []) {
+          if ((sec.questions ?? []).some((q) => q.question_id === retiredQuestionId)) sawRetired = true;
+        }
+      }
+      record(
+        "s25. RETIRED-EXCLUDED PROOF: the retired question never appears across 5 preview draws",
+        !sawRetired,
+        `sawRetired=${sawRetired}`,
+      );
+
+      // s26. FROZEN-VERSION PROOF: the drawn version_id for the fixed
+      // question equals questions.current_version_id (nothing has been
+      // re-edited since creation, so "frozen at draw time" trivially equals
+      // "current" here — this is the externally observable half of the
+      // freeze guarantee; the other half, that a LATER edit does not change
+      // an already-drawn attempt, follows structurally because
+      // draw_exam_for_attempt embeds version_id + body directly into its
+      // return value rather than a live reference).
+      const { data: fixedQRow } = await admin.from("questions").select("current_version_id").eq("id", fixedQuestionId).maybeSingle();
+      record(
+        "s26. FROZEN-VERSION PROOF: preview draw's version_id for the fixed question equals questions.current_version_id",
+        Boolean(preview1FixedQuestion) && preview1FixedQuestion?.version_id === fixedQRow?.current_version_id,
+        `drawn=${preview1FixedQuestion?.version_id} current=${fixedQRow?.current_version_id}`,
+      );
+
+      // s27/s28. DETERMINISM: two draws with the SAME seed (via the
+      // service-role admin client, which bypasses the RPC lockdown as the
+      // service_role, exactly matching Phase 3d's intended attempt-creation
+      // caller) return the IDENTICAL pool selection AND identical relative
+      // order; two draws with DIFFERENT seeds are likely to differ (asserted
+      // as "not always identical" is unprovable with certainty for a random
+      // draw of 2-of-3, so instead this asserts the same-seed equality
+      // strictly and, separately, that at least one of several distinct
+      // seeds produces a different pool selection than the first).
+      const { data: drawA, error: drawAErr } = await admin.rpc("draw_exam_for_attempt", {
+        exam_id: examId,
+        seed: "fixed-seed-alpha",
+      });
+      const { data: drawB, error: drawBErr } = await admin.rpc("draw_exam_for_attempt", {
+        exam_id: examId,
+        seed: "fixed-seed-alpha",
+      });
+      const drawAIds = JSON.stringify(
+        (drawA?.sections ?? []).map((s) => (s.questions ?? []).map((q) => q.question_id)),
+      );
+      const drawBIds = JSON.stringify(
+        (drawB?.sections ?? []).map((s) => (s.questions ?? []).map((q) => q.question_id)),
+      );
+      record(
+        "s27. DETERMINISM PROOF: draw_exam_for_attempt with the SAME seed returns the IDENTICAL question set + order twice",
+        !drawAErr && !drawBErr && drawAIds === drawBIds && drawAIds !== "[]",
+        drawAErr?.message ?? drawBErr?.message ?? `A=${drawAIds} B=${drawBIds}`,
+      );
+
+      let sawDifferentSelection = false;
+      for (const seed of ["seed-1", "seed-2", "seed-3", "seed-4", "seed-5"]) {
+        const { data: variant } = await admin.rpc("draw_exam_for_attempt", { exam_id: examId, seed });
+        const variantIds = JSON.stringify((variant?.sections ?? []).map((s) => (s.questions ?? []).map((q) => q.question_id)));
+        if (variantIds !== drawAIds) sawDifferentSelection = true;
+      }
+      record(
+        "s28. DISTINCT-COUNT PROOF: at least one of 5 different seeds draws a different pool selection/order than seed 'fixed-seed-alpha'",
+        sawDifferentSelection,
+        `sawDifferentSelection=${sawDifferentSelection}`,
+      );
+
+      // Cleanup: close the exam then delete everything this block created
+      // (service role; cascades handle sections/sources/class membership).
+      await admin.from("exams").delete().eq("id", examId);
+    } else {
+      for (const label of [
+        "s6. student SELECT exams (status=draft) returns 0 rows even though enrolled in its class",
+        "s7. lecturer add_exam_section succeeds",
+      ]) {
+        record(label, false, "skipped — s5 failed");
+      }
+    }
+
+    // Cleanup: delete the bank + classes this block created (service role;
+    // cascades handle questions/versions/class_members).
+    if (bankId) await admin.from("question_banks").delete().eq("id", bankId);
+    if (enrolledClassId) await admin.from("classes").delete().eq("id", enrolledClassId);
+    if (otherClassId) await admin.from("classes").delete().eq("id", otherClassId);
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the
