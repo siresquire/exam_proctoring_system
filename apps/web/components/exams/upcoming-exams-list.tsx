@@ -1,18 +1,22 @@
-import { Clock, FileText } from "lucide-react";
+import Link from "next/link";
+import { FileText } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { ExamRow } from "@/lib/supabase/types";
 
 /**
- * Student-facing "Upcoming exams" list (Phase 3c task brief). Rows already
- * come pre-filtered by exams_select_published_open_enrolled RLS (published +
- * within [opens_at, closes_at] + the student is a class_members row for
+ * Student-facing "Upcoming exams" list (Phase 3c task brief, Start wired up
+ * in Phase 3d-i). Rows already come pre-filtered by
+ * exams_select_published_open_enrolled RLS (published + within
+ * [opens_at, closes_at] + the student is a class_members row for
  * exams.class_id) — this component only renders what the server returned,
  * it does not re-check status/window/enrollment itself.
  *
- * "Start" is deliberately disabled: exam_attempts/answer storage/proctoring
- * integration is Phase 3d. Listing only.
+ * "Start" links to /exam/[examId], which runs the attestation intro then
+ * start_exam_attempt/get_attempt_questions (Phase 3d-i) — the RPCs
+ * themselves re-derive enrollment/window/published-status independently, so
+ * this link is not the security boundary, just navigation.
  */
 export function UpcomingExamsList({ exams }: { exams: ExamRow[] }) {
   if (exams.length === 0) return null;
@@ -39,13 +43,9 @@ export function UpcomingExamsList({ exams }: { exams: ExamRow[] }) {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-2">
-              <Button disabled aria-describedby={`exam-start-note-${exam.id}`}>
-                Start
+              <Button asChild>
+                <Link href={`/exam/${exam.id}`}>Start</Link>
               </Button>
-              <p id={`exam-start-note-${exam.id}`} className="text-muted-foreground flex items-center gap-1.5 text-xs">
-                <Clock aria-hidden className="size-3.5" />
-                Taking exams opens in a later phase — this page just previews your schedule.
-              </p>
             </CardContent>
           </Card>
         ))}

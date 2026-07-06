@@ -31,6 +31,9 @@ export type ExamStatus = "draft" | "published" | "closed";
 export type ExamResultsRelease = "immediate" | "after_close" | "manual";
 export type ExamSectionSourceType = "fixed" | "pool";
 
+/** Phase 3d-i: exam_attempts.status. in_progress -> submitted/auto_submitted at student submit; graded/terminated are reserved for Phase 3d-ii (manual essay grading / proctoring termination). */
+export type ExamAttemptStatus = "in_progress" | "submitted" | "auto_submitted" | "graded" | "terminated";
+
 export interface Database {
   public: {
     Tables: {
@@ -464,6 +467,51 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      exam_attempts: {
+        Row: {
+          id: string;
+          exam_id: string;
+          student_id: string;
+          status: ExamAttemptStatus;
+          seed: string;
+          started_at: string;
+          /** Server-authoritative deadline = started_at + duration_minutes * accommodations extra_time_multiplier. Null exam duration -> far-future deadline (no time limit), never a null column. */
+          deadline_at: string;
+          submitted_at: string | null;
+          auto_score: number | null;
+          max_score: number | null;
+          needs_manual_grading: boolean;
+          created_at: string;
+        };
+        // Writable only via start_exam_attempt()/submit_exam_attempt() RPCs
+        // (security definer) — no client INSERT/UPDATE policy.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      exam_answers: {
+        Row: {
+          id: string;
+          attempt_id: string;
+          question_version_id: string;
+          /** Per-attempt slot id "<section_id>:<index>" minted when the paper is frozen — see get_attempt_questions. */
+          question_ref: string;
+          response: Json | null;
+          flagged: boolean;
+          updated_at: string;
+        };
+        // Writable only via save_exam_answer() RPC (security definer).
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      // exam_attempt_papers is intentionally OMITTED from this Database type:
+      // it has zero client-reachable RLS policies (not even for the owning
+      // student) and is never read/written via the client library — only
+      // through get_attempt_questions()/submit_exam_attempt() (which strip
+      // or internally consume its content) or the service role. Omitting it
+      // here means the generated client types don't even offer
+      // `.from("exam_attempt_papers")` as an autocomplete suggestion.
     };
     Views: Record<string, never>;
     Functions: {
@@ -855,6 +903,73 @@ export interface Database {
         Args: { exam_id: string };
         Returns: Database["public"]["Functions"]["draw_exam_for_attempt"]["Returns"];
       };
+      start_exam_attempt: {
+        // Phase 3d-i: validates attested=true (identity gate), exam
+        // published + in-window, and class_members enrollment. Resumes an
+        // existing in_progress attempt if one exists (idempotent); otherwise
+        // enforces one-attempt-per-exam, calls the locked-down
+        // draw_exam_for_attempt, and stores the frozen paper in
+        // exam_attempt_papers (never in exam_attempts itself). Returns the
+        // attempt id.
+        Args: { exam_id: string; claimed_index_number?: string | null; attested?: boolean };
+        Returns: string;
+      };
+      get_attempt_questions: {
+        // Phase 3d-i: THE sanitized delivery RPC. Owner-only. Strips every
+        // answer-bearing body field (correct/accepted/case_sensitive/
+        // tolerance/rubric) server-side before returning, and rebuilds
+        // options as bare {id,text}. Also returns saved responses/flags
+        // (exam_answers) + deadline_at + server `now()` so the client can
+        // render resume state and a server-authoritative countdown.
+        Args: { attempt_id: string };
+        Returns: {
+          attempt_id: string;
+          status: ExamAttemptStatus;
+          started_at: string;
+          deadline_at: string;
+          server_now: string;
+          sections: {
+            section_id: string;
+            title: string;
+            description: string | null;
+            questions: {
+              question_ref: string;
+              question_id: string;
+              version_id: string;
+              type: QuestionTypeDb;
+              prompt: string;
+              /** Answer fields already stripped — see the migration comment on get_attempt_questions. */
+              body: Json;
+            }[];
+          }[];
+          answers: { question_ref: string; response: Json | null; flagged: boolean }[];
+        };
+      };
+      save_exam_answer: {
+        // Phase 3d-i: autosave. Owner-only, attempt must be in_progress, and
+        // REJECTED once now() > deadline_at regardless of client-claimed
+        // state (server-authoritative). Upserts on (attempt_id, question_ref).
+        Args: { attempt_id: string; question_ref: string; response?: Json | null; flagged?: boolean };
+        Returns: undefined;
+      };
+      submit_exam_attempt: {
+        // Phase 3d-i: owner-only. Auto-grades every non-essay slot against
+        // the frozen paper; essay slots set needs_manual_grading=true and
+        // score 0 (graded in Phase 3d-ii). Records status='submitted' or
+        // 'auto_submitted' (when called past deadline_at). Per-question
+        // correctness is returned ONLY when exams.results_release='immediate'
+        // — otherwise per_question is null and only totals/ack are returned.
+        Args: { attempt_id: string };
+        Returns: {
+          attempt_id: string;
+          status: ExamAttemptStatus;
+          auto_score: number;
+          max_score: number;
+          needs_manual_grading: boolean;
+          results_released: boolean;
+          per_question: { question_ref: string; score?: number; max?: number; needs_manual_grading?: boolean }[] | null;
+        };
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -887,3 +1002,9 @@ export type ExamSectionRow = Database["public"]["Tables"]["exam_sections"]["Row"
 export type ExamSectionSourceRow = Database["public"]["Tables"]["exam_section_sources"]["Row"];
 export type ExamValidationResult = Database["public"]["Functions"]["validate_exam"]["Returns"];
 export type ExamDraw = Database["public"]["Functions"]["draw_exam_for_attempt"]["Returns"];
+export type ExamAttemptRow = Database["public"]["Tables"]["exam_attempts"]["Row"];
+export type ExamAnswerRow = Database["public"]["Tables"]["exam_answers"]["Row"];
+export type AttemptQuestions = Database["public"]["Functions"]["get_attempt_questions"]["Returns"];
+export type AttemptSection = AttemptQuestions["sections"][number];
+export type AttemptQuestion = AttemptSection["questions"][number];
+export type SubmitAttemptResult = Database["public"]["Functions"]["submit_exam_attempt"]["Returns"];

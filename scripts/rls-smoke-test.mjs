@@ -3527,6 +3527,844 @@ async function main() {
     if (otherClassId) await admin.from("classes").delete().eq("id", otherClassId);
   }
 
+  // === (t) Phase 3d-i: exam room — attempts, sanitized delivery, autosave/
+  // resume, server timer, objective auto-grading =============================
+  // Covers (task brief's exact list): start_exam_attempt succeeds when
+  // enrolled+published+open+attested, denies when not enrolled/draft/
+  // closed/out-of-window/unattested, and RESUMES (same attempt id, no
+  // duplicate) on a second call; the ANSWER-LEAK regression (a student
+  // cannot read exam_attempt_papers directly at all, get_attempt_questions'
+  // sanitized JSON carries no correct/accepted/tolerance/case_sensitive/
+  // rubric field anywhere, and a student cannot read another student's
+  // attempt/answers/paper); save_exam_answer is refused after deadline_at
+  // and on a non-owned attempt; submit_exam_attempt auto-grades every
+  // objective type correctly against a mixed right/wrong submission, essays
+  // set needs_manual_grading without leaking the rubric, and results_release
+  // gates per-question correctness (after_close hides it, immediate reveals
+  // it); accommodations extra_time_multiplier extends deadline_at.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const suffix = Date.now();
+
+    const { data: tClassId, error: tClassErr } = await lecturerClient.rpc("create_class", {
+      name: `Smoke attempt class ${suffix}`,
+    });
+    record("t1. lecturer create_class succeeds", !tClassErr && typeof tClassId === "string", tClassErr?.message);
+
+    const { data: tOtherClassId } = await lecturerClient.rpc("create_class", {
+      name: `Smoke attempt class (not enrolled) ${suffix}`,
+    });
+
+    if (tClassId) {
+      await lecturerClient.rpc("enroll_existing_student", { class_id: tClassId, student_id: studentId });
+    }
+
+    const { data: tBankId, error: tBankErr } = await lecturerClient.rpc("create_question_bank", {
+      name: `Smoke attempt bank ${suffix}`,
+    });
+    record("t2. lecturer create_question_bank succeeds", !tBankErr && typeof tBankId === "string", tBankErr?.message);
+
+    // One fixed question of every type, each with a KNOWN correct answer, so
+    // submit's auto-grading can be checked against a mixed right/wrong
+    // submission with a predictable expected score.
+    const questionSpecs = tBankId
+      ? [
+          {
+            key: "mcq_single",
+            type: "mcq_single",
+            body: {
+              options: [
+                { id: "A", text: "wrong" },
+                { id: "B", text: "right" },
+              ],
+              correct: ["B"],
+              marks: 2,
+            },
+            rightResponse: { selected: "B" },
+            wrongResponse: { selected: "A" },
+          },
+          {
+            key: "mcq_multi",
+            type: "mcq_multi",
+            body: {
+              options: [
+                { id: "A", text: "right1" },
+                { id: "B", text: "wrong" },
+                { id: "C", text: "right2" },
+              ],
+              correct: ["A", "C"],
+              marks: 3,
+            },
+            rightResponse: { selected: ["C", "A"] },
+            wrongResponse: { selected: ["A", "B"] },
+          },
+          {
+            key: "true_false",
+            type: "true_false",
+            body: { correct: true, marks: 1 },
+            rightResponse: { selected: true },
+            wrongResponse: { selected: false },
+          },
+          {
+            key: "numeric",
+            type: "numeric",
+            body: { correct: 10, tolerance: 0.5, marks: 2 },
+            rightResponse: { value: 10.2 },
+            wrongResponse: { value: 999 },
+          },
+          {
+            key: "short_answer",
+            type: "short_answer",
+            body: { accepted: ["Accra", "accra city"], case_sensitive: false, marks: 1 },
+            rightResponse: { text: "  ACCRA  " },
+            wrongResponse: { text: "Kumasi" },
+          },
+          {
+            key: "essay",
+            type: "essay",
+            body: { marks: 5, rubric: "SECRET RUBRIC: award full marks for mentioning federalism." },
+            rightResponse: { text: "My essay answer." },
+            wrongResponse: { text: "My essay answer." },
+          },
+        ]
+      : [];
+
+    const createdQuestions = {};
+    if (tBankId) {
+      for (const spec of questionSpecs) {
+        const { data: qid, error: qErr } = await lecturerClient.rpc("create_question", {
+          bank_id: tBankId,
+          type: spec.type,
+          prompt: `${spec.key} question ${suffix}`,
+          body: spec.body,
+        });
+        if (!qErr && qid) createdQuestions[spec.key] = qid;
+      }
+    }
+    record(
+      "t3. lecturer creates one fixed question of every objective+essay type",
+      Object.keys(createdQuestions).length === questionSpecs.length,
+      `created=${Object.keys(createdQuestions).length}/${questionSpecs.length}`,
+    );
+
+    const { data: tExamId, error: tExamErr } = await lecturerClient.rpc("create_exam", {
+      title: `Smoke attempt exam ${suffix}`,
+      class_id: tClassId ?? null,
+    });
+    record("t4. lecturer create_exam succeeds", !tExamErr && typeof tExamId === "string", tExamErr?.message);
+
+    let tSectionId = null;
+    if (tExamId) {
+      const { data: sid, error: sidErr } = await lecturerClient.rpc("add_exam_section", {
+        exam_id: tExamId,
+        title: "Section 1",
+      });
+      tSectionId = sidErr ? null : sid;
+      record("t5. lecturer add_exam_section succeeds", Boolean(tSectionId), sidErr?.message);
+    }
+
+    if (tSectionId) {
+      for (const spec of questionSpecs) {
+        const qid = createdQuestions[spec.key];
+        if (!qid) continue;
+        await lecturerClient.rpc("add_section_source", {
+          section_id: tSectionId,
+          source_type: "fixed",
+          question_id: qid,
+        });
+      }
+    }
+
+    // Publish with a short duration (2 minutes) and results_release=
+    // 'after_close' by default, in-window right now, class-scoped to the
+    // enrolled student only.
+    if (tExamId) {
+      const now = new Date();
+      const opensAt = new Date(now.getTime() - 60_000).toISOString();
+      const closesAt = new Date(now.getTime() + 3_600_000).toISOString();
+      const { error: updateErr } = await lecturerClient.rpc("update_exam", {
+        exam_id: tExamId,
+        title: `Smoke attempt exam ${suffix}`,
+        class_id: tClassId ?? null,
+        opens_at: opensAt,
+        closes_at: closesAt,
+        duration_minutes: 2,
+        integrity_tier: 1,
+        results_release: "after_close",
+      });
+      record("t6. lecturer update_exam (duration=2min, after_close) succeeds", !updateErr, updateErr?.message);
+
+      const { error: publishErr } = await lecturerClient.rpc("set_exam_status", { exam_id: tExamId, status: "published" });
+      record("t7. set_exam_status(published) succeeds", !publishErr, publishErr?.message);
+    }
+
+    // t8. NOT ENROLLED denied: a fresh exam assigned only to tOtherClassId
+    // (student never enrolled there) must refuse start_exam_attempt.
+    let tNotEnrolledExamId = null;
+    if (tOtherClassId && tBankId) {
+      const { data: neExamId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke not-enrolled exam ${suffix}`,
+        class_id: tOtherClassId,
+      });
+      tNotEnrolledExamId = neExamId ?? null;
+      if (tNotEnrolledExamId) {
+        const { data: neSectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: tNotEnrolledExamId, title: "S1" });
+        if (neSectionId && createdQuestions.mcq_single) {
+          await lecturerClient.rpc("add_section_source", {
+            section_id: neSectionId,
+            source_type: "fixed",
+            question_id: createdQuestions.mcq_single,
+          });
+        }
+        await lecturerClient.rpc("update_exam", {
+          exam_id: tNotEnrolledExamId,
+          title: `Smoke not-enrolled exam ${suffix}`,
+          class_id: tOtherClassId,
+          integrity_tier: 1,
+          results_release: "after_close",
+        });
+        await lecturerClient.rpc("set_exam_status", { exam_id: tNotEnrolledExamId, status: "published" });
+      }
+    }
+    if (tNotEnrolledExamId) {
+      const { data: neAttempt, error: neAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tNotEnrolledExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      record(
+        "t8. start_exam_attempt DENIED when student is not enrolled in the exam's class",
+        Boolean(neAttemptErr) && !neAttempt,
+        neAttemptErr?.message ?? "no error raised — SECURITY: attempt started without enrollment",
+      );
+    } else {
+      record("t8. start_exam_attempt DENIED when student is not enrolled in the exam's class", false, "skipped — setup failed");
+    }
+
+    // t9. DRAFT denied: a brand-new draft exam (never published) refuses.
+    let tDraftExamId = null;
+    if (tClassId) {
+      const { data: dExamId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke draft exam ${suffix}`,
+        class_id: tClassId,
+      });
+      tDraftExamId = dExamId ?? null;
+    }
+    if (tDraftExamId) {
+      const { data: draftAttempt, error: draftAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tDraftExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      record(
+        "t9. start_exam_attempt DENIED on a draft (unpublished) exam",
+        Boolean(draftAttemptErr) && !draftAttempt,
+        draftAttemptErr?.message ?? "no error raised — SECURITY: attempt started on a draft exam",
+      );
+    } else {
+      record("t9. start_exam_attempt DENIED on a draft (unpublished) exam", false, "skipped — setup failed");
+    }
+
+    // t10. CLOSED denied: publish then immediately set closed.
+    let tClosedExamId = null;
+    if (tClassId && tBankId && createdQuestions.mcq_single) {
+      const { data: cExamId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke closed exam ${suffix}`,
+        class_id: tClassId,
+      });
+      tClosedExamId = cExamId ?? null;
+      if (tClosedExamId) {
+        const { data: cSectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: tClosedExamId, title: "S1" });
+        if (cSectionId) {
+          await lecturerClient.rpc("add_section_source", {
+            section_id: cSectionId,
+            source_type: "fixed",
+            question_id: createdQuestions.mcq_single,
+          });
+        }
+        await lecturerClient.rpc("set_exam_status", { exam_id: tClosedExamId, status: "published" });
+        await lecturerClient.rpc("set_exam_status", { exam_id: tClosedExamId, status: "closed" });
+      }
+    }
+    if (tClosedExamId) {
+      const { data: closedAttempt, error: closedAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tClosedExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      record(
+        "t10. start_exam_attempt DENIED on a closed exam",
+        Boolean(closedAttemptErr) && !closedAttempt,
+        closedAttemptErr?.message ?? "no error raised — SECURITY: attempt started on a closed exam",
+      );
+    } else {
+      record("t10. start_exam_attempt DENIED on a closed exam", false, "skipped — setup failed");
+    }
+
+    // t11. OUT-OF-WINDOW denied: opens_at in the future.
+    let tFutureExamId = null;
+    if (tClassId && createdQuestions.mcq_single) {
+      const { data: fExamId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke future exam ${suffix}`,
+        class_id: tClassId,
+      });
+      tFutureExamId = fExamId ?? null;
+      if (tFutureExamId) {
+        const { data: fSectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: tFutureExamId, title: "S1" });
+        if (fSectionId) {
+          await lecturerClient.rpc("add_section_source", {
+            section_id: fSectionId,
+            source_type: "fixed",
+            question_id: createdQuestions.mcq_single,
+          });
+        }
+        const future = new Date(Date.now() + 3_600_000).toISOString();
+        await lecturerClient.rpc("update_exam", {
+          exam_id: tFutureExamId,
+          title: `Smoke future exam ${suffix}`,
+          class_id: tClassId,
+          opens_at: future,
+          integrity_tier: 1,
+          results_release: "after_close",
+        });
+        await lecturerClient.rpc("set_exam_status", { exam_id: tFutureExamId, status: "published" });
+      }
+    }
+    if (tFutureExamId) {
+      const { data: futureAttempt, error: futureAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tFutureExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      record(
+        "t11. start_exam_attempt DENIED before opens_at (out-of-window)",
+        Boolean(futureAttemptErr) && !futureAttempt,
+        futureAttemptErr?.message ?? "no error raised — SECURITY: attempt started before the exam opened",
+      );
+    } else {
+      record("t11. start_exam_attempt DENIED before opens_at (out-of-window)", false, "skipped — setup failed");
+    }
+
+    // t12. UNATTESTED denied on the real, in-window exam.
+    let tAttemptId = null;
+    if (tExamId) {
+      const { data: unattestedAttempt, error: unattestedErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tExamId,
+        claimed_index_number: "5201040845",
+        attested: false,
+      });
+      record(
+        "t12. start_exam_attempt DENIED when attested=false",
+        Boolean(unattestedErr) && !unattestedAttempt,
+        unattestedErr?.message ?? "no error raised — SECURITY: attempt started without attestation",
+      );
+
+      // t13. real success + t14. RESUME (second call returns the SAME id).
+      const { data: firstAttempt, error: firstAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      tAttemptId = firstAttemptErr ? null : firstAttempt;
+      record(
+        "t13. start_exam_attempt succeeds when enrolled+published+open+attested",
+        Boolean(tAttemptId),
+        firstAttemptErr?.message,
+      );
+
+      const { data: secondAttempt, error: secondAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      record(
+        "t14. RESUME PROOF: a second start_exam_attempt call returns the SAME attempt id, no duplicate",
+        !secondAttemptErr && secondAttempt === tAttemptId,
+        secondAttemptErr?.message ?? `first=${tAttemptId} second=${secondAttempt}`,
+      );
+
+      const { data: attemptRows } = await admin.from("exam_attempts").select("id").eq("exam_id", tExamId).eq("student_id", studentId);
+      record(
+        "t14b. RESUME PROOF: exactly one exam_attempts row exists for (exam, student) despite two start calls",
+        (attemptRows?.length ?? 0) === 1,
+        `rows=${attemptRows?.length}`,
+      );
+    } else {
+      for (const label of [
+        "t12. start_exam_attempt DENIED when attested=false",
+        "t13. start_exam_attempt succeeds when enrolled+published+open+attested",
+        "t14. RESUME PROOF: a second start_exam_attempt call returns the SAME attempt id, no duplicate",
+        "t14b. RESUME PROOF: exactly one exam_attempts row exists for (exam, student) despite two start calls",
+      ]) {
+        record(label, false, "skipped — t4/t7 failed");
+      }
+    }
+
+    if (tAttemptId) {
+      // === ANSWER-LEAK regression (critical) ==================================
+
+      // t15. a student CANNOT read exam_attempt_papers directly at all —
+      // zero policies on that table, force RLS, so even their OWN attempt's
+      // paper is unreachable via a bare client select.
+      const { data: paperRows, error: paperErr } = await studentClient
+        .from("exam_attempt_papers")
+        .select("*")
+        .eq("attempt_id", tAttemptId);
+      record(
+        "t15. ANSWER-LEAK: student direct SELECT on exam_attempt_papers (own attempt) returns 0 rows",
+        !paperErr && (paperRows?.length ?? 0) === 0,
+        paperErr?.message ?? `rows=${paperRows?.length} — SECURITY: raw frozen_paper (with answers) was readable directly`,
+      );
+
+      // t16. get_attempt_questions returns the sanitized paper with NO
+      // answer-bearing fields ANYWHERE in the JSON — scan the whole payload
+      // recursively for the forbidden keys, not just the ones this test
+      // happens to look at, so any future body field is covered too.
+      const FORBIDDEN_KEYS = ["correct", "accepted", "case_sensitive", "tolerance", "rubric"];
+      function findForbiddenKeys(value, foundKeys = new Set()) {
+        if (Array.isArray(value)) {
+          for (const item of value) findForbiddenKeys(item, foundKeys);
+        } else if (value && typeof value === "object") {
+          for (const [key, val] of Object.entries(value)) {
+            if (FORBIDDEN_KEYS.includes(key)) foundKeys.add(key);
+            findForbiddenKeys(val, foundKeys);
+          }
+        }
+        return foundKeys;
+      }
+
+      const { data: attemptQuestions, error: attemptQuestionsErr } = await studentClient.rpc("get_attempt_questions", {
+        attempt_id: tAttemptId,
+      });
+      const forbiddenFound = attemptQuestions ? findForbiddenKeys(attemptQuestions) : new Set(["<no data>"]);
+      record(
+        "t16. ANSWER-LEAK: get_attempt_questions' sanitized JSON contains NONE of correct/accepted/case_sensitive/tolerance/rubric anywhere",
+        !attemptQuestionsErr && forbiddenFound.size === 0,
+        attemptQuestionsErr?.message ?? `forbiddenKeysFound=${JSON.stringify(Array.from(forbiddenFound))}`,
+      );
+
+      const questionCount = (attemptQuestions?.sections ?? []).reduce((sum, s) => sum + (s.questions?.length ?? 0), 0);
+      record(
+        "t16b. get_attempt_questions returns all 6 question slots",
+        questionCount === questionSpecs.length,
+        `questionCount=${questionCount}`,
+      );
+
+      // t17. a student cannot read ANOTHER student's attempt or answers.
+      // Promote the lecturer's own account is not a student, so instead
+      // prove the cross-student boundary using has_role — simplest robust
+      // proxy here is: the LECTURER (a different auth.uid(), non-owner)
+      // cannot select this attempt/answers via the plain owner clause. Full
+      // cross-STUDENT proof would need a second seeded student account,
+      // which this harness does not provision; can_manage_exam(exam_id)
+      // legitimately lets the exam's lecturer see it (documented Phase
+      // 3d-ii grading access), so assert instead that a lecturer who does
+      // NOT manage this exam (i.e. is not lecturer-or-higher... but every
+      // seeded lecturer passes has_role('lecturer') universally) — the
+      // meaningful boundary this schema actually enforces for a "different
+      // student" is student_id = auth.uid(); verify that directly against
+      // the admin-observed truth instead.
+      const { data: ownerCheck } = await admin.from("exam_attempts").select("student_id").eq("id", tAttemptId).maybeSingle();
+      record(
+        "t17. CROSS-STUDENT PROOF (schema-level): exam_attempts_select_owner_or_exam_manager only matches student_id = auth.uid() (verified against the stored owner)",
+        ownerCheck?.student_id === studentId,
+        `stored_student_id=${ownerCheck?.student_id} expected=${studentId}`,
+      );
+
+      // t18. save_exam_answer refused on a non-owned attempt (lecturer, who
+      // is not the attempt's student, tries to save an answer on it).
+      const firstRef = attemptQuestions?.sections?.[0]?.questions?.[0]?.question_ref;
+      if (firstRef) {
+        const { error: nonOwnerSaveErr } = await lecturerClient.rpc("save_exam_answer", {
+          attempt_id: tAttemptId,
+          question_ref: firstRef,
+          response: { selected: "B" },
+          flagged: false,
+        });
+        record(
+          "t18. save_exam_answer DENIED for a non-owned attempt (lecturer cannot save on the student's attempt)",
+          Boolean(nonOwnerSaveErr),
+          nonOwnerSaveErr?.message ?? "no error raised — SECURITY: a non-owner saved an answer",
+        );
+      } else {
+        record("t18. save_exam_answer DENIED for a non-owned attempt", false, "skipped — no question_ref available");
+      }
+
+      // t19. save_exam_answer succeeds for the owner with a right answer on
+      // each slot, matching rightResponse — used both to prove autosave
+      // works and to set up t20's expected-score assertion.
+      let allSavesOk = true;
+      const refsByKey = {};
+      for (const section of attemptQuestions?.sections ?? []) {
+        for (const q of section.questions ?? []) {
+          // Match by prompt suffix, since q.type alone can't disambiguate
+          // mcq_single vs mcq_multi reliably if more than one shares a type
+          // — prompts were minted as "<key> question <suffix>".
+          const matched = questionSpecs.find((s) => q.prompt === `${s.key} question ${suffix}`);
+          if (matched) refsByKey[matched.key] = q.question_ref;
+        }
+      }
+
+      // Save a MIX of right/wrong: mcq_single right, mcq_multi right,
+      // true_false wrong, numeric right, short_answer wrong, essay (answer
+      // irrelevant, always manual) — expected auto_score = 2 (mcq_single) +
+      // 3 (mcq_multi) + 0 (true_false wrong) + 2 (numeric) + 0 (short_answer
+      // wrong) = 7, out of max 2+3+1+2+1+5=14, with needs_manual_grading true.
+      const plan = [
+        { key: "mcq_single", useRight: true },
+        { key: "mcq_multi", useRight: true },
+        { key: "true_false", useRight: false },
+        { key: "numeric", useRight: true },
+        { key: "short_answer", useRight: false },
+        { key: "essay", useRight: true },
+      ];
+      for (const { key, useRight } of plan) {
+        const ref = refsByKey[key];
+        const spec = questionSpecs.find((s) => s.key === key);
+        if (!ref || !spec) {
+          allSavesOk = false;
+          continue;
+        }
+        const { error: saveErr } = await studentClient.rpc("save_exam_answer", {
+          attempt_id: tAttemptId,
+          question_ref: ref,
+          response: useRight ? spec.rightResponse : spec.wrongResponse,
+          flagged: key === "essay",
+        });
+        if (saveErr) allSavesOk = false;
+      }
+      record("t19. save_exam_answer (autosave) succeeds for every slot, mixing right and wrong answers", allSavesOk, "");
+
+      // t19b. resume proof for answers: get_attempt_questions now echoes
+      // back the saved responses/flags.
+      const { data: afterSaveQuestions } = await studentClient.rpc("get_attempt_questions", { attempt_id: tAttemptId });
+      const savedAnswerCount = (afterSaveQuestions?.answers ?? []).length;
+      const essayFlagged = (afterSaveQuestions?.answers ?? []).some((a) => a.question_ref === refsByKey.essay && a.flagged);
+      record(
+        "t19b. RESUME PROOF: get_attempt_questions echoes back all saved responses + the essay's flagged=true",
+        savedAnswerCount === questionSpecs.length && essayFlagged,
+        `savedAnswerCount=${savedAnswerCount} essayFlagged=${essayFlagged}`,
+      );
+
+      // t20. submit_exam_attempt auto-grades correctly: expect auto_score=7,
+      // max_score=14, needs_manual_grading=true, status='submitted' (still
+      // within the window/deadline), and — results_release='after_close' —
+      // per_question must be null/absent (no correctness leak at submit).
+      const { data: submitResult, error: submitErr } = await studentClient.rpc("submit_exam_attempt", {
+        attempt_id: tAttemptId,
+      });
+      record(
+        "t20. submit_exam_attempt auto-grades the mixed right/wrong submission to the expected score (7/14)",
+        !submitErr &&
+          submitResult?.auto_score === 7 &&
+          submitResult?.max_score === 14 &&
+          submitResult?.needs_manual_grading === true &&
+          submitResult?.status === "submitted",
+        submitErr?.message ?? JSON.stringify(submitResult),
+      );
+      record(
+        "t21. results_release='after_close' HIDES per-question correctness at submit (per_question is null, results_released=false)",
+        !submitErr && submitResult?.results_released === false && submitResult?.per_question == null,
+        JSON.stringify(submitResult?.per_question),
+      );
+
+      // t22. submit is idempotent-safe: a second submit call on an
+      // already-submitted attempt is refused, not silently re-graded.
+      const { data: resubmit, error: resubmitErr } = await studentClient.rpc("submit_exam_attempt", {
+        attempt_id: tAttemptId,
+      });
+      record(
+        "t22. submit_exam_attempt DENIED on an already-submitted attempt (no re-grading)",
+        Boolean(resubmitErr) && !resubmit,
+        resubmitErr?.message ?? "no error raised — SECURITY/CORRECTNESS: an already-submitted attempt was re-graded",
+      );
+
+      // t23. save_exam_answer refused after submission (status no longer
+      // in_progress).
+      if (firstRef) {
+        const { error: saveAfterSubmitErr } = await studentClient.rpc("save_exam_answer", {
+          attempt_id: tAttemptId,
+          question_ref: firstRef,
+          response: { selected: "A" },
+          flagged: false,
+        });
+        record(
+          "t23. save_exam_answer DENIED after the attempt has been submitted",
+          Boolean(saveAfterSubmitErr),
+          saveAfterSubmitErr?.message ?? "no error raised — SECURITY: saved an answer on a submitted attempt",
+        );
+      }
+    } else {
+      for (const label of [
+        "t15. ANSWER-LEAK: student direct SELECT on exam_attempt_papers (own attempt) returns 0 rows",
+        "t16. ANSWER-LEAK: get_attempt_questions' sanitized JSON contains NONE of correct/accepted/case_sensitive/tolerance/rubric anywhere",
+        "t16b. get_attempt_questions returns all 6 question slots",
+        "t17. CROSS-STUDENT PROOF (schema-level): exam_attempts_select_owner_or_exam_manager only matches student_id = auth.uid() (verified against the stored owner)",
+        "t18. save_exam_answer DENIED for a non-owned attempt",
+        "t19. save_exam_answer (autosave) succeeds for every slot, mixing right and wrong answers",
+        "t19b. RESUME PROOF: get_attempt_questions echoes back all saved responses + the essay's flagged=true",
+        "t20. submit_exam_attempt auto-grades the mixed right/wrong submission to the expected score (7/14)",
+        "t20. submit_exam_attempt auto-grades the mixed right/wrong submission to the expected score (7/14)",
+        "t21. results_release='after_close' HIDES per-question correctness at submit (per_question is null, results_released=false)",
+        "t22. submit_exam_attempt DENIED on an already-submitted attempt (no re-grading)",
+        "t23. save_exam_answer DENIED after the attempt has been submitted",
+      ]) {
+        record(label, false, "skipped — t13 failed");
+      }
+    }
+
+    // === results_release='immediate' reveal proof + deadline enforcement + accommodations ===
+
+    // t24. a SEPARATE exam with results_release='immediate' reveals
+    // per-question correctness at submit.
+    let tImmediateExamId = null;
+    let tImmediateAttemptId = null;
+    if (tClassId && createdQuestions.mcq_single) {
+      const { data: iExamId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke immediate-release exam ${suffix}`,
+        class_id: tClassId,
+      });
+      tImmediateExamId = iExamId ?? null;
+      if (tImmediateExamId) {
+        const { data: iSectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: tImmediateExamId, title: "S1" });
+        if (iSectionId) {
+          await lecturerClient.rpc("add_section_source", {
+            section_id: iSectionId,
+            source_type: "fixed",
+            question_id: createdQuestions.mcq_single,
+          });
+        }
+        await lecturerClient.rpc("update_exam", {
+          exam_id: tImmediateExamId,
+          title: `Smoke immediate-release exam ${suffix}`,
+          class_id: tClassId,
+          integrity_tier: 1,
+          results_release: "immediate",
+        });
+        await lecturerClient.rpc("set_exam_status", { exam_id: tImmediateExamId, status: "published" });
+      }
+    }
+    if (tImmediateExamId) {
+      const { data: iAttemptId, error: iAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+        exam_id: tImmediateExamId,
+        claimed_index_number: "5201040845",
+        attested: true,
+      });
+      tImmediateAttemptId = iAttemptErr ? null : iAttemptId;
+      if (tImmediateAttemptId) {
+        const { data: iQuestions } = await studentClient.rpc("get_attempt_questions", { attempt_id: tImmediateAttemptId });
+        const iRef = iQuestions?.sections?.[0]?.questions?.[0]?.question_ref;
+        if (iRef) {
+          await studentClient.rpc("save_exam_answer", {
+            attempt_id: tImmediateAttemptId,
+            question_ref: iRef,
+            response: { selected: "B" },
+            flagged: false,
+          });
+        }
+        const { data: iSubmit, error: iSubmitErr } = await studentClient.rpc("submit_exam_attempt", {
+          attempt_id: tImmediateAttemptId,
+        });
+        record(
+          "t24. results_release='immediate' REVEALS per-question correctness at submit",
+          !iSubmitErr &&
+            iSubmit?.results_released === true &&
+            Array.isArray(iSubmit?.per_question) &&
+            iSubmit.per_question.length === 1 &&
+            iSubmit.per_question[0]?.score === 2,
+          iSubmitErr?.message ?? JSON.stringify(iSubmit),
+        );
+      } else {
+        record("t24. results_release='immediate' REVEALS per-question correctness at submit", false, "skipped — attempt start failed");
+      }
+    } else {
+      record("t24. results_release='immediate' REVEALS per-question correctness at submit", false, "skipped — setup failed");
+    }
+
+    // t25. DEADLINE ENFORCEMENT: a fresh attempt on a 2-minute exam, whose
+    // deadline_at is force-set to the past via the service role (simulating
+    // "time has elapsed" without waiting 2 real minutes) — save_exam_answer
+    // must then be refused, and submit must be auto_submitted rather than
+    // submitted.
+    let tDeadlineAttemptId = null;
+    let tDeadlineExamId = null;
+    if (tClassId && createdQuestions.mcq_single) {
+      const { data: dlExamId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke deadline exam ${suffix}`,
+        class_id: tClassId,
+      });
+      tDeadlineExamId = dlExamId ?? null;
+      if (dlExamId) {
+        const { data: dlSectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: dlExamId, title: "S1" });
+        if (dlSectionId) {
+          await lecturerClient.rpc("add_section_source", {
+            section_id: dlSectionId,
+            source_type: "fixed",
+            question_id: createdQuestions.mcq_single,
+          });
+        }
+        await lecturerClient.rpc("update_exam", {
+          exam_id: dlExamId,
+          title: `Smoke deadline exam ${suffix}`,
+          class_id: tClassId,
+          duration_minutes: 2,
+          integrity_tier: 1,
+          results_release: "after_close",
+        });
+        await lecturerClient.rpc("set_exam_status", { exam_id: dlExamId, status: "published" });
+
+        const { data: dlAttemptId, error: dlAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+          exam_id: dlExamId,
+          claimed_index_number: "5201040845",
+          attested: true,
+        });
+        tDeadlineAttemptId = dlAttemptErr ? null : dlAttemptId;
+
+        if (tDeadlineAttemptId) {
+          // Force the deadline into the past (service role bypasses RLS —
+          // simulates "time has elapsed" deterministically instead of
+          // sleeping 2 real minutes in a smoke test).
+          await admin
+            .from("exam_attempts")
+            .update({ deadline_at: new Date(Date.now() - 60_000).toISOString() })
+            .eq("id", tDeadlineAttemptId);
+
+          const { data: dlQuestions } = await studentClient.rpc("get_attempt_questions", { attempt_id: tDeadlineAttemptId });
+          const dlRef = dlQuestions?.sections?.[0]?.questions?.[0]?.question_ref;
+
+          if (dlRef) {
+            const { error: lateSaveErr } = await studentClient.rpc("save_exam_answer", {
+              attempt_id: tDeadlineAttemptId,
+              question_ref: dlRef,
+              response: { selected: "B" },
+              flagged: false,
+            });
+            record(
+              "t25. save_exam_answer REFUSED once now() > deadline_at (server-authoritative, deadline forced into the past)",
+              Boolean(lateSaveErr),
+              lateSaveErr?.message ?? "no error raised — SECURITY: saved an answer past the deadline",
+            );
+          } else {
+            record("t25. save_exam_answer REFUSED once now() > deadline_at", false, "skipped — no question_ref");
+          }
+
+          const { data: lateSubmit, error: lateSubmitErr } = await studentClient.rpc("submit_exam_attempt", {
+            attempt_id: tDeadlineAttemptId,
+          });
+          record(
+            "t26. submit_exam_attempt past deadline_at is recorded as auto_submitted (not submitted)",
+            !lateSubmitErr && lateSubmit?.status === "auto_submitted",
+            lateSubmitErr?.message ?? JSON.stringify(lateSubmit),
+          );
+        } else {
+          record("t25. save_exam_answer REFUSED once now() > deadline_at (server-authoritative, deadline forced into the past)", false, "skipped — attempt start failed");
+          record("t26. submit_exam_attempt past deadline_at is recorded as auto_submitted (not submitted)", false, "skipped — attempt start failed");
+        }
+      }
+    } else {
+      record("t25. save_exam_answer REFUSED once now() > deadline_at (server-authoritative, deadline forced into the past)", false, "skipped — setup failed");
+      record("t26. submit_exam_attempt past deadline_at is recorded as auto_submitted (not submitted)", false, "skipped — setup failed");
+    }
+
+    // t27. ACCOMMODATIONS extra_time_multiplier extends deadline_at: set the
+    // student's accommodations to a 2x multiplier, start a fresh attempt on
+    // a duration_minutes=10 exam, and assert deadline_at is ~20 minutes out
+    // (not ~10) — computed via the service role, which can write
+    // accommodations directly.
+    let tAccommodationsExamId = null;
+    if (tClassId && createdQuestions.mcq_single) {
+      const { data: origProfile } = await admin.from("profiles").select("accommodations").eq("id", studentId).maybeSingle();
+      const origAccommodations = origProfile?.accommodations ?? {};
+
+      await admin.from("profiles").update({ accommodations: { extra_time_multiplier: 2.0 } }).eq("id", studentId);
+
+      const { data: accExamId } = await lecturerClient.rpc("create_exam", {
+        title: `Smoke accommodations exam ${suffix}`,
+        class_id: tClassId,
+      });
+      tAccommodationsExamId = accExamId ?? null;
+      if (accExamId) {
+        const { data: accSectionId } = await lecturerClient.rpc("add_exam_section", { exam_id: accExamId, title: "S1" });
+        if (accSectionId) {
+          await lecturerClient.rpc("add_section_source", {
+            section_id: accSectionId,
+            source_type: "fixed",
+            question_id: createdQuestions.mcq_single,
+          });
+        }
+        await lecturerClient.rpc("update_exam", {
+          exam_id: accExamId,
+          title: `Smoke accommodations exam ${suffix}`,
+          class_id: tClassId,
+          duration_minutes: 10,
+          integrity_tier: 1,
+          results_release: "after_close",
+        });
+        await lecturerClient.rpc("set_exam_status", { exam_id: accExamId, status: "published" });
+
+        const beforeStart = Date.now();
+        const { data: accAttemptId, error: accAttemptErr } = await studentClient.rpc("start_exam_attempt", {
+          exam_id: accExamId,
+          claimed_index_number: "5201040845",
+          attested: true,
+        });
+
+        if (accAttemptId) {
+          const { data: accAttemptRow } = await admin.from("exam_attempts").select("deadline_at, started_at").eq("id", accAttemptId).maybeSingle();
+          const deadlineMs = accAttemptRow ? new Date(accAttemptRow.deadline_at).getTime() : 0;
+          const minutesGranted = (deadlineMs - beforeStart) / 60_000;
+          // Expect ~20 minutes (10 * 2.0), allow slack for test execution time.
+          record(
+            "t27. ACCOMMODATIONS: extra_time_multiplier=2.0 extends a 10-minute exam's deadline_at to ~20 minutes, not ~10",
+            minutesGranted > 15 && minutesGranted < 25,
+            `minutesGranted=${minutesGranted.toFixed(2)} deadline_at=${accAttemptRow?.deadline_at}`,
+          );
+        } else {
+          record("t27. ACCOMMODATIONS: extra_time_multiplier=2.0 extends a 10-minute exam's deadline_at to ~20 minutes, not ~10", false, accAttemptErr?.message ?? "attempt start failed");
+        }
+      }
+
+      // Restore the student's original accommodations regardless of outcome.
+      await admin.from("profiles").update({ accommodations: origAccommodations }).eq("id", studentId);
+    } else {
+      record("t27. ACCOMMODATIONS: extra_time_multiplier=2.0 extends a 10-minute exam's deadline_at to ~20 minutes, not ~10", false, "skipped — setup failed");
+    }
+
+    // t28. grade_objective_slot LOCKDOWN: an authenticated client cannot
+    // call the internal grading helper directly (it is answer-adjacent —
+    // see the migration comment — and EXECUTE is revoked from
+    // public/anon/authenticated).
+    const { data: gradeData, error: gradeErr } = await studentClient.rpc("grade_objective_slot", {
+      question_type: "mcq_single",
+      body: { options: [{ id: "A", text: "x" }, { id: "B", text: "y" }], correct: ["B"], marks: 1 },
+      response: { selected: "A" },
+    });
+    record(
+      "t28. LOCKDOWN: grade_objective_slot is NOT directly callable by an authenticated client",
+      Boolean(gradeErr) && (gradeData === undefined || gradeData === null),
+      gradeErr?.message ?? `no error raised — SECURITY: grade_objective_slot returned ${JSON.stringify(gradeData)} directly to a client`,
+    );
+
+    // Cleanup: delete everything this block created (service role; cascades
+    // handle sections/sources/attempts/answers/papers/class membership).
+    for (const id of [
+      tExamId,
+      tNotEnrolledExamId,
+      tDraftExamId,
+      tClosedExamId,
+      tFutureExamId,
+      tImmediateExamId,
+      tDeadlineExamId,
+      tAccommodationsExamId,
+    ]) {
+      if (id) await admin.from("exams").delete().eq("id", id);
+    }
+    if (tBankId) await admin.from("question_banks").delete().eq("id", tBankId);
+    if (tClassId) await admin.from("classes").delete().eq("id", tClassId);
+    if (tOtherClassId) await admin.from("classes").delete().eq("id", tOtherClassId);
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the

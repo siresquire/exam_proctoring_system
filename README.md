@@ -1066,9 +1066,192 @@ running for the unrelated Phase 2b webhook checks earlier in the script).
 Attempt-taking, per-student attempt records, answer storage,
 autosave/resume, the server-authoritative timer, auto-grading, the manual
 grading queue, results release logic, and attaching the proctoring engine
-by tier are all out of scope here. The student dashboard's "Upcoming exams"
-list shows a disabled "Start" button with a note that taking exams opens in
-a later phase.
+by tier are all out of scope here — see "Exam room & attempts (Phase 3d-i)"
+below for the part of this list that Phase 3d-i now delivers.
+
+## Exam room & attempts (Phase 3d-i)
+
+Phase 3d-i is the **secure exam-taking spine**: the attempt lifecycle, a
+frozen per-attempt paper, sanitized one-question-at-a-time delivery,
+autosave, resume-on-disconnect, a server-authoritative timer (with
+accommodations extra-time), submission, and auto-grading of objective
+question types. This is the T1 (server-side-anti-cheat-only) exam room —
+webcam/proctor-core attachment, manual essay grading, and a dedicated
+student results view are **Phase 3d-ii**, which will wrap this room rather
+than replace it.
+
+### Schema: attempts, the frozen paper, and answers
+
+`supabase/migrations/20260705000012_exam_attempts.sql` adds three tables:
+
+- **`exam_attempts`** — one row per student attempt: `status`
+  (`in_progress` → `submitted`/`auto_submitted`; `graded`/`terminated`
+  reserved for Phase 3d-ii), `seed`, `started_at`/`deadline_at`,
+  `submitted_at`, `auto_score`/`max_score`, `needs_manual_grading`. Carries
+  **no question content or answers** — only lifecycle/timing/score state —
+  so it is safe to expose to the owning student via an ordinary RLS SELECT
+  policy (`student_id = auth.uid()`) plus the exam's owner/lecturer-or-higher
+  (read-only, for Phase 3d-ii grading tools). A unique partial index allows
+  at most one `in_progress` row per `(exam_id, student_id)`.
+- **`exam_attempt_papers`** — `attempt_id` → `frozen_paper` jsonb, the FULL
+  `draw_exam_for_attempt()` output verbatim, correct/accepted/tolerance/
+  rubric fields included. **This table has RLS enabled + forced with ZERO
+  policies for any client role, not even the owning student.** A direct
+  `.from("exam_attempt_papers").select()` from any authenticated or anon
+  client returns zero rows unconditionally — this is the load-bearing
+  security property of the whole migration (see "Answers never reach the
+  client" below).
+- **`exam_answers`** — one row per `(attempt_id, question_ref)`: the
+  student's own response (`jsonb`, shape varies by question type) and
+  `flagged`. `question_ref` is a per-slot id minted as
+  `"<section_id>:<index>"` when the paper is frozen, not the raw
+  `question_version_id` — a pool draw can only place a given version once
+  per section today, but slots (not versions) are the addressable unit
+  autosave targets, so a future looser pool config can't retroactively
+  break this. RLS: owner or the exam's owner/lecturer-or-higher may SELECT;
+  no client INSERT/UPDATE/DELETE at all — every write goes through
+  `save_exam_answer` (below).
+
+**Re-attempt policy** (documented simplification): one attempt per student
+per exam. `start_exam_attempt` resumes an `in_progress` attempt if one
+exists; otherwise it refuses if ANY prior attempt (terminal or not) already
+exists for that `(exam, student)` pair. A future `max_attempts` column can
+relax this without a schema rewrite.
+
+### Answers never reach the client
+
+This is the single most important property of this phase. Three
+independent layers enforce it:
+
+1. **Storage separation** — the frozen paper (with answers) lives only in
+   `exam_attempt_papers`, which has no client-reachable SELECT policy at
+   all. `exam_attempts`/`exam_answers`, which the student CAN read, never
+   contain question content.
+2. **Server-side stripping** — `get_attempt_questions(attempt_id)` is the
+   *only* way a student sees their questions. It reads the frozen paper
+   internally (as the security-definer function owner, which is not
+   subject to `exam_attempt_papers`' policy-less FORCE RLS the way a normal
+   client session is) and returns a rebuilt JSON structure with
+   `body.correct` / `body.accepted` / `body.case_sensitive` /
+   `body.tolerance` / `body.rubric` removed and `options` rebuilt as bare
+   `{id, text}` pairs — never a filtered pass-through of the original body.
+3. **Results-release gating** — `submit_exam_attempt` auto-grades
+   server-side and returns per-question correctness (`per_question` in its
+   response) *only* when `exams.results_release = 'immediate'`; for
+   `after_close`/`manual` it returns totals/ack only (`per_question: null`),
+   so a curious student can't infer which answers were right from the
+   submit response itself.
+
+`draw_exam_for_attempt` (Phase 3c, already locked down — `EXECUTE` revoked
+from `public`/`anon`/`authenticated`) is called *only* from
+`start_exam_attempt`, itself `security definer`; a client can never reach
+it directly, exactly as before. `grade_objective_slot` (new in this
+migration) is answer-adjacent — it grades whatever `(type, body, response)`
+it's handed with no `auth.uid()` check of its own — so it gets the same
+lock-down treatment: `EXECUTE` revoked from `public`/`anon`/`authenticated`
+immediately after creation, callable only from `submit_exam_attempt`.
+
+### RPCs
+
+- **`start_exam_attempt(exam_id, claimed_index_number, attested)`** —
+  validates enrollment (`class_members`), `exams.status = 'published'`,
+  `now()` within `[opens_at, closes_at]`, and `attested = true` (the same
+  identity-gate spirit as `start_proctor_session`). Resumes an existing
+  `in_progress` attempt if found; otherwise generates a seed, calls
+  `draw_exam_for_attempt`, mints `question_ref` per slot, computes
+  `deadline_at` from `exams.duration_minutes` scaled by the caller's
+  `profiles.accommodations->>'extra_time_multiplier'` (default `1.0`; a
+  `null` duration means no time limit, represented as a far-future
+  deadline rather than a nullable column), and stores the frozen paper.
+- **`get_attempt_questions(attempt_id)`** — owner-only sanitized delivery
+  (see above). Also returns the student's saved responses/flags and
+  `deadline_at` + server `now()`, so the client can render resume state and
+  synchronize its countdown to the *server's* clock, never the browser's.
+- **`save_exam_answer(attempt_id, question_ref, response, flagged)`** —
+  autosave. Owner-only, attempt must be `in_progress`, and — the
+  server-authoritative deadline enforcement — refuses any save once
+  `now() > deadline_at`, regardless of what the client believes the time
+  remaining is. Upserts on `(attempt_id, question_ref)`.
+- **`submit_exam_attempt(attempt_id)`** — owner-only; allowed even slightly
+  past `deadline_at` (recorded as `auto_submitted` instead of `submitted`,
+  so a student mid-keystroke when the clock hits zero can still submit).
+  Auto-grades every non-essay slot via `grade_objective_slot`: `mcq_single`
+  (exact option match), `mcq_multi` (exact set match — **no partial
+  credit**, documented), `true_false`, `numeric` (within `|tolerance|`),
+  `short_answer` (any accepted string, case-insensitive unless
+  `body.case_sensitive`). Essay slots set `needs_manual_grading = true` and
+  score 0 (graded in Phase 3d-ii). Stores `auto_score`/`max_score` and
+  gates `per_question` by `results_release` (see above).
+
+No standing scheduler auto-submits abandoned attempts — deadline
+enforcement is lazy (refuse late saves; treat a late submit as
+`auto_submitted`) by design for this phase; a cron/edge sweep for genuinely
+abandoned attempts is a documented TODO for Phase 3d-ii/Phase 6.
+
+### The exam room UI
+
+`apps/web/app/exam/[examId]/page.tsx` → `ExamAttemptWrapper` →
+`ExamAttemptIntro` (a short "this is a timed exam, answers autosave, don't
+navigate away" notice + the same index-number/attestation pattern as the
+proctoring identity step, minus the camera — that's Phase 3d-ii) →
+`start_exam_attempt` + `get_attempt_questions` → `ExamRoom`.
+
+`ExamRoom` (`apps/web/components/exam-room/exam-room.tsx`) mirrors
+`components/proctor/sample-quiz.tsx`'s one-question-at-a-time + palette +
+flag-for-review + review-before-submit UX, backed by the real RPCs:
+
+- **Autosave**: every answer/flag change is debounced (900ms) and sent via
+  `save_exam_answer`, with a visible "Saved HH:MM:SS" indicator
+  (`aria-live="polite"`, DESIGN.md §2.1).
+- **Resume**: on load, `get_attempt_questions` returns saved
+  responses/flags, which seed the room's state — reloading mid-exam
+  restores exactly where the student left off (verified in the browser
+  check below).
+- **Server-authoritative timer**: the client measures a one-time
+  offset between its own clock and the server's `now()` (from
+  `get_attempt_questions`), then always derives "time remaining" from
+  `deadline_at - (Date.now() + offset)` — a wrong local clock can't produce
+  an incorrect countdown. Announces at 30/15/5/1 minutes remaining via an
+  `aria-live="polite"` region (DESIGN.md §3 Robust) and auto-submits at
+  zero.
+- **Calm reconnect**: a failed autosave buffers the answer locally and
+  shows "Reconnecting… your answers are saved on this device" — never an
+  alarming error — and flushes automatically on the browser's `online`
+  event or a 5s retry poll (DESIGN.md §2.6).
+- **Review-before-submit**: submitting lists unanswered question numbers
+  via `notify.confirm()` before proceeding, exactly like the sample quiz.
+- **Results**: the post-submit screen shows the score immediately when
+  `results_released = true` (from `submit_exam_attempt`'s response),
+  otherwise a "results will be available later" message.
+
+### Accommodations extra-time
+
+`profiles.accommodations->>'extra_time_multiplier'` (e.g. `1.25`, `1.5`,
+`2`) is read once, at `start_exam_attempt` time, and multiplies
+`exams.duration_minutes` when computing `deadline_at`. This is a first-class
+exam-engine feature per DESIGN.md §3 "Timing adjustable," not a
+workaround — an admin sets the multiplier on the student's profile, and
+every future exam that student takes honors it automatically.
+
+### Verifying locally
+
+The RLS smoke test's section `(t)` covers the full attempt lifecycle:
+`start_exam_attempt` succeeds when enrolled+published+open+attested and is
+denied for not-enrolled/draft/closed/out-of-window/unattested; a second
+call **resumes** the same attempt (no duplicate row); the **answer-leak
+regression** — a student cannot read `exam_attempt_papers` directly at all,
+`get_attempt_questions`' sanitized JSON is scanned recursively and contains
+none of `correct`/`accepted`/`case_sensitive`/`tolerance`/`rubric`
+anywhere, and cross-attempt ownership is schema-verified; `save_exam_answer`
+is refused for a non-owned attempt and once past a (test-forced)
+`deadline_at`; `submit_exam_attempt` auto-grades a mixed right/wrong
+six-type submission to the exact expected score, sets
+`needs_manual_grading` for the essay slot without leaking its rubric, and
+gates per-question correctness by `results_release`
+(`after_close` hides it, `immediate` reveals it); and the accommodations
+`extra_time_multiplier` measurably extends `deadline_at`. Run
+`node scripts/rls-smoke-test.mjs` (dev server must be running for the
+unrelated Phase 2b webhook checks earlier in the script).
 
 ## Design system review
 
