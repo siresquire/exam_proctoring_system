@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { CategoryTree } from "@/components/questions/category-tree";
 import { notify } from "@/lib/notify";
 import { QUESTION_TYPE_LABELS } from "@/lib/questions/types";
@@ -71,6 +72,13 @@ export function BankDetail({ bank, categories, questions }: BankDetailProps) {
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Question banks", href: "/dashboard/lecturer/question-banks" },
+          { label: bank.name },
+        ]}
+      />
       <header className="mb-8 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{bank.name}</h1>

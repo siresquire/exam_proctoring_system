@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { fetchExamResults } from "@/app/dashboard/lecturer/exams/actions";
 import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { Button } from "@/components/ui/button";
 import { ExamResultsTable } from "@/components/exams/exam-results-table";
 import { ReleaseResultsButton } from "@/components/exams/release-results-button";
@@ -40,6 +41,14 @@ export default async function ExamResultsPage({ params }: { params: Promise<{ id
 
   return (
     <div className="mx-auto max-w-5xl space-y-8 px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Exams", href: "/dashboard/lecturer/exams" },
+          { label: exam.title, href: `/dashboard/lecturer/exams/${id}` },
+          { label: "Results" },
+        ]}
+      />
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Results — {exam.title}</h1>

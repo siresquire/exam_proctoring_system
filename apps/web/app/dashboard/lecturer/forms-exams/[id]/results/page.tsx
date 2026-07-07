@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 
 import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { FormsBypassDetectionPanel } from "@/components/forms/forms-bypass-detection-panel";
 import { FormsExamResultsTable } from "@/components/forms/forms-exam-results-table";
 import { FormsExamSubmissionsTable } from "@/components/forms/forms-exam-submissions-table";
@@ -47,6 +48,14 @@ export default async function FormsExamResultsPage({
 
   return (
     <div className="mx-auto max-w-5xl space-y-10 px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Google Forms quizzes", href: "/dashboard/lecturer/forms-exams" },
+          { label: exam.title, href: `/dashboard/lecturer/forms-exams/${id}/edit` },
+          { label: "Results" },
+        ]}
+      />
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">Results — {exam.title}</h1>
         <p className="text-muted-foreground mt-2 max-w-2xl">

@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 
 import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { EditQuestionForm } from "@/components/questions/edit-question-form";
 import type { BankQuestionRow, QuestionBankRow } from "@/lib/supabase/types";
 
@@ -29,6 +30,14 @@ export default async function EditQuestionPage({
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Question banks", href: "/dashboard/lecturer/question-banks" },
+          { label: bank.name, href: `/dashboard/lecturer/question-banks/${bank.id}` },
+          { label: "Edit question" },
+        ]}
+      />
       <header className="mb-8">
         <h1 className="text-2xl font-semibold tracking-tight">Edit question — {bank.name}</h1>
         <p className="text-muted-foreground mt-2 max-w-2xl">

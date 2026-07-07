@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 
 import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { AttemptResultView } from "@/components/exams/attempt-result-view";
 import type { AttemptResult, ExamRow } from "@/lib/supabase/types";
 
@@ -49,6 +50,12 @@ export default async function AttemptResultPage({
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: `Result — ${exam.title}` },
+        ]}
+      />
       <AttemptResultView examTitle={exam.title} result={data as unknown as AttemptResult} />
     </div>
   );

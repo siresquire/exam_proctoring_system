@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Download, RefreshCw, Trash2, UserPlus } from "lucide-react";
 
 import { regenerateStudentPassword, removeStudentFromClass } from "@/app/dashboard/lecturer/classes/actions";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { RosterImportDialog } from "@/components/onboarding/roster-import-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -102,6 +103,13 @@ export function ClassDetail({ klass, roster }: ClassDetailProps) {
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Classes", href: "/dashboard/lecturer/classes" },
+          { label: klass.name },
+        ]}
+      />
       <header className="mb-8 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{klass.name}</h1>

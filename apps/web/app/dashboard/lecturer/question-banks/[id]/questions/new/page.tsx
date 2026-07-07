@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 
 import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { NewQuestionForm } from "@/components/questions/new-question-form";
 import type { QuestionBankRow, QuestionCategoryRow } from "@/lib/supabase/types";
 
@@ -27,6 +28,14 @@ export default async function NewQuestionPage({ params }: { params: Promise<{ id
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Question banks", href: "/dashboard/lecturer/question-banks" },
+          { label: bank.name, href: `/dashboard/lecturer/question-banks/${bank.id}` },
+          { label: "New question" },
+        ]}
+      />
       <header className="mb-8">
         <h1 className="text-2xl font-semibold tracking-tight">New question — {bank.name}</h1>
         <p className="text-muted-foreground mt-2 max-w-2xl">

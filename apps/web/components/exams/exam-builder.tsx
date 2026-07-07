@@ -6,6 +6,7 @@ import { addExamSection } from "@/app/dashboard/lecturer/exams/actions";
 import { AddSectionButton, SectionEditor } from "@/components/exams/section-editor";
 import { ExamPublishPanel } from "@/components/exams/exam-publish-panel";
 import { ExamSettingsForm } from "@/components/exams/exam-settings-form";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { notify } from "@/lib/notify";
@@ -59,6 +60,13 @@ export function ExamBuilder({ exam, sections, sources, classes, banks, questions
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Exams", href: "/dashboard/lecturer/exams" },
+          { label: exam.title },
+        ]}
+      />
       <header className="mb-8 flex flex-wrap items-start justify-between gap-4">
         <div>
           <div className="flex items-center gap-2">

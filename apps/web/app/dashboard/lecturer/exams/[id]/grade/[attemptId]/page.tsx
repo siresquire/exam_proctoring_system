@@ -3,9 +3,10 @@ import { notFound } from "next/navigation";
 
 import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { Button } from "@/components/ui/button";
 import { EssayGradingForm } from "@/components/exams/essay-grading-form";
-import type { AttemptGradingDetail, ExamRow } from "@/lib/supabase/types";
+import type { AttemptGradingDetail, ExamResultRow, ExamRow } from "@/lib/supabase/types";
 
 /**
  * Phase 3d-ii manual essay grading page. Loads get_attempt_for_grading
@@ -40,8 +41,24 @@ export default async function GradeAttemptPage({
   const essayQuestions = detail.per_question.filter((q) => q.type === "essay");
   const objectiveQuestions = detail.per_question.filter((q) => q.type !== "essay");
 
+  // Reuses the same exam_results RPC as the results page purely to label
+  // this attempt with the student's name in the breadcrumb/heading — no new
+  // query surface, and get_attempt_for_grading above already proved this
+  // caller may see this attempt.
+  const { data: resultRows } = await supabase.rpc("exam_results", { exam_id: id });
+  const studentName = ((resultRows ?? []) as ExamResultRow[]).find((r) => r.attempt_id === attemptId)?.full_name;
+
   return (
     <div className="mx-auto max-w-3xl space-y-8 px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[
+          { label: "Dashboard", href: "/dashboard" },
+          { label: "Exams", href: "/dashboard/lecturer/exams" },
+          { label: exam.title, href: `/dashboard/lecturer/exams/${id}` },
+          { label: "Results", href: `/dashboard/lecturer/exams/${id}/results` },
+          { label: studentName ? `Grade — ${studentName}` : "Grade attempt" },
+        ]}
+      />
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Grade attempt — {exam.title}</h1>

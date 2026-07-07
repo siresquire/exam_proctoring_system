@@ -245,9 +245,15 @@ export function CategoryTree({ bankId, categories, selectedCategoryId, onSelectC
 
   return (
     <nav aria-label="Question categories">
-      <div className="mb-2 flex items-center justify-between">
+      <div className="mb-3 flex flex-col gap-2">
         <h2 className="text-sm font-medium">Categories</h2>
-        <Button type="button" size="sm" variant="outline" onClick={() => setAddingUnder(null)}>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={() => setAddingUnder(null)}
+          className="w-full justify-center"
+        >
           <FolderPlus aria-hidden className="size-4" />
           New top-level category
         </Button>
