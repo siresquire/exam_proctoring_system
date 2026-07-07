@@ -5,6 +5,7 @@ import { requireRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import type { QuestionBankRow } from "@/lib/supabase/types";
 
 /**
@@ -25,6 +26,9 @@ export default async function QuestionBanksPage() {
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-10 sm:px-6">
+      <Breadcrumbs
+        items={[{ label: "Dashboard", href: "/dashboard" }, { label: "Question banks" }]}
+      />
       <header className="mb-8 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Question banks</h1>
