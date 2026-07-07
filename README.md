@@ -1515,6 +1515,101 @@ deferred: re-attaching a webcam stream on page-refresh resume (see "Exam
 room wiring" above), and a standing scheduler for genuinely abandoned
 attempts (still lazy-enforced, per 3d-i).
 
+## Admin & super-admin consoles
+
+Three screens turn the previously-placeholder admin/super-admin dashboards
+into working shells, gated by `requireRole()` (UI-level routing — the real
+enforcement is always the RLS/RPC layer described below).
+
+### Users & roles (`/dashboard/users`, admin + super_admin)
+
+Lists every account: `full_name`, email, role, `student_number`, and
+whether the account still has to change its temp password.
+`profiles` has no email column — the page's data path
+(`lib/admin/users.ts#listUsersWithEmail`) reads `profiles` through the
+caller's own authenticated client (RLS-scoped: `profiles_select_admin_or_higher`
+lets admin/super_admin see every row; anyone else silently gets only their
+own row back, so the page degrades safely even if a future caller forgets
+the `requireRole` gate) and merges in emails via the **service-role** Admin
+API (`admin.auth.admin.listUsers()`, paginated) — server-only, never sent
+to the browser as raw service-role data beyond the resolved email string.
+
+- **Role changes** go through the `set_user_role` RPC only —
+  `apps/web/app/dashboard/users/actions.ts#changeUserRole` never writes
+  `profiles.role` directly. Every escalation rule (nobody changes their own
+  role; only `super_admin` grants/revokes `admin`/`super_admin`; `admin` may
+  only set `lecturer`/`student`) is enforced in Postgres
+  (`set_user_role` in `20260704000005_rls_policies.sql`); the UI
+  (`components/admin/users-table.tsx#assignableRoles`) mirrors those same
+  rules only to decide what to render (an editable `<select>` vs. a disabled
+  badge with a tooltip explaining why), so a client bug in the UI can never
+  grant more than the RPC allows. Every change is confirmed via
+  `notify.confirm` and audit-logged automatically by the RPC.
+- **Accommodations** (extra-time multiplier, AT-flag suppression, reviewer
+  notes — DESIGN.md §3) are edited in an accessible dialog and saved via
+  the caller's own authenticated client, relying on
+  `profiles_update_admin_or_higher` + the `profiles_guard_update` trigger:
+  admin/super_admin may update any row's `accommodations`, and that same
+  trigger still blocks `full_name`/`student_number`/`role` from changing
+  through this path.
+- The table uses semantic `<th scope="col">` headers, 44px-minimum controls,
+  and a horizontal-scroll container around the table body so it never
+  overflows the page at 375px (verified).
+
+### Audit log (`/dashboard/audit`, admin + super_admin)
+
+Paginated (50/page), newest-first browser over `audit_log` — the flagship
+super-admin oversight screen. Read-only and append-only: the table has no
+UPDATE/DELETE grants and a trigger that rejects both outright (see
+`20260704000002_audit_log.sql`), so there is no write/delete path to add
+here even by accident. `audit_log_select_admin_or_higher` restricts SELECT
+to admin-or-higher — a lecturer or student hitting this route's data path
+directly gets 0 rows (confirmed in the RLS smoke test, section `v`). Each
+row shows time, actor (resolved to name/email the same way as the Users
+page), action, target, IP, and an expandable `metadata` viewer. Filterable
+by action; the actor list for a page of 50 rows is resolved with at most 50
+service-role lookups, not the whole user base.
+
+### System overview (`/dashboard/system`, super_admin only)
+
+Real, live counts — users by role, classes, question banks, questions,
+exams by status, exam attempts by status, proctoring sessions by status,
+pending proctor reports, and proctoring media files — computed with the
+service-role client (`createAdminClient()`) rather than the caller's RLS-
+scoped client, because several of the underlying tables (`exams`,
+`exam_attempts`, ...) use owner-or-lecturer SELECT policies that would
+under-count for a `super_admin` viewer who isn't literally the row's owner.
+Also shows the `keepalive` table's last ping and how long ago that was.
+
+**Storage/quota is intentionally honest, not simulated**: Supabase and
+Cloudflare R2 free-tier usage (database size, storage, bandwidth) requires
+each provider's own management API, which this app does not call. Rather
+than fabricate a number, the page states that plainly and links out to the
+Supabase project dashboard and the Cloudflare R2 overview, both marked as
+"checked in the provider console."
+
+### Dashboard wiring
+
+`/dashboard/admin` and `/dashboard/super-admin` no longer show dead
+placeholder cards — every card is a real link. Admin sees Classes, Users &
+roles, and Audit log. Super admin sees the same oversight set plus System
+overview, and (since `super_admin` is a universal role) a second section
+linking straight into every lecturer tool (classes, question banks, Forms
+quizzes, exam builder).
+
+### Verifying locally
+
+`node scripts/rls-smoke-test.mjs` section `v` covers: a lecturer/student
+cannot read `audit_log` (0 rows, not an error — RLS filters silently, same
+as every other admin-gated table here); an `admin` cannot promote anyone to
+`admin`/`super_admin` via `set_user_role` (only `super_admin` can); the
+Users & roles data path (`profiles` select-all) is confirmed admin-only;
+accommodations updates via the admin-or-higher policy persist the exact
+`{extra_time_multiplier, suppress_at_flags, notes}` shape the dialog
+writes; and a `lecturer` cannot update another user's `accommodations`
+(0 rows affected, value unchanged — PostgREST doesn't raise for this case,
+it just filters the UPDATE's matched rows via RLS).
+
 ## Design system review
 
 Run the dev server and open `/design` — it exercises every notification

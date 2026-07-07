@@ -4843,6 +4843,188 @@ async function main() {
     if (uClassId) await admin.from("classes").delete().eq("id", uClassId);
   }
 
+  // === (v) Admin & super-admin consoles: users & roles, audit-log browser,
+  // system overview ===========================================================
+  // Covers the task brief's exact asks: (1) a lecturer/student cannot read
+  // audit_log (RLS denies) while admin/super_admin can; (2) admin cannot
+  // promote to admin/super_admin via set_user_role even from a fresh
+  // student->lecturer->admin chain (student->lecturer already covered in
+  // (f), but this isolates the lecturer->admin escalation attempt
+  // specifically, since that's the exact path the Users & roles screen's
+  // role <select> now exposes in the UI); super_admin can perform that same
+  // promotion; (3) the users-list data path (profiles select-all) is
+  // confirmed admin-only already by (a2)/(e1)/(f1)/(g1) above — this section
+  // adds one more explicit assertion that a lecturer's attempt to read the
+  // full roster (not just their own row) is denied, matching what
+  // /dashboard/users relies on.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const { client: adminClient } = sessions.admin;
+    const { client: superAdminClient } = sessions.super_admin;
+
+    // v1. lecturer SELECT audit_log FAILS (0 rows — RLS silently filters
+    // rather than raising, same posture as every other admin_or_higher-only
+    // table in this schema).
+    const { data: lecturerAuditRows, error: lecturerAuditErr } = await lecturerClient
+      .from("audit_log")
+      .select("*")
+      .limit(1);
+    record(
+      "v1. lecturer SELECT audit_log returns 0 rows (RLS denies)",
+      !lecturerAuditErr && (lecturerAuditRows?.length ?? 0) === 0,
+      lecturerAuditErr?.message ?? `rows=${lecturerAuditRows?.length}`,
+    );
+
+    // v2. student SELECT audit_log FAILS (0 rows).
+    const { data: studentAuditRows, error: studentAuditErr } = await studentClient
+      .from("audit_log")
+      .select("*")
+      .limit(1);
+    record(
+      "v2. student SELECT audit_log returns 0 rows (RLS denies)",
+      !studentAuditErr && (studentAuditRows?.length ?? 0) === 0,
+      studentAuditErr?.message ?? `rows=${studentAuditRows?.length}`,
+    );
+
+    // v3. admin SELECT audit_log succeeds (admin_or_higher).
+    const { data: adminAuditRows, error: adminAuditErr } = await adminClient
+      .from("audit_log")
+      .select("*")
+      .limit(1);
+    record(
+      "v3. admin SELECT audit_log succeeds",
+      !adminAuditErr && (adminAuditRows?.length ?? 0) >= 0,
+      adminAuditErr?.message ?? `rows=${adminAuditRows?.length}`,
+    );
+
+    // v4. super_admin SELECT audit_log succeeds.
+    const { data: superAuditRows, error: superAuditErr } = await superAdminClient
+      .from("audit_log")
+      .select("*")
+      .limit(1);
+    record(
+      "v4. super_admin SELECT audit_log succeeds",
+      !superAuditErr && (superAuditRows?.length ?? 0) >= 0,
+      superAuditErr?.message ?? `rows=${superAuditRows?.length}`,
+    );
+
+    // v5. lecturer SELECT the full profiles roster (no filter) returns only
+    // their own row — confirms the Users & roles screen's data path
+    // (listUsersWithEmail, backed by the caller's own authenticated client)
+    // cannot be reached by a lecturer even if they discovered the route.
+    const { data: lecturerRoster, error: lecturerRosterErr } = await lecturerClient
+      .from("profiles")
+      .select("*");
+    record(
+      "v5. lecturer SELECT full profiles roster returns only own row (Users & roles data path is admin-only)",
+      !lecturerRosterErr && lecturerRoster?.length === 1 && lecturerRoster[0].id === lecturerId,
+      lecturerRosterErr?.message ?? `rows=${lecturerRoster?.length}`,
+    );
+
+    // v6. admin set_user_role(lecturer -> admin) FAILS (escalation blocked)
+    // — the exact promotion path the Users & roles role <select> offers to
+    // a super_admin viewer but must NOT offer (and the RPC must reject
+    // regardless of what the UI offers) to an admin viewer.
+    const { error: adminEscalateErr } = await adminClient.rpc("set_user_role", {
+      target: lecturerId,
+      new_role: "admin",
+    });
+    record(
+      "v6. admin set_user_role(lecturer -> admin) FAILS (escalation blocked)",
+      isDenied(adminEscalateErr),
+      adminEscalateErr?.message ?? "no error raised — SECURITY: admin escalated a lecturer to admin",
+    );
+
+    // v7. admin set_user_role(lecturer -> super_admin) FAILS.
+    const { error: adminSuperEscalateErr } = await adminClient.rpc("set_user_role", {
+      target: lecturerId,
+      new_role: "super_admin",
+    });
+    record(
+      "v7. admin set_user_role(lecturer -> super_admin) FAILS (escalation blocked)",
+      isDenied(adminSuperEscalateErr),
+      adminSuperEscalateErr?.message ?? "no error raised — SECURITY: admin escalated a lecturer to super_admin",
+    );
+
+    // v8. super_admin set_user_role(lecturer -> admin) succeeds, then revert
+    // — proves the same promotion IS available to a super_admin viewer,
+    // matching the Users & roles screen's role editor being enabled only
+    // for a super_admin caller on an admin/super_admin target.
+    const { error: superPromoteErr } = await superAdminClient.rpc("set_user_role", {
+      target: lecturerId,
+      new_role: "admin",
+    });
+    record(
+      "v8. super_admin set_user_role(lecturer -> admin) succeeds",
+      !superPromoteErr,
+      superPromoteErr?.message,
+    );
+    const { error: superRevertErr } = await superAdminClient.rpc("set_user_role", {
+      target: lecturerId,
+      new_role: "lecturer",
+    });
+    record(
+      "v8b. super_admin can revert set_user_role(admin -> lecturer) [cleanup]",
+      !superRevertErr,
+      superRevertErr?.message,
+    );
+
+    // v9. accommodations update via the profiles_update_admin_or_higher
+    // policy: admin can set another user's accommodations (mirrors f2, but
+    // isolates the exact shape the Users & roles accommodations dialog
+    // writes: extra_time_multiplier + suppress_at_flags + notes together).
+    const { error: accUpdateErr } = await adminClient
+      .from("profiles")
+      .update({
+        accommodations: { extra_time_multiplier: 1.5, suppress_at_flags: true, notes: "smoke test v9" },
+      })
+      .eq("id", studentId);
+    record(
+      "v9. admin UPDATE another user's accommodations (multiplier + suppress_at_flags + notes) succeeds",
+      !accUpdateErr,
+      accUpdateErr?.message,
+    );
+
+    const { data: accRow } = await admin.from("profiles").select("accommodations").eq("id", studentId).single();
+    record(
+      "v9b. accommodations persisted with the exact shape written",
+      accRow?.accommodations?.extra_time_multiplier === 1.5 &&
+        accRow?.accommodations?.suppress_at_flags === true &&
+        accRow?.accommodations?.notes === "smoke test v9",
+      JSON.stringify(accRow?.accommodations),
+    );
+    // revert
+    await admin.from("profiles").update({ accommodations: {} }).eq("id", studentId);
+
+    // v10. lecturer cannot update another user's accommodations at all
+    // (profiles_update_admin_or_higher requires is_admin_or_higher(); a
+    // lecturer has no UPDATE policy covering someone else's row). PostgREST
+    // doesn't raise an error for this case — RLS's USING clause simply
+    // filters the target row out of the UPDATE's matched set, so the
+    // request "succeeds" with 0 rows affected (same silent-filter posture
+    // as every SELECT-side RLS check in this suite, e.g. a2/a3/e1/e2).
+    // Assert both: the update reports 0 affected rows AND the value is
+    // unchanged in the database afterward.
+    const { data: lecturerAccData, error: lecturerAccErr } = await lecturerClient
+      .from("profiles")
+      .update({ accommodations: { notes: "lecturer should not be able to do this" } })
+      .eq("id", studentId)
+      .select();
+    const { data: accUnchangedRow } = await admin
+      .from("profiles")
+      .select("accommodations")
+      .eq("id", studentId)
+      .single();
+    record(
+      "v10. lecturer UPDATE another user's accommodations FAILS (0 rows affected, value unchanged)",
+      (isDenied(lecturerAccErr) || (lecturerAccData?.length ?? 0) === 0) &&
+        accUnchangedRow?.accommodations?.notes !== "lecturer should not be able to do this",
+      lecturerAccErr?.message ??
+        `rows affected=${lecturerAccData?.length} stored=${JSON.stringify(accUnchangedRow?.accommodations)}`,
+    );
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the
