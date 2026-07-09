@@ -367,6 +367,40 @@ sets it for `student@usted.test` only — staff profiles stay `NULL`.
   persisted + applied before first paint (no flash of unscaled text), the
   same technique `next-themes` uses for color scheme.
 
+### Navigation
+
+The header's primary nav (`apps/web/components/layout/site-header.tsx` +
+`primary-nav.tsx`) is role-aware, not a fixed list of every tab for everyone:
+`apps/web/components/layout/nav-config.ts` maps each `UserRole` to its own
+link groups (student: just Dashboard; lecturer: Dashboard, Question banks,
+Exams, Classes, Forms quizzes; admin: Dashboard, Classes, Users & roles,
+Audit log; super_admin: all of the above, grouped as "Teaching" /
+"Administration"), plus "Proctoring demo" appended for every signed-in role
+(it's a training/review surface, not a staff-only tool). Signed-out visitors
+see only the brand mark and a "Sign in" button — no app links. `SiteHeader`
+resolves the session server-side via `getSessionProfile()` (the same
+cookie-decoding path `requireRole` uses — see `lib/auth.ts`) and passes
+`role`/`fullName`/`email` down as props, so there's no client-side session
+fetch to race the middleware's token refresh.
+
+Above the `md` breakpoint the role's links render inline in one row
+(wrapping gracefully for `super_admin`'s longer list at narrow desktop
+widths); below it, the header collapses to just the logo and a hamburger
+button (`aria-label`, `aria-expanded` via Radix, ≥44×44px target) that opens
+a shadcn **Sheet** drawer. The drawer holds the same role-scoped links
+(grouped under labeled headings for `super_admin`), then the signed-in
+identity, the text-size and theme controls, and sign-out — so the mobile
+top bar never wraps into multiple rows. Radix's Dialog primitive under the
+Sheet gives focus-trap, Escape-to-close, and scroll-lock for free; each link
+is wrapped in `SheetClose` so tapping it navigates and closes the drawer in
+one action. The drawer uses a single `<nav>` landmark for the whole link
+list (per-group headings are plain `<h2>`s, not nested `<nav>`s) to avoid
+an axe-core `landmark-unique` violation from two same-labeled navs.
+
+`/design` (the shadcn/notify.ts component gallery) was dropped from the
+primary nav entirely — it's a developer surface, not something students or
+staff need to reach from the app chrome. The route itself is untouched.
+
 ### Face-presence detection & portrait quality gating (Phase 1.6)
 
 `packages/proctor-core` defines a framework-agnostic `FaceDetector` interface
