@@ -8,6 +8,14 @@ import { Menu } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
+  NavigationMenu,
+  NavigationMenuContent,
+  NavigationMenuItem,
+  NavigationMenuLink,
+  NavigationMenuList,
+  NavigationMenuTrigger,
+} from "@/components/ui/navigation-menu";
+import {
   Sheet,
   SheetClose,
   SheetContent,
@@ -41,11 +49,27 @@ interface NavProps {
   groups: NavGroup[];
 }
 
+const navLinkClass = (active: boolean) =>
+  cn(
+    "focus-visible:ring-ring/50 rounded-md px-3 py-2 text-sm font-medium whitespace-nowrap transition-colors focus-visible:outline-none focus-visible:ring-3",
+    active
+      ? "bg-accent text-accent-foreground"
+      : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+  );
+
 /**
- * Desktop inline navigation (lg and up). One non-wrapping row; if a role has
- * enough links to exceed the space (super_admin), the row scrolls
- * horizontally rather than wrapping into the brand — wrapping was the cause
- * of the earlier overlap. Below lg the links live in the MobileNav drawer
+ * Desktop inline navigation (lg and up), one non-wrapping row that never
+ * scrolls: unlabeled groups (student/lecturer/admin, plus the leading
+ * "Dashboard" and trailing "Proctoring demo" groups for every role) render
+ * as plain inline links, same as before. A *labeled* group (super_admin's
+ * "Teaching" / "Administration") collapses into a single top-level dropdown
+ * — trigger = the group label, panel = that group's links — so a heavy role
+ * still fits in a handful of top-level items instead of overflowing.
+ *
+ * The dropdown is Radix NavigationMenu (via shadcn's navigation-menu),
+ * chosen specifically because it opens on hover *and* is fully keyboard
+ * (Enter/Space/arrow keys), click, and touch operable — DESIGN.md forbids
+ * hover-only interaction. Below lg the links live in the MobileNav drawer
  * instead. The compact avatar + settings controls in the header (see
  * AccountMenu / DisplaySettingsMenu) are what free the room for this row.
  */
@@ -55,25 +79,77 @@ export function DesktopNav({ groups }: NavProps) {
   const activeHref = getActiveHref(pathname, flatLinks);
 
   return (
-    <nav
-      aria-label="Primary"
-      className="hidden min-w-0 flex-1 items-center gap-1 overflow-x-auto lg:flex"
-    >
-      {flatLinks.map((link) => (
-        <Link
-          key={link.href}
-          href={link.href}
-          aria-current={link.href === activeHref ? "page" : undefined}
-          className={cn(
-            "focus-visible:ring-ring/50 rounded-md px-3 py-2 text-sm font-medium whitespace-nowrap transition-colors focus-visible:outline-none focus-visible:ring-3",
-            link.href === activeHref
-              ? "bg-accent text-accent-foreground"
-              : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-          )}
-        >
-          {link.label}
-        </Link>
-      ))}
+    <nav aria-label="Primary" className="hidden min-w-0 flex-1 items-center gap-1 lg:flex">
+      {groups.map((group, index) => {
+        if (!group.label) {
+          return (
+            <React.Fragment key={`group-${index}`}>
+              {group.links.map((link) => (
+                <Link
+                  key={link.href}
+                  href={link.href}
+                  aria-current={link.href === activeHref ? "page" : undefined}
+                  className={navLinkClass(link.href === activeHref)}
+                >
+                  {link.label}
+                </Link>
+              ))}
+            </React.Fragment>
+          );
+        }
+
+        const groupIsActive = group.links.some((link) => link.href === activeHref);
+
+        return (
+          <NavigationMenu
+            key={group.label}
+            viewport={false}
+            aria-label={`${group.label} menu`}
+            className="max-w-none flex-none"
+          >
+            <NavigationMenuList>
+              <NavigationMenuItem>
+                <NavigationMenuTrigger
+                  className={cn(
+                    // Override shadcn's default plain `focus:bg-muted` (paired with our
+                    // `text-muted-foreground`, that combination is only 4.34:1 — fails
+                    // WCAG AA 4.5:1, confirmed by axe-core's color-contrast rule). Focus
+                    // gets the same accent treatment as hover/active instead.
+                    "focus-visible:ring-ring/50 h-auto rounded-md bg-transparent px-3 py-2 text-sm font-medium focus:bg-accent focus:text-accent-foreground focus-visible:ring-3",
+                    groupIsActive
+                      ? "bg-accent text-accent-foreground hover:bg-accent hover:text-accent-foreground data-popup-open:bg-accent data-open:bg-accent"
+                      : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                  )}
+                >
+                  {group.label}
+                </NavigationMenuTrigger>
+                <NavigationMenuContent>
+                  <ul className="grid w-56 gap-1 p-1">
+                    {group.links.map((link) => (
+                      <li key={link.href}>
+                        <NavigationMenuLink asChild>
+                          <Link
+                            href={link.href}
+                            aria-current={link.href === activeHref ? "page" : undefined}
+                            className={cn(
+                              "flex min-h-11 items-center rounded-md px-3 py-2 text-sm font-medium transition-colors",
+                              link.href === activeHref
+                                ? "bg-accent text-accent-foreground"
+                                : "text-foreground hover:bg-accent hover:text-accent-foreground",
+                            )}
+                          >
+                            {link.label}
+                          </Link>
+                        </NavigationMenuLink>
+                      </li>
+                    ))}
+                  </ul>
+                </NavigationMenuContent>
+              </NavigationMenuItem>
+            </NavigationMenuList>
+          </NavigationMenu>
+        );
+      })}
     </nav>
   );
 }

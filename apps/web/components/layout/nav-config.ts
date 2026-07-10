@@ -50,10 +50,13 @@ const ROLE_NAV_GROUPS: Record<UserRole, NavGroup[]> = {
     },
   ],
   super_admin: [
+    // Unlabeled leading group so "Dashboard" renders as its own top-level
+    // link (not buried inside the "Teaching" dropdown) — see DesktopNav,
+    // which renders unlabeled groups inline and labeled groups as dropdowns.
+    { links: [{ href: "/dashboard", label: "Dashboard" }] },
     {
       label: "Teaching",
       links: [
-        { href: "/dashboard", label: "Dashboard" },
         { href: "/dashboard/lecturer/question-banks", label: "Question banks" },
         { href: "/dashboard/lecturer/exams", label: "Exams" },
         { href: "/dashboard/lecturer/classes", label: "Classes" },

@@ -15,12 +15,13 @@ import { getSessionProfile } from "@/lib/auth";
 // 1.6b refresh-hardening fix (single server-side session read, no second
 // GoTrue client racing the middleware's refresh) is untouched.
 //
-// Layout: brand (left, fixed) · inline role nav (middle, desktop only,
-// scrolls if a heavy role overflows) · compact right cluster (display/a11y
-// settings + circular account avatar; the hamburger replaces the inline nav
-// below lg). Compacting the account + settings into an avatar + one icon is
-// what frees the horizontal room for the nav to lay out inline without
-// wrapping into the brand.
+// Layout: brand (left, fixed) · inline role nav (middle, desktop only —
+// heavy roles like super_admin collapse their grouped links into dropdowns
+// so the row never scrolls or wraps, see DesktopNav) · compact right cluster
+// (display/a11y settings + circular account avatar; the hamburger replaces
+// the inline nav below lg). Compacting the account + settings into an avatar
+// + one icon is what frees the horizontal room for the nav to lay out inline
+// without wrapping into the brand.
 export async function SiteHeader() {
   const session = await getSessionProfile();
   const navGroups = session ? getNavGroups(session.profile.role) : [];
