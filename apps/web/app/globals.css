@@ -85,6 +85,42 @@
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
+  /* Dashboard analytics palette (dataviz skill method — see
+     apps/web/components/charts/). Color is assigned LAST, after form: most
+     charts here are single-series magnitude bars, which per the skill's
+     anti-patterns ("a value-ramp on nominal categories") take ONE flat
+     color, not one per bar — --chart-series-1 below. The 8-slot categorical
+     ramp is kept validated and available for a future multi-series chart
+     (e.g. several lecturers' activity on one line chart), so it never ships
+     unvalidated later. Validated with the skill's
+     scripts/validate_palette.js: `node validate_palette.js
+     "#93204a,#0f9b9b,#2a78d6,#b8860b,#0f6938,#4a3aa7,#e7000b,#e87ba4"
+     --mode light` -> ALL CHECKS PASS (lightness band, chroma floor, worst
+     adjacent CVD deltaE 29.5 vs the >=12 target, contrast >=3:1 except slot
+     8 magenta at 2.62:1 — shipped only with a visible label/table, never
+     color-alone, per the skill's relief rule). Slots 5/7 are literally
+     --success/--destructive (brand green/red); slots 1/4 are chart-tuned
+     lightness bumps off --primary/--accent so they clear the categorical
+     lightness floor (0.43) that the brand tokens themselves sit just under. */
+  --chart-series-1: var(--primary);
+  --chart-cat-1: #93204a; /* chart-tuned maroon (brand hue) */
+  --chart-cat-2: #0f9b9b; /* teal */
+  --chart-cat-3: #2a78d6; /* blue */
+  --chart-cat-4: #b8860b; /* chart-tuned gold (brand hue, darker than --accent) */
+  --chart-cat-5: var(--success); /* #0f6938 — green */
+  --chart-cat-6: #4a3aa7; /* violet */
+  --chart-cat-7: var(--destructive); /* #e7000b — red */
+  --chart-cat-8: #e87ba4; /* magenta (sub-3:1, relief-required) */
+  /* Status palette: fixed meaning (good/warning/serious/critical), reserved —
+     never reused as a categorical slot, always paired with icon+label (never
+     color alone). warning/serious sit below 3:1 on the light surface by
+     design (skill palette.md precedent) — the icon+label pairing is the
+     mitigation, not a fix. Text-contrast checked via the skill's exported
+     `contrast()`, not the categorical validator (out of that check's scope). */
+  --chart-status-good: var(--success); /* #0f6938 — 6.60:1 */
+  --chart-status-warning: #b8791a; /* 3.53:1 */
+  --chart-status-serious: #c1541f; /* 4.49:1 */
+  --chart-status-critical: var(--destructive); /* #e7000b — 3.81:1 */
   --radius: 0.625rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
@@ -130,6 +166,31 @@
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
+  /* Dashboard analytics palette, dark variant — same 8 hues re-stepped for
+     the dark surface (#1a1a19), re-validated (not an automatic light-mode
+     flip, per the skill's "dark mode is selected" rule): `node
+     validate_palette.js
+     "#e16089,#1ca3a3,#3987e5,#c98500,#17a357,#9085e9,#e66767,#d55181"
+     --mode dark --surface "#1a1a19"` -> ALL CHECKS PASS (worst adjacent CVD
+     deltaE 12.0, at the >=12 target; contrast >=3:1 on all 8). Slot 7 (red)
+     is a chart-tuned #e66767, NOT --destructive's dark value (#ff6467) —
+     that brand token is too light (L 0.70) for the dark categorical band
+     (0.48-0.67); status-critical below still uses the real --destructive
+     token, since the status palette isn't subject to the categorical
+     lightness-band check. */
+  --chart-series-1: var(--primary);
+  --chart-cat-1: var(--primary); /* #e16089 */
+  --chart-cat-2: #1ca3a3;
+  --chart-cat-3: #3987e5;
+  --chart-cat-4: #c98500;
+  --chart-cat-5: var(--success); /* #17a357 */
+  --chart-cat-6: #9085e9;
+  --chart-cat-7: #e66767; /* chart-tuned red, see comment above */
+  --chart-cat-8: #d55181;
+  --chart-status-good: var(--success); /* #17a357 — 5.32:1 */
+  --chart-status-warning: #e0a53a; /* 7.97:1 */
+  --chart-status-serious: #e2734a; /* 5.63:1 */
+  --chart-status-critical: var(--destructive); /* #ff6467 — 6.01:1 */
   --sidebar: oklch(0.205 0 0);
   --sidebar-foreground: oklch(0.985 0 0);
   --sidebar-primary: oklch(0.488 0.243 264.376);
@@ -178,6 +239,28 @@
   --chart-3: oklch(0.4 0.22 27);
   --chart-4: oklch(0.35 0 0);
   --chart-5: oklch(0.2 0 0);
+  /* Dashboard analytics palette, high-contrast variant — same white surface
+     as light, so the light-mode 8 slots are re-validated as-is EXCEPT slot 7
+     (red), swapped for high-contrast's own darker --destructive (#9d0000,
+     vs light's #e7000b) so it stays in step with the theme's own token:
+     `node validate_palette.js
+     "#93204a,#0f9b9b,#2a78d6,#b8860b,#0f6938,#4a3aa7,#9d0000,#e87ba4"
+     --mode light --surface "#ffffff"` -> ALL CHECKS PASS. Structure
+     (borders/focus rings) carries the "high contrast" intent, not hue —
+     same convention as --primary/--accent/--success above. */
+  --chart-series-1: var(--primary);
+  --chart-cat-1: var(--primary); /* #8d1b3f */
+  --chart-cat-2: #0f9b9b;
+  --chart-cat-3: #2a78d6;
+  --chart-cat-4: #b8860b;
+  --chart-cat-5: var(--success); /* #0f6938 */
+  --chart-cat-6: #4a3aa7;
+  --chart-cat-7: var(--destructive); /* #9d0000 */
+  --chart-cat-8: #e87ba4;
+  --chart-status-good: var(--success);
+  --chart-status-warning: #b8791a;
+  --chart-status-serious: #c1541f;
+  --chart-status-critical: var(--destructive);
   --sidebar: oklch(1 0 0);
   --sidebar-foreground: oklch(0 0 0);
   --sidebar-primary: oklch(0 0 0);
