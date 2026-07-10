@@ -2,6 +2,8 @@ import Link from "next/link";
 import { FileClock, ShieldCheck, Users } from "lucide-react";
 
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { PlatformAnalyticsSection } from "@/components/admin/platform-analytics-section";
+import { getPlatformAnalytics } from "@/lib/admin/platform-analytics";
 
 const CARDS = [
   {
@@ -25,7 +27,9 @@ const CARDS = [
   },
 ];
 
-export default function AdminDashboard() {
+export default async function AdminDashboard() {
+  const analytics = await getPlatformAnalytics();
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
       <header className="mb-8">
@@ -34,6 +38,9 @@ export default function AdminDashboard() {
           Manage classes, lecturers, students, and review the audit trail.
         </p>
       </header>
+
+      {analytics ? <PlatformAnalyticsSection analytics={analytics} /> : null}
+
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {CARDS.map(({ href, icon: Icon, title, description }) => (
           <Link key={href} href={href} className="block">

@@ -10,6 +10,8 @@ import {
 } from "lucide-react";
 
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { PlatformAnalyticsSection } from "@/components/admin/platform-analytics-section";
+import { getPlatformAnalytics } from "@/lib/admin/platform-analytics";
 
 const OVERSIGHT_CARDS = [
   {
@@ -59,7 +61,9 @@ const LECTURER_TOOL_CARDS = [
   },
 ];
 
-export default function SuperAdminDashboard() {
+export default async function SuperAdminDashboard() {
+  const analytics = await getPlatformAnalytics();
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
       <header className="mb-8">
@@ -69,6 +73,8 @@ export default function SuperAdminDashboard() {
           you can also reach every lecturer tool below.
         </p>
       </header>
+
+      {analytics ? <PlatformAnalyticsSection analytics={analytics} /> : null}
 
       <section aria-labelledby="oversight-heading" className="mb-10">
         <h2 id="oversight-heading" className="mb-4 text-lg font-medium tracking-tight">
