@@ -1093,6 +1093,22 @@ export interface Database {
           score_distribution: Record<string, number>;
         };
       };
+      student_dashboard_stats: {
+        // Analytics phase: student dashboard aggregates. Owner-only
+        // (student_id = auth.uid(), no id argument) AND release-gated
+        // identically to get_attempt_result — never an unreleased score,
+        // never another student's results.
+        Args: Record<string, never>;
+        Returns: {
+          released_results: {
+            exam_id: string;
+            exam_title: string;
+            submitted_at: string;
+            score_pct: number;
+          }[];
+          upcoming_exams_count: number;
+        };
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -1135,5 +1151,6 @@ export type AttemptResult = Database["public"]["Functions"]["get_attempt_result"
 export type AttemptResultQuestion = NonNullable<AttemptResult["per_question"]>[number];
 export type ExamResultRow = Database["public"]["Functions"]["exam_results"]["Returns"][number];
 export type LecturerDashboardStats = Database["public"]["Functions"]["lecturer_dashboard_stats"]["Returns"];
+export type StudentDashboardStats = Database["public"]["Functions"]["student_dashboard_stats"]["Returns"];
 export type AttemptGradingDetail = Database["public"]["Functions"]["get_attempt_for_grading"]["Returns"];
 export type AttemptGradingQuestion = AttemptGradingDetail["per_question"][number];

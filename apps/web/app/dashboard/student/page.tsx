@@ -2,14 +2,16 @@ import { DashboardShell } from "@/components/dashboard-shell";
 import { OpenFormsExamsList } from "@/components/forms/open-forms-exams-list";
 import { UpcomingExamsList } from "@/components/exams/upcoming-exams-list";
 import { MyResultsList, type MyAttemptSummary } from "@/components/exams/my-results-list";
+import { StudentAnalyticsSection } from "@/components/exams/student-analytics-section";
 import { createClient } from "@/lib/supabase/server";
-import type { ExamRow, FormsExamRow } from "@/lib/supabase/types";
+import type { ExamRow, FormsExamRow, StudentDashboardStats } from "@/lib/supabase/types";
 
 export default async function StudentDashboard() {
   const supabase = await createClient();
   let formsExams: FormsExamRow[] = [];
   let exams: ExamRow[] = [];
   let myAttempts: MyAttemptSummary[] = [];
+  let stats: StudentDashboardStats | null = null;
   if (supabase) {
     // RLS's forms_exams_select_published_and_open policy already restricts
     // this to status='published' AND within [opens_at, closes_at] — no
@@ -41,11 +43,18 @@ export default async function StudentDashboard() {
       status: a.status,
       submitted_at: a.submitted_at,
     }));
+
+    // Analytics phase: released-only score summary + available-exam count —
+    // student_dashboard_stats() re-derives ownership + the results_release
+    // gate itself (see that RPC's comment); no further filtering needed here.
+    const { data: statsData } = await supabase.rpc("student_dashboard_stats");
+    stats = (statsData as StudentDashboardStats | null) ?? null;
   }
 
   return (
     <div>
       <div className="mx-auto max-w-6xl space-y-8 px-4 pt-10 sm:px-6">
+        {stats ? <StudentAnalyticsSection stats={stats} /> : null}
         <UpcomingExamsList exams={exams} />
         <OpenFormsExamsList exams={formsExams} />
         <MyResultsList attempts={myAttempts} />

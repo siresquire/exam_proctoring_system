@@ -5132,6 +5132,188 @@ async function main() {
     );
   }
 
+  // === (x) Analytics phase: student_dashboard_stats() — owner-only AND
+  // release-gated ==============================================================
+  // Proves the two load-bearing properties: (1) an unreleased exam's score
+  // never appears (x1/x2 — an after_close exam that hasn't closed yet), and
+  // (2) a second student never sees the first student's result, and vice
+  // versa (x3/x4/x5) — genuine cross-user isolation, not just "empty because
+  // no attempts", using a freshly created second student account (mirroring
+  // q12's onboarding pattern) so there are two REAL, DIFFERING scores to
+  // tell apart.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const suffix = Date.now();
+
+    const { data: xClassId } = await lecturerClient.rpc("create_class", { name: `Smoke x-analytics class ${suffix}` });
+    if (xClassId) {
+      await lecturerClient.rpc("enroll_existing_student", { class_id: xClassId, student_id: studentId });
+    }
+
+    const { data: xBankId } = await lecturerClient.rpc("create_question_bank", { name: `Smoke x-analytics bank ${suffix}` });
+    const { data: xQuestionId } = xBankId
+      ? await lecturerClient.rpc("create_question", {
+          bank_id: xBankId,
+          type: "mcq_single",
+          prompt: `x-analytics mcq ${suffix}`,
+          body: { options: [{ id: "A", text: "wrong" }, { id: "B", text: "right" }], correct: ["B"], marks: 2 },
+        })
+      : { data: null };
+
+    const opensAt = new Date(Date.now() - 60_000).toISOString();
+    const futureClosesAt = new Date(Date.now() + 60 * 60_000).toISOString();
+
+    // Exam A: results_release='immediate' — released as soon as submitted.
+    const { data: xExamAId } = await lecturerClient.rpc("create_exam", { title: `x-analytics immediate exam ${suffix}`, class_id: xClassId ?? null });
+    let xSectionAId = null;
+    if (xExamAId) {
+      const { data: sid } = await lecturerClient.rpc("add_exam_section", { exam_id: xExamAId, title: "Section 1" });
+      xSectionAId = sid ?? null;
+      if (xSectionAId && xQuestionId) {
+        await lecturerClient.rpc("add_section_source", { section_id: xSectionAId, source_type: "fixed", question_id: xQuestionId });
+      }
+      await lecturerClient.rpc("update_exam", {
+        exam_id: xExamAId,
+        title: `x-analytics immediate exam ${suffix}`,
+        class_id: xClassId ?? null,
+        opens_at: opensAt,
+        closes_at: futureClosesAt,
+        integrity_tier: 1,
+        results_release: "immediate",
+      });
+      await lecturerClient.rpc("set_exam_status", { exam_id: xExamAId, status: "published" });
+    }
+
+    // Exam B: results_release='after_close', still open (closes_at in the
+    // future, exam not closed) — its score must NEVER appear yet.
+    const { data: xExamBId } = await lecturerClient.rpc("create_exam", { title: `x-analytics unreleased exam ${suffix}`, class_id: xClassId ?? null });
+    let xSectionBId = null;
+    if (xExamBId) {
+      const { data: sid } = await lecturerClient.rpc("add_exam_section", { exam_id: xExamBId, title: "Section 1" });
+      xSectionBId = sid ?? null;
+      if (xSectionBId && xQuestionId) {
+        await lecturerClient.rpc("add_section_source", { section_id: xSectionBId, source_type: "fixed", question_id: xQuestionId });
+      }
+      await lecturerClient.rpc("update_exam", {
+        exam_id: xExamBId,
+        title: `x-analytics unreleased exam ${suffix}`,
+        class_id: xClassId ?? null,
+        opens_at: opensAt,
+        closes_at: futureClosesAt,
+        integrity_tier: 1,
+        results_release: "after_close",
+      });
+      await lecturerClient.rpc("set_exam_status", { exam_id: xExamBId, status: "published" });
+    }
+
+    record(
+      "x-setup. class + bank + question + immediate exam + unreleased exam created",
+      Boolean(xClassId && xBankId && xQuestionId && xExamAId && xSectionAId && xExamBId && xSectionBId),
+      `class=${Boolean(xClassId)} bank=${Boolean(xBankId)} question=${Boolean(xQuestionId)} examA=${Boolean(xExamAId)} examB=${Boolean(xExamBId)}`,
+    );
+
+    // Seeded student takes + submits BOTH exams, answering correctly both
+    // times (2/2 = 100%).
+    async function takeAndSubmit(client, examId, sectionId, selected) {
+      const { data: attemptId } = await client.rpc("start_exam_attempt", { exam_id: examId, attested: true });
+      if (!attemptId) return null;
+      await client.rpc("save_exam_answer", { attempt_id: attemptId, question_ref: `${sectionId}:0`, response: { selected } });
+      await client.rpc("submit_exam_attempt", { attempt_id: attemptId });
+      return attemptId;
+    }
+
+    if (xExamAId && xSectionAId) await takeAndSubmit(studentClient, xExamAId, xSectionAId, "B");
+    if (xExamBId && xSectionBId) await takeAndSubmit(studentClient, xExamBId, xSectionBId, "B");
+
+    // x1. seeded student's own view: exam A (released, 100%) present, exam B
+    // (unreleased) absent.
+    const { data: studentStats1 } = await studentClient.rpc("student_dashboard_stats");
+    const studentResults1 = studentStats1?.released_results ?? [];
+    const examAEntry = studentResults1.find((r) => r.exam_id === xExamAId);
+    const examBEntry = studentResults1.find((r) => r.exam_id === xExamBId);
+    record(
+      "x1. student_dashboard_stats() includes the RELEASED (immediate) exam's own score",
+      Boolean(examAEntry) && examAEntry.score_pct === 100,
+      JSON.stringify(examAEntry),
+    );
+    record(
+      "x2. student_dashboard_stats() NEVER includes the UNRELEASED (after_close, still open) exam's score",
+      !examBEntry,
+      examBEntry ? `SECURITY: unreleased score leaked — ${JSON.stringify(examBEntry)}` : "correctly absent",
+    );
+
+    // x3-x5. A second, freshly created student takes exam A and answers
+    // WRONG (0%) — a genuinely different score from the seeded student's
+    // 100%, so cross-leakage in either direction is observable, not just
+    // "empty".
+    // signIn() below always uses the shared PASSWORD constant (it signs in
+    // every seeded test user with it) — give this ephemeral account the
+    // same password rather than a custom one, so signIn(email) just works.
+    const secondIndex = `8${String(suffix).slice(-9).padStart(9, "0")}`;
+    const secondEmail = `${secondIndex}@students.usted.local`;
+    const { data: secondUser, error: secondUserErr } = await admin.auth.admin.createUser({
+      email: secondEmail,
+      password: PASSWORD,
+      email_confirm: true,
+      user_metadata: { full_name: "Smoke Test Second Student" },
+    });
+    const secondStudentId = secondUser?.user?.id;
+    if (secondStudentId) {
+      await admin.from("profiles").update({ student_number: secondIndex }).eq("id", secondStudentId);
+      if (xClassId) {
+        await lecturerClient.rpc("enroll_existing_student", { class_id: xClassId, student_id: secondStudentId });
+      }
+    }
+    record(
+      "x3-setup. second student account created + enrolled",
+      Boolean(secondStudentId),
+      secondUserErr?.message ?? secondStudentId,
+    );
+
+    if (secondStudentId) {
+      const { client: secondClient } = await signIn(secondEmail);
+      if (xExamAId && xSectionAId) await takeAndSubmit(secondClient, xExamAId, xSectionAId, "A"); // wrong answer -> 0%
+
+      const { data: secondStats } = await secondClient.rpc("student_dashboard_stats");
+      const secondResults = secondStats?.released_results ?? [];
+      const secondExamAEntry = secondResults.find((r) => r.exam_id === xExamAId);
+      record(
+        "x3. second student's OWN view shows their OWN 0% score for exam A, not the first student's 100%",
+        Boolean(secondExamAEntry) && secondExamAEntry.score_pct === 0,
+        JSON.stringify(secondExamAEntry),
+      );
+
+      // x4. CROSS-USER ISOLATION: re-fetch the FIRST student's view after
+      // the second student submitted — still shows only their own 100%,
+      // never a 0% entry (proving no leakage from the second student's
+      // attempt into the first student's aggregate).
+      const { data: studentStats2 } = await studentClient.rpc("student_dashboard_stats");
+      const studentResults2 = studentStats2?.released_results ?? [];
+      const examAEntriesForFirstStudent = studentResults2.filter((r) => r.exam_id === xExamAId);
+      record(
+        "x4. CROSS-USER ISOLATION: first student's view still shows exactly ONE entry for exam A (their own 100%, not the second student's 0%)",
+        examAEntriesForFirstStudent.length === 1 && examAEntriesForFirstStudent[0].score_pct === 100,
+        JSON.stringify(examAEntriesForFirstStudent),
+      );
+
+      await secondClient.auth.signOut().catch(() => {});
+    } else {
+      record("x3. second student's OWN view shows their OWN 0% score for exam A, not the first student's 100%", false, "skipped — setup failed");
+      record("x4. CROSS-USER ISOLATION: first student's view still shows exactly ONE entry for exam A", false, "skipped — setup failed");
+    }
+
+    // x5. upcoming_exams_count is a positive integer for an enrolled student
+    // with published+open exams (loose bound — other sections' fixtures
+    // also enroll this same seeded student in fresh classes, so an exact
+    // count isn't stable across the whole suite run).
+    record(
+      "x5. student_dashboard_stats() upcoming_exams_count is a positive integer",
+      Number.isInteger(studentStats1?.upcoming_exams_count) && studentStats1.upcoming_exams_count > 0,
+      String(studentStats1?.upcoming_exams_count),
+    );
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the
