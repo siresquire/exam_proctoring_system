@@ -5094,6 +5094,44 @@ async function main() {
     );
   }
 
+  // === (w) Analytics phase: lecturer/student dashboard aggregate RPCs =======
+  // lecturer_dashboard_stats() takes no arguments — authority is entirely
+  // re-derived server-side from auth.uid() + has_role('lecturer'), so the
+  // only client-observable security property is "a non-lecturer caller is
+  // denied", asserted here as a negative test (w1). w2 proves the positive
+  // path still works and returns the expected jsonb shape.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+
+    // w1. student calling lecturer_dashboard_stats() FAILS (has_role('lecturer') denies).
+    // The RPC raises its own explicit exception (not an RLS-policy rejection
+    // isDenied()'s substring list is tuned for), so the meaningful assertion
+    // is simply "an error was raised, no data returned" — same predicate
+    // u16 above uses for exam_results' analogous student-denied case.
+    const { data: studentStatsData, error: studentStatsErr } = await studentClient.rpc("lecturer_dashboard_stats");
+    record(
+      "w1. student lecturer_dashboard_stats() FAILS (not a lecturer)",
+      Boolean(studentStatsErr) && !studentStatsData,
+      studentStatsErr?.message ?? "no error raised — SECURITY: student read lecturer analytics",
+    );
+
+    // w2. lecturer calling lecturer_dashboard_stats() succeeds and returns
+    // the expected top-level jsonb keys.
+    const { data: lecturerStats, error: lecturerStatsErr } = await lecturerClient.rpc("lecturer_dashboard_stats");
+    const hasExpectedShape =
+      !!lecturerStats &&
+      "exams_by_status" in lecturerStats &&
+      "attempts_by_status" in lecturerStats &&
+      "flags_by_severity" in lecturerStats &&
+      "score_distribution" in lecturerStats;
+    record(
+      "w2. lecturer lecturer_dashboard_stats() succeeds with expected shape",
+      !lecturerStatsErr && hasExpectedShape,
+      lecturerStatsErr?.message ?? JSON.stringify(lecturerStats),
+    );
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the

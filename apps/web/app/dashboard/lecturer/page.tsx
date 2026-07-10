@@ -3,11 +3,26 @@ import { BookOpen, FileSpreadsheet, FileText, Users } from "lucide-react";
 
 import { DashboardShell } from "@/components/dashboard-shell";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { LecturerAnalyticsSection } from "@/components/lecturer/lecturer-analytics-section";
+import { createClient } from "@/lib/supabase/server";
+import type { LecturerDashboardStats } from "@/lib/supabase/types";
 
-export default function LecturerDashboard() {
+export default async function LecturerDashboard() {
+  const supabase = await createClient();
+  let stats: LecturerDashboardStats | null = null;
+  if (supabase) {
+    const { data } = await supabase.rpc("lecturer_dashboard_stats");
+    stats = (data as LecturerDashboardStats | null) ?? null;
+  }
+
   return (
     <div>
-      <div className="mx-auto grid max-w-6xl gap-4 px-4 pt-10 sm:grid-cols-2 sm:px-6 lg:grid-cols-3">
+      {stats ? (
+        <div className="pt-10">
+          <LecturerAnalyticsSection stats={stats} />
+        </div>
+      ) : null}
+      <div className="mx-auto grid max-w-6xl gap-4 px-4 pt-6 first:pt-10 sm:grid-cols-2 sm:px-6 lg:grid-cols-3">
         <Link href="/dashboard/lecturer/classes" className="block">
           <Card className="hover:bg-muted/50 h-full transition-colors">
             <CardHeader>

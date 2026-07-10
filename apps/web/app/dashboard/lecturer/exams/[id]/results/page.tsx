@@ -8,6 +8,8 @@ import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { Button } from "@/components/ui/button";
 import { ExamResultsTable } from "@/components/exams/exam-results-table";
 import { ReleaseResultsButton } from "@/components/exams/release-results-button";
+import { BarChartCard } from "@/components/charts/bar-chart-card";
+import { bucketScoreDistribution } from "@/lib/exams/score-distribution";
 import type { ExamRow } from "@/lib/supabase/types";
 
 const RELEASE_LABEL: Record<string, string> = {
@@ -65,6 +67,16 @@ export default async function ExamResultsPage({ params }: { params: Promise<{ id
           </Button>
         </div>
       </header>
+
+      {rows && rows.length > 0 ? (
+        <BarChartCard
+          title="Score distribution"
+          description="Fully-graded attempts, bucketed by percentage of max score."
+          data={bucketScoreDistribution(rows)}
+          valueLabel="Attempts"
+          emptyMessage="No fully-graded attempts yet."
+        />
+      ) : null}
 
       <section aria-labelledby="attempts-heading" className="space-y-4">
         <h2 id="attempts-heading" className="text-lg font-semibold tracking-tight">

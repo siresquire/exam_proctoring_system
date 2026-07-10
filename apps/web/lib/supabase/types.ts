@@ -1081,6 +1081,18 @@ export interface Database {
           has_report: boolean;
         }[];
       };
+      lecturer_dashboard_stats: {
+        // Analytics phase: lecturer dashboard aggregates, strictly owner-
+        // scoped (owner_id = auth.uid() on exams). Re-derives has_role
+        // itself; raises for a non-lecturer caller.
+        Args: Record<string, never>;
+        Returns: {
+          exams_by_status: Record<string, number>;
+          attempts_by_status: Record<string, number>;
+          flags_by_severity: Record<string, number>;
+          score_distribution: Record<string, number>;
+        };
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -1122,5 +1134,6 @@ export type SubmitAttemptResult = Database["public"]["Functions"]["submit_exam_a
 export type AttemptResult = Database["public"]["Functions"]["get_attempt_result"]["Returns"];
 export type AttemptResultQuestion = NonNullable<AttemptResult["per_question"]>[number];
 export type ExamResultRow = Database["public"]["Functions"]["exam_results"]["Returns"][number];
+export type LecturerDashboardStats = Database["public"]["Functions"]["lecturer_dashboard_stats"]["Returns"];
 export type AttemptGradingDetail = Database["public"]["Functions"]["get_attempt_for_grading"]["Returns"];
 export type AttemptGradingQuestion = AttemptGradingDetail["per_question"][number];
