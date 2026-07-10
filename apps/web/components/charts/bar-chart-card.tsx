@@ -6,6 +6,7 @@ import { Bar, BarChart, CartesianGrid, LabelList, XAxis } from "recharts";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { ChartDataTableToggle } from "@/components/charts/chart-data-table";
+import { truncateLabel } from "@/components/charts/truncate-label";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 
 export interface BarChartDatum {
@@ -49,6 +50,11 @@ export function BarChartCard({
     value: { label: valueLabel, color: "var(--chart-series-1)" },
   };
 
+  // More categories -> less width each, so the always-visible axis tick (see
+  // truncateLabel's comment) needs a tighter cap to avoid colliding with its
+  // neighbor. The full label is never lost either way — tooltip + table.
+  const tickMax = data.length >= 5 ? 8 : data.length === 4 ? 11 : 16;
+
   return (
     <Card>
       <CardHeader>
@@ -67,6 +73,7 @@ export function BarChartCard({
                 tickMargin={8}
                 interval={0}
                 tick={{ fontSize: 12 }}
+                tickFormatter={(value: string) => truncateLabel(value, tickMax)}
               />
               <ChartTooltip
                 cursor={{ fill: "var(--muted)" }}

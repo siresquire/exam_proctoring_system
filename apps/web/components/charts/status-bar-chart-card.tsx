@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { ChartDataTableToggle } from "@/components/charts/chart-data-table";
 import { STATUS_COLOR_VAR, STATUS_ICON, STATUS_LABEL, type ChartStatus } from "@/components/charts/chart-status";
+import { truncateLabel } from "@/components/charts/truncate-label";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 
 export interface StatusBarChartDatum {
@@ -50,6 +51,9 @@ export function StatusBarChartCard({
     value: { label: valueLabel, color: "var(--chart-status-good)" },
   };
 
+  // See BarChartCard's identical comment: tighter cap as category count grows.
+  const tickMax = data.length >= 5 ? 8 : data.length === 4 ? 11 : 16;
+
   return (
     <Card>
       <CardHeader>
@@ -69,6 +73,7 @@ export function StatusBarChartCard({
                   tickMargin={8}
                   interval={0}
                   tick={{ fontSize: 12 }}
+                  tickFormatter={(value: string) => truncateLabel(value, tickMax)}
                 />
                 <ChartTooltip
                   cursor={{ fill: "var(--muted)" }}
