@@ -25,13 +25,11 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "USTED Exam Proctoring",
   description: "Exam proctoring and anti-cheat platform for USTED.",
-  // Not swapping the favicon for the full AAMUSTED logo: it's a wide
-  // crest+wordmark lockup, and shrinking it to a 16-32px square (browser
-  // tab size) makes the wordmark illegible and the crest a smudge — cropping
-  // just the crest would need real image processing (this repo's only
-  // image-capable dependency, pngjs, decodes/encodes but doesn't resize or
-  // crop), which is out of scope for "trivial via Next metadata icons" per
-  // the task brief. Keeping the default favicon.ico.
+  // Favicon + Apple icon: the USTED crest (just the emblem, no wordmark —
+  // a manually-cropped square version of the logo) lives at
+  // app/icon.png and app/apple-icon.png, which Next auto-detects and links.
+  // The crest reads clearly at tab size; the full crest+wordmark lockup
+  // (public/aamusted-logo.png) is still used in the header where there's room.
 };
 
 export default function RootLayout({
