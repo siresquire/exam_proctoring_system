@@ -6,6 +6,7 @@ import { Download, RefreshCw, Trash2, UserPlus } from "lucide-react";
 
 import { regenerateStudentPassword, removeStudentFromClass } from "@/app/dashboard/lecturer/classes/actions";
 import { Breadcrumbs } from "@/components/layout/breadcrumbs";
+import { AddStudentDialog } from "@/components/onboarding/add-student-dialog";
 import { RosterImportDialog } from "@/components/onboarding/roster-import-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,6 +40,7 @@ interface ClassDetailProps {
 export function ClassDetail({ klass, roster }: ClassDetailProps) {
   const router = useRouter();
   const [importOpen, setImportOpen] = React.useState(false);
+  const [addOpen, setAddOpen] = React.useState(false);
   // studentId -> freshly generated password, shown once until the next
   // page refresh/navigation clears this state.
   const [freshPasswords, setFreshPasswords] = React.useState<Record<string, string>>({});
@@ -123,6 +125,10 @@ export function ClassDetail({ klass, roster }: ClassDetailProps) {
             <Download aria-hidden />
             Export roster (CSV)
           </Button>
+          <Button variant="outline" onClick={() => setAddOpen(true)}>
+            <UserPlus aria-hidden />
+            Add student
+          </Button>
           <Button onClick={() => setImportOpen(true)}>
             <UserPlus aria-hidden />
             Import students (CSV)
@@ -143,7 +149,8 @@ export function ClassDetail({ klass, roster }: ClassDetailProps) {
         <CardContent>
           {roster.length === 0 ? (
             <p className="text-muted-foreground text-sm">
-              No students yet. Use &quot;Import students (CSV)&quot; to add some.
+              No students yet. Use &quot;Add student&quot; for one at a time, or &quot;Import students
+              (CSV)&quot; for a roster.
             </p>
           ) : (
             <Table>
@@ -217,6 +224,19 @@ export function ClassDetail({ klass, roster }: ClassDetailProps) {
             }
             return next;
           });
+          router.refresh();
+        }}
+      />
+
+      <AddStudentDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        classId={klass.id}
+        className={klass.name}
+        onAdded={({ studentId, tempPassword }) => {
+          if (tempPassword) {
+            setFreshPasswords((prev) => ({ ...prev, [studentId]: tempPassword }));
+          }
           router.refresh();
         }}
       />

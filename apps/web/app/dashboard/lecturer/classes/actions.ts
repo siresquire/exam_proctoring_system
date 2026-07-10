@@ -163,6 +163,97 @@ export async function commitRosterImport(classId: string, csvText: string): Prom
   return { imported, skipped };
 }
 
+const INDEX_NUMBER_PATTERN = /^\d{10}$/;
+
+export interface AddStudentFieldErrors {
+  fullName?: string;
+  indexNumber?: string;
+}
+
+export interface AddStudentResult {
+  error?: string;
+  fieldErrors?: AddStudentFieldErrors;
+  studentId?: string;
+  fullName?: string;
+  indexNumber?: string;
+  /** True only when this call created a brand-new auth account. */
+  created?: boolean;
+  /** True when the student was already on this class's roster before this call (no-op). */
+  alreadyEnrolled?: boolean;
+  /** Set ONLY when `created` is true — see createOrFindStudent's doc comment on why it can never be recovered afterward. */
+  tempPassword?: string | null;
+}
+
+/**
+ * Adds a single student to a class from the UI (the non-CSV path next to
+ * "Import students (CSV)"). Deliberately reuses the exact same primitives as
+ * commitRosterImport above, just for one row instead of a parsed file:
+ * requireRole gates the caller the same way, createOrFindStudent does the
+ * identical create-or-find + temp-password + must_change_password work, and
+ * enroll_existing_student is the same idempotent RPC — so this path can
+ * never be looser than the CSV importer's security posture.
+ */
+export async function addStudentToClass(
+  classId: string,
+  input: { fullName: string; indexNumber: string; phone?: string | null },
+): Promise<AddStudentResult> {
+  await requireRole("lecturer", "admin");
+
+  const fullName = input.fullName.trim();
+  const indexNumber = input.indexNumber.trim();
+  const phone = input.phone?.trim() || null;
+
+  const fieldErrors: AddStudentFieldErrors = {};
+  if (!fullName) {
+    fieldErrors.fullName = "Full name is required.";
+  }
+  if (!INDEX_NUMBER_PATTERN.test(indexNumber)) {
+    fieldErrors.indexNumber = "Index number must be exactly 10 digits.";
+  }
+  if (Object.keys(fieldErrors).length > 0) {
+    return { fieldErrors };
+  }
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  // Same "is this index already on the roster" check commitRosterImport
+  // does before importing, so the UI can tell "existing account, freshly
+  // enrolled" apart from "was already enrolled here — nothing changed".
+  const { data: roster, error: rosterError } = await supabase.rpc("class_roster", { class_id: classId });
+  if (rosterError) {
+    return { error: rosterError.message };
+  }
+  const wasAlreadyEnrolled = ((roster ?? []) as ClassRosterRow[]).some((r) => r.student_number === indexNumber);
+
+  const result = await createOrFindStudent({ fullName, indexNumber, phone });
+  if (!result.ok) {
+    return { error: result.error };
+  }
+
+  const { error: enrollError } = await supabase.rpc("enroll_existing_student", {
+    class_id: classId,
+    student_id: result.studentId,
+  });
+  if (enrollError) {
+    return { error: enrollError.message };
+  }
+
+  revalidatePath(CLASSES_PATH);
+  revalidatePath(`${CLASSES_PATH}/${classId}`);
+
+  return {
+    studentId: result.studentId,
+    fullName,
+    indexNumber,
+    created: result.created,
+    alreadyEnrolled: wasAlreadyEnrolled,
+    tempPassword: result.created ? result.tempPassword : null,
+  };
+}
+
 export interface RegeneratePasswordResult {
   error?: string;
   tempPassword?: string;

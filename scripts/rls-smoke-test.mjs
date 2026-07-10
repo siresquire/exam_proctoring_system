@@ -2685,6 +2685,75 @@ async function main() {
       }
     }
 
+    // q13. Single-student "Add student" flow (addStudentToClass in
+    // app/dashboard/lecturer/classes/actions.ts, the non-CSV path next to
+    // "Import students (CSV)"). It is built entirely from primitives already
+    // exercised above — requireRole("lecturer", "admin"), createOrFindStudent,
+    // and this same enroll_existing_student RPC — so its security floor is
+    // q5a's non-manager rejection, reasserted here framed as the single-add
+    // path. What's new to actually assert: the DB-level backstop (CHECK
+    // profiles_student_number_format, 20260705000002) behind the server
+    // action's own ^\d{10}$ regex check, and that adding an ALREADY-KNOWN
+    // index number enrolls without creating a duplicate class_members row
+    // (the "existing student enrolled, no-op if already enrolled" outcome).
+    if (classId) {
+      const { error: nonManagerEnrollErr } = await studentClient.rpc("enroll_existing_student", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      record(
+        "q13a. non-manager (student) cannot add/enroll a student via the single-add path's RPC",
+        Boolean(nonManagerEnrollErr),
+        nonManagerEnrollErr?.message ??
+          "no error raised — SECURITY: a non-manager added a student to a class",
+      );
+
+      const { error: badIndexErr } = await admin
+        .from("profiles")
+        .update({ student_number: "520104084" })
+        .eq("id", studentId);
+      record(
+        "q13b. a 9-digit index number is rejected by the DB CHECK constraint (backstop behind the form's 10-digit validation)",
+        Boolean(badIndexErr),
+        badIndexErr?.message ?? "no error raised — SECURITY: a 9-digit index number was accepted",
+      );
+      // Restore the seeded student's real index number regardless of outcome.
+      await admin.from("profiles").update({ student_number: "5201040845" }).eq("id", studentId);
+
+      const { error: singleAddEnrollErr } = await lecturerClient.rpc("enroll_existing_student", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      record(
+        "q13c. single-add of an already-known index number enrolls the existing account",
+        !singleAddEnrollErr,
+        singleAddEnrollErr?.message,
+      );
+
+      const { error: singleAddReEnrollErr } = await lecturerClient.rpc("enroll_existing_student", {
+        class_id: classId,
+        student_id: studentId,
+      });
+      const { data: singleAddMemberRows, error: singleAddMemberRowsErr } = await admin
+        .from("class_members")
+        .select("*")
+        .eq("class_id", classId)
+        .eq("student_id", studentId);
+      record(
+        "q13d. re-adding the same index number is a no-op — exactly one class_members row (no duplicate)",
+        !singleAddReEnrollErr && !singleAddMemberRowsErr && singleAddMemberRows?.length === 1,
+        singleAddReEnrollErr?.message ?? singleAddMemberRowsErr?.message ?? `rows=${singleAddMemberRows?.length}`,
+      );
+
+      // Cleanup this sub-block's enrollment before the class itself is deleted below.
+      await lecturerClient.rpc("remove_class_member", { class_id: classId, student_id: studentId });
+    } else {
+      record("q13a. non-manager (student) cannot add/enroll a student via the single-add path's RPC", false, "skipped — q2 failed");
+      record("q13b. a 9-digit index number is rejected by the DB CHECK constraint (backstop behind the form's 10-digit validation)", false, "skipped — q2 failed");
+      record("q13c. single-add of an already-known index number enrolls the existing account", false, "skipped — q2 failed");
+      record("q13d. re-adding the same index number is a no-op — exactly one class_members row (no duplicate)", false, "skipped — q2 failed");
+    }
+
     // Cleanup: delete everything this block created (service role bypasses RLS).
     if (classId) {
       await admin.from("classes").delete().eq("id", classId);
