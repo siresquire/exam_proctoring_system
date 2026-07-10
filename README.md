@@ -347,9 +347,9 @@ sets it for `student@usted.test` only — staff profiles stay `NULL`.
 
 ### Branding & accessibility extras (Phase 1.5)
 
-- AAMUSTED's crest+wordmark (`apps/web/public/aamusted-logo.png`) is in the
+- USTED's crest+wordmark (`apps/web/public/aamusted-logo.png`) is in the
   site header (~40px), and larger on `/login` and the home page, each with a
-  descriptive `alt`. The home page footer credits AAMUSTED. The favicon was
+  descriptive `alt`. The home page footer credits USTED. The favicon was
   **not** replaced — see the comment in `apps/web/app/layout.tsx`'s
   `metadata` for why (the full logo doesn't survive being shrunk to a
   16–32px square; cropping just the crest needs real image processing this

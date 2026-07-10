@@ -48,13 +48,13 @@ const LECTURER_TOOL_CARDS = [
   {
     href: "/dashboard/lecturer/forms-exams",
     icon: FileSpreadsheet,
-    title: "Google Forms quizzes (System 1)",
+    title: "Google Forms quizzes",
     description: "Attach proctoring to an existing Google Form.",
   },
   {
     href: "/dashboard/lecturer/exams",
     icon: FileText,
-    title: "Exams (System 2)",
+    title: "Exams",
     description: "Build and schedule exams from question banks.",
   },
 ];

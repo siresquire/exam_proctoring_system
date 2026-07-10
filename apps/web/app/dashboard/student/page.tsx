@@ -52,8 +52,13 @@ export default async function StudentDashboard() {
       </div>
       <DashboardShell
         title="Student Dashboard"
-        description="Upcoming exams, past results, and appeals. Placeholder shell — wired up in later phases."
-        cards={[{ title: "Appeals", description: "Submit or track an appeal on a proctoring verdict." }]}
+        description="Upcoming exams, past results, and appeals."
+        cards={[
+          {
+            title: "Appeals",
+            description: "Submit or track an appeal on a proctoring verdict. Coming soon.",
+          },
+        ]}
       />
     </div>
   );

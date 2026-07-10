@@ -15,9 +15,9 @@ export default async function ProctorDemoPage() {
       <header className="mb-8">
         <h1 className="text-2xl font-semibold tracking-tight">Proctoring demo</h1>
         <p className="text-muted-foreground mt-2 max-w-2xl">
-          Live walkthrough of the proctoring engine shared by the Google Forms wrapper and the
-          platform exam room. See README.md &quot;Proctoring engine &amp; demo&quot; for details on
-          each signal.
+          Try out the proctoring checks used across Google Forms quizzes and platform exams. This
+          is a practice run — nothing here is graded, and the sections below explain what each
+          signal means.
         </p>
       </header>
       <ProctorDemo fullName={profile.full_name} />

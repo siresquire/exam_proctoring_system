@@ -514,7 +514,7 @@ function EssayBodyEditor({
     <Card>
       <CardHeader>
         <CardTitle className="text-base">Grading rubric</CardTitle>
-        <CardDescription>Essays are always manually graded (Phase 3d).</CardDescription>
+        <CardDescription>Essays are always manually graded.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-2">

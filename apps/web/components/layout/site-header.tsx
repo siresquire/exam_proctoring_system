@@ -34,7 +34,7 @@ export async function SiteHeader() {
         >
           <Image
             src="/aamusted-logo.png"
-            alt="AAMUSTED — University of Skills Training and Entrepreneurial Development"
+            alt="USTED — University of Skills Training and Entrepreneurial Development"
             width={160}
             height={46}
             className="h-10 w-auto"

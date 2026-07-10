@@ -11,7 +11,7 @@ export const TIER_LABELS: Record<number, string> = {
   1: "T1 — Quiz (any device, server-side checks only, no camera)",
   2: "T2 — Monitored (webcam + environment signals)",
   3: "T3 — Proctored (adds fullscreen lock + tab/app-switch detection)",
-  4: "T4 — High stakes (desktop + Safe Exam Browser, not yet wired up here)",
+  4: "T4 — High stakes (desktop + Safe Exam Browser — coming soon)",
 };
 
 export const RESULTS_RELEASE_LABELS: Record<ExamResultsRelease, string> = {

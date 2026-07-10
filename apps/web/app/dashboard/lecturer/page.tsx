@@ -41,7 +41,7 @@ export default function LecturerDashboard() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <FileSpreadsheet aria-hidden className="text-primary" />
-                Google Forms quizzes (System 1)
+                Google Forms quizzes
               </CardTitle>
               <CardDescription>
                 Attach proctoring to an existing Google Form. Available now — no need to wait for
@@ -55,7 +55,7 @@ export default function LecturerDashboard() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <FileText aria-hidden className="text-primary" />
-                Exams (System 2)
+                Exams
               </CardTitle>
               <CardDescription>
                 Build exams from sections and question banks — fixed picks or randomized N-from-pool
@@ -67,11 +67,11 @@ export default function LecturerDashboard() {
       </div>
       <DashboardShell
         title="Lecturer Dashboard"
-        description="Schedule exams and review proctoring flags for your classes. Placeholder shell — wired up in later phases."
+        description="Schedule exams and review proctoring flags for your classes."
         cards={[
           {
             title: "Live monitoring",
-            description: "Watch active exam sessions and respond to flags.",
+            description: "Watch active exam sessions and respond to flags. Coming soon.",
           },
         ]}
       />

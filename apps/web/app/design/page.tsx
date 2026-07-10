@@ -143,8 +143,8 @@ export default function DesignSystemPage() {
             <CardDescription>
               Use the &quot;Theme&quot; control in the header to switch. High-contrast swaps in pure
               black/white with heavier borders and a 3px focus ring, rather than just inverting dark
-              mode. Brand colors (AAMUSTED maroon/gold/green — docs/DESIGN.md §1) carry across all
-              three themes, each pair re-verified to clear 4.5:1 contrast.
+              mode. Brand colors (USTED maroon/gold/green) carry across all three themes, each pair
+              re-verified to clear 4.5:1 contrast.
             </CardDescription>
           </CardHeader>
         </Card>

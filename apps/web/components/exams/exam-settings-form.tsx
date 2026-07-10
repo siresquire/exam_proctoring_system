@@ -140,7 +140,7 @@ export function ExamSettingsForm({ exam, classes, onSaved }: ExamSettingsFormPro
               ))}
             </select>
             <p className="text-muted-foreground text-sm">
-              Only students enrolled in this class can see and (in Phase 3d) take this exam.
+              Only students enrolled in this class can see and take this exam.
             </p>
           </div>
           <div className="grid gap-4 sm:grid-cols-3">

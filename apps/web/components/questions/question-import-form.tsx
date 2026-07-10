@@ -48,7 +48,7 @@ const FORMAT_TEMPLATES: Record<ImportFormat, string> = {
 const FORMAT_HELP: Record<ImportFormat, string> = {
   csv: "Columns: type, prompt, options, correct, difficulty, tags, marks, category. options/accepted answers are pipe- or semicolon-separated; correct is a 1-based index or letter for MCQ.",
   aiken: 'Classic Aiken MCQ format: a prompt line, "A. option" lines, then "ANSWER: A". Every item becomes single-answer multiple choice.',
-  gift: "A subset of Moodle GIFT: multiple choice ({=correct ~wrong}), true/false ({TRUE}/{FALSE}), short answer ({=ans1 =ans2}), numeric ({#answer:tolerance}). Per-option weights and empty {} essay items are rejected, not silently imported — see the README for the full supported/unsupported list.",
+  gift: "A subset of Moodle GIFT: multiple choice ({=correct ~wrong}), true/false ({TRUE}/{FALSE}), short answer ({=ans1 =ans2}), numeric ({#answer:tolerance}). Per-option weights and empty {} essay items are rejected, not silently imported.",
 };
 
 type Step = "input" | "preview" | "done";

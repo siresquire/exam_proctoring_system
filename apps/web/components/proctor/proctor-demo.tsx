@@ -440,8 +440,8 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
         <CardHeader>
           <CardTitle className="text-xl">What this demo shows</CardTitle>
           <CardDescription>
-            A training surface for the proctoring engine that will run inside real exams (Phase 2
-            Forms wrapper and Phase 4 exam room). Nothing here is graded.
+            A practice run of the same proctoring checks used in real Google Forms quizzes and
+            platform exams. Nothing here is graded.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

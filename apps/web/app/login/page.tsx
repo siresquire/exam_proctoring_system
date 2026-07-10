@@ -24,7 +24,7 @@ export default async function LoginPage() {
     <div className="mx-auto flex max-w-md flex-col px-4 py-16 sm:px-6">
       <Image
         src="/aamusted-logo.png"
-        alt="AAMUSTED — University of Skills Training and Entrepreneurial Development"
+        alt="USTED — University of Skills Training and Entrepreneurial Development"
         width={400}
         height={116}
         className="mx-auto mb-8 h-auto w-full max-w-xs"
@@ -67,12 +67,8 @@ function NotConfigured() {
         Sign-in is not configured yet
       </p>
       <p className="mt-2">
-        This deployment is not connected to a Supabase project. If you are the developer, copy{" "}
-        <code className="font-mono">apps/web/.env.example</code> to{" "}
-        <code className="font-mono">.env.local</code> and fill in{" "}
-        <code className="font-mono">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
-        <code className="font-mono">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> — see the &ldquo;Supabase
-        setup&rdquo; section of the README.
+        This site is not yet connected to an account system. Please check back later or contact
+        your administrator.
       </p>
     </div>
   );

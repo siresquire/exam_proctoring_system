@@ -86,8 +86,8 @@ export function FormsBypassDetectionPanel({
         <CardDescription>
           Detects students who open the raw Google Form link instead of the proctored wrapper.
           Install a small Apps Script on your form that reports every submission back here for
-          cross-checking — see <code>apps-script/README.md</code> in the project repository for
-          step-by-step instructions.
+          cross-checking — generate a secret below, then paste the values into the script using
+          the field names shown.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

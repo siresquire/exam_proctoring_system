@@ -25,7 +25,7 @@ export default function Home() {
       <section className="flex-1">
         <Image
           src="/aamusted-logo.png"
-          alt="AAMUSTED — University of Skills Training and Entrepreneurial Development"
+          alt="USTED — University of Skills Training and Entrepreneurial Development"
           width={480}
           height={139}
           className="mb-6 h-auto w-full max-w-md"
@@ -34,7 +34,7 @@ export default function Home() {
         <h1 className="text-3xl font-semibold tracking-tight">USTED Exam Proctoring</h1>
         <p className="text-muted-foreground mt-3 max-w-2xl text-lg">
           A proctored exam platform built on evidence and human review, not automated punishment.
-          Pick a role below to preview its dashboard shell.
+          Pick a role below to see its dashboard.
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <Button asChild>
@@ -58,9 +58,8 @@ export default function Home() {
 
       <footer className="text-muted-foreground mt-16 border-t pt-6 text-sm">
         <p>
-          Built for AAMUSTED — the University of Skills Training and Entrepreneurial Development.
-          The AAMUSTED name and crest are used with attribution to identify the institution this
-          platform serves.
+          USTED — University of Skills Training and Entrepreneurial Development. Secure, fair exams
+          for every student and lecturer on campus.
         </p>
       </footer>
     </div>
