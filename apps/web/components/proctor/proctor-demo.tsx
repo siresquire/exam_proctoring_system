@@ -36,10 +36,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { createClient } from "@/lib/supabase/client";
-import {
-  createSupabaseStorageAdapter,
-  createSupabaseTransportAdapter,
-} from "@/lib/proctor/supabase-adapters";
+import { createSupabaseTransportAdapter } from "@/lib/proctor/supabase-adapters";
+import { createProctorStorageAdapter, uploadIdentityPortrait } from "@/lib/proctor/storage-adapter";
 import { createMediaPipeFaceDetectorAdapter } from "@/lib/proctor/face-detector";
 import { notify } from "@/lib/notify";
 
@@ -154,7 +152,7 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
     if (!blob) return;
 
     const capturedAt = new Date().toISOString();
-    const storage = createSupabaseStorageAdapter(supabase);
+    const storage = createProctorStorageAdapter(supabase);
     try {
       await storage.uploadSnapshot(sessionId, blob, { capturedAt, mimeType: "image/jpeg" });
       const url = URL.createObjectURL(blob);
@@ -254,14 +252,11 @@ export function ProctorDemo({ fullName }: ProctorDemoProps) {
       return;
     }
 
-    // Upload the identity portrait under {session_id}/... (storage RLS
-    // requires an active session owned by the caller) then link it.
+    // Upload the identity portrait under {session_id}/... (storage RLS, or
+    // its R2-presign equivalent, requires an active session owned by the
+    // caller) then link it.
     try {
-      const path = `${sessionId}/identity-${Date.now()}.jpg`;
-      const { error: uploadError } = await supabase.storage
-        .from("proctoring")
-        .upload(path, result.portraitBlob, { contentType: "image/jpeg", upsert: false });
-      if (uploadError) throw uploadError;
+      const path = await uploadIdentityPortrait(supabase, sessionId, result.portraitBlob);
 
       const { error: attachError } = await supabase.rpc("attach_identity_portrait", {
         session_id: sessionId,

@@ -500,6 +500,91 @@ These are exactly what **Tier 4 + Safe Exam Browser** (Phase 6) exists for;
 in-browser we catch only their side effects (focus flapping, display changes),
 and the webcam/face layer covers the rest.
 
+### Cloudflare R2 storage (optional, env-gated)
+
+Proctoring media (webcam snapshots + identity portraits) uses **Supabase
+Storage by default**, unchanged. Cloudflare R2 (10GB free, zero egress —
+PLAN.md §1) is available as an **opt-in alternative**, fully dormant until
+explicitly turned on:
+
+- **Provider selection**: `NEXT_PUBLIC_STORAGE_PROVIDER` (public, non-secret —
+  it only picks a code path, never a credential). Empty or anything other
+  than `"r2"` = Supabase Storage, exactly as today. `"r2"` = Cloudflare R2.
+  `apps/web/lib/proctor/storage-adapter.ts`'s `createProctorStorageAdapter()`
+  factory branches on this flag; `getStorageProvider()` reads it once.
+- **The R2 secret never reaches the browser.** `apps/web/lib/storage/r2.ts`
+  holds `R2_SECRET_ACCESS_KEY` server-only (a `typeof window` runtime guard
+  throws if it's ever imported into client code, mirroring
+  `lib/supabase/admin.ts`'s pattern) and only ever hands the browser a
+  short-lived **presigned URL**, signed with `aws4fetch` (SigV4 query
+  signing — R2 is S3-API-compatible). The browser does a plain `fetch(url,
+  { method: 'PUT' | 'GET' })` against that URL; it never sees the key/secret.
+- **Two server actions re-derive the Storage RLS by hand**
+  (`apps/web/lib/proctor/storage-actions.ts`) — R2 has no RLS of its own, so
+  these two functions ARE the entire security boundary once R2 is active:
+  - `presignMediaUpload(sessionId, ext, contentType)`: mirrors the
+    `proctoring_insert_own_active_session` policy
+    (`20260704000007_proctor_rls_and_storage.sql`) — the caller must own
+    `sessionId` **and** that session must be `status = 'active'`, checked via
+    the caller's cookie-bound Supabase client (`supabase.auth.getUser()` +
+    a `proctor_sessions` row lookup). The object key
+    (`${sessionId}/${randomUUID()}.${ext}`) is generated **server-side**,
+    never trusted from the client, enforcing the same `{session_id}/...`
+    prefix the SQL policy's `storage.foldername(name))[1]` check requires.
+  - `presignMediaRead(storagePath)`: mirrors
+    `proctoring_select_own`/`proctoring_select_lecturer_or_higher` combined —
+    the session owner, or anyone for whom `has_role('lecturer')` is true
+    (called via the same `has_role` RPC the SQL policies use — note this is
+    an **exact** role match plus super_admin's universal pass, not "admin or
+    higher", exactly like the SQL).
+- **Identity portraits and snapshots both** route through this same
+  provider-agnostic layer (`uploadIdentityPortrait()` and
+  `createProctorStorageAdapter().uploadSnapshot()`); `record_proctor_media`
+  and `attach_identity_portrait` are unchanged RPCs either way — they just
+  store whichever `storage_path`/key they're given.
+
+**Enabling R2** (owner's activation steps — cannot be tested end-to-end until
+real credentials exist, so this is the exact runbook to follow once they do):
+
+1. In Vercel (Project Settings → Environment Variables), set:
+   `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`
+   (the bucket name, e.g. `usted-proctoring-media`), and
+   `NEXT_PUBLIC_STORAGE_PROVIDER=r2`. The R2 secret lives **only** in
+   Vercel's environment variables — never in a repo file, never in
+   `.env.local` on a shared machine.
+2. Add a **CORS policy** to the R2 bucket (Cloudflare dashboard → R2 → the
+   bucket → Settings → CORS Policy) — the browser's `fetch(url, { method:
+   'PUT' })`/`GET` calls need this or they fail with a CORS error:
+   ```json
+   [
+     {
+       "AllowedOrigins": ["https://usted-proctor.vercel.app"],
+       "AllowedMethods": ["GET", "PUT"],
+       "AllowedHeaders": ["*"],
+       "ExposeHeaders": [],
+       "MaxAgeSeconds": 3600
+     }
+   ]
+   ```
+   Replace the origin with the actual deployed URL (add both the production
+   domain and any preview-deployment domain you test against).
+3. Redeploy (env var changes require a new deployment to take effect).
+4. Verify: open `/proctor-demo`, go through consent → identity verification
+   (this uploads the portrait) → start a session and let it take a snapshot
+   (every 20s, or wait for the first one). Confirm:
+   - The object appears in the R2 bucket under `<session_id>/...` (Cloudflare
+     dashboard → R2 → the bucket → Objects).
+   - The in-page snapshot thumbnail still renders (it uses a local blob URL
+     for the just-captured frame, so this alone doesn't prove the read path —
+     but a failed `uploadSnapshot()` call logs `"Snapshot upload failed"` to
+     the browser console, so an absence of that error plus the object
+     appearing in the bucket together confirm the R2 upload path works).
+   - No console errors from `presignMediaUpload`/`presignMediaRead`.
+5. To roll back at any point: unset `NEXT_PUBLIC_STORAGE_PROVIDER` (or set it
+   to anything other than `"r2"`) and redeploy — the app returns to Supabase
+   Storage immediately, with zero data migration (existing R2 objects simply
+   stop being referenced by new uploads; nothing reads or writes them).
+
 ## System 1 — proctored Google Forms wrapper (Phase 2a)
 
 System 1 wraps an ordinary Google Form with the same proctoring engine used

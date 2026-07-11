@@ -11,9 +11,13 @@ import type { Database } from "@/lib/supabase/types";
 /**
  * apps/web's implementations of proctor-core's two adapter interfaces.
  * proctor-core itself never imports @supabase/supabase-js — these adapters
- * are the only place Supabase-specific code touches the proctoring engine,
- * so swapping storage for Cloudflare R2 later (PLAN.md §1) means writing a
- * new ProctorStorageAdapter here, not touching packages/proctor-core.
+ * are the only place Supabase-specific code touches the proctoring engine.
+ * This is the DEFAULT storage path, still used unchanged whenever
+ * `NEXT_PUBLIC_STORAGE_PROVIDER` isn't "r2" — see
+ * apps/web/lib/proctor/storage-adapter.ts's `createProctorStorageAdapter()`
+ * factory, which is what host components (proctor-demo.tsx, the exam room,
+ * forms-exam-wrapper.tsx) actually construct, and which branches to the
+ * Cloudflare R2 adapter (PLAN.md §1) only when that flag is set.
  */
 
 const PROCTORING_BUCKET = "proctoring";
@@ -38,13 +42,14 @@ export function createSupabaseTransportAdapter(
 }
 
 /**
- * LOCAL Supabase Storage for now (bucket 'proctoring', see
- * supabase/migrations/20260704000007_proctor_rls_and_storage.sql). To move
- * to Cloudflare R2 (10GB free, zero egress — PLAN.md §1): implement this
- * same interface against presigned R2 PUT URLs instead of
- * `supabase.storage.from(...).upload()`, and swap which adapter
- * `/proctor-demo` (and later the exam room) constructs. The engine and the
- * ProctorStorageAdapter *interface* never change.
+ * Supabase Storage (bucket 'proctoring', see
+ * supabase/migrations/20260704000007_proctor_rls_and_storage.sql) — the
+ * DEFAULT storage backend, used whenever `NEXT_PUBLIC_STORAGE_PROVIDER` is
+ * not "r2". The Cloudflare R2 alternative (PLAN.md §1) implements this same
+ * `ProctorStorageAdapter` interface against presigned R2 PUT URLs instead —
+ * see storage-adapter.ts's `createProctorStorageAdapter()` factory, which
+ * picks between the two. The engine and the ProctorStorageAdapter
+ * *interface* never change either way.
  */
 export function createSupabaseStorageAdapter(
   supabase: SupabaseClient<Database>,

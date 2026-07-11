@@ -27,10 +27,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { createClient } from "@/lib/supabase/client";
-import {
-  createSupabaseStorageAdapter,
-  createSupabaseTransportAdapter,
-} from "@/lib/proctor/supabase-adapters";
+import { createSupabaseTransportAdapter } from "@/lib/proctor/supabase-adapters";
+import { createProctorStorageAdapter, uploadIdentityPortrait } from "@/lib/proctor/storage-adapter";
 import { createMediaPipeFaceDetectorAdapter } from "@/lib/proctor/face-detector";
 import { notify } from "@/lib/notify";
 import type { FormsExamRow } from "@/lib/supabase/types";
@@ -161,7 +159,7 @@ export function FormsExamWrapper({ exam, fullName }: FormsExamWrapperProps) {
     if (!blob) return;
 
     const capturedAt = new Date().toISOString();
-    const storage = createSupabaseStorageAdapter(supabase);
+    const storage = createProctorStorageAdapter(supabase);
     try {
       await storage.uploadSnapshot(sessionId, blob, { capturedAt, mimeType: "image/jpeg" });
       const url = URL.createObjectURL(blob);
@@ -251,11 +249,7 @@ export function FormsExamWrapper({ exam, fullName }: FormsExamWrapperProps) {
       }
 
       try {
-        const path = `${sessionId}/identity-${Date.now()}.jpg`;
-        const { error: uploadError } = await supabase.storage
-          .from("proctoring")
-          .upload(path, result.portraitBlob, { contentType: "image/jpeg", upsert: false });
-        if (uploadError) throw uploadError;
+        const path = await uploadIdentityPortrait(supabase, sessionId, result.portraitBlob);
 
         const { error: attachError } = await supabase.rpc("attach_identity_portrait", {
           session_id: sessionId,

@@ -13,7 +13,8 @@ import { ExamRoom } from "@/components/exam-room/exam-room";
 import { EventFeed, type FeedEvent } from "@/components/proctor/event-feed";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { createMediaPipeFaceDetectorAdapter } from "@/lib/proctor/face-detector";
-import { createSupabaseStorageAdapter, createSupabaseTransportAdapter } from "@/lib/proctor/supabase-adapters";
+import { createSupabaseTransportAdapter } from "@/lib/proctor/supabase-adapters";
+import { createProctorStorageAdapter } from "@/lib/proctor/storage-adapter";
 import { notify } from "@/lib/notify";
 import { createClient } from "@/lib/supabase/client";
 import type { AttemptQuestions } from "@/lib/supabase/types";
@@ -87,7 +88,7 @@ export function ProctoredExamRoom({
     if (!blob) return;
 
     const capturedAt = new Date().toISOString();
-    const storage = createSupabaseStorageAdapter(supabase);
+    const storage = createProctorStorageAdapter(supabase);
     try {
       await storage.uploadSnapshot(proctorSessionId, blob, { capturedAt, mimeType: "image/jpeg" });
       const url = URL.createObjectURL(blob);
