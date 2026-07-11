@@ -10,6 +10,9 @@ export type Json = string | number | boolean | null | { [key: string]: Json | un
 
 export type UserRole = "super_admin" | "admin" | "lecturer" | "student";
 
+/** Phase 4: profiles.status — account lifecycle. active=normal; suspended=reversible disable; removed=soft delete (archived, blocked, records kept, reversible). Changed only via set_account_status(). See supabase/migrations/20260711000001_account_lifecycle.sql. */
+export type ProfileStatus = "active" | "suspended" | "removed";
+
 /** Phase 3b: questions.type — see supabase/migrations/20260705000010_question_banks.sql for the documented body jsonb shape per type. */
 export type QuestionTypeDb = "mcq_single" | "mcq_multi" | "true_false" | "numeric" | "short_answer" | "essay";
 export type QuestionDifficultyDb = "easy" | "medium" | "hard";
@@ -54,6 +57,8 @@ export interface Database {
           must_change_password: boolean;
           /** Phase 3a: optional contact number for the SMS onboarding adapter (lib/sms/). Light validation only. */
           phone: string | null;
+          /** Phase 4: account lifecycle status. Only changeable via set_account_status() — never a direct client PATCH, including by super_admin (profiles_guard_update's usted.allow_status_change GUC). */
+          status: ProfileStatus;
           created_at: string;
           updated_at: string;
         };
@@ -65,6 +70,7 @@ export interface Database {
           accommodations?: Json;
           must_change_password?: boolean;
           phone?: string | null;
+          status?: ProfileStatus;
           created_at?: string;
           updated_at?: string;
         };
@@ -76,6 +82,7 @@ export interface Database {
           accommodations?: Json;
           must_change_password?: boolean;
           phone?: string | null;
+          status?: ProfileStatus;
           created_at?: string;
           updated_at?: string;
         };
@@ -548,6 +555,15 @@ export interface Database {
         Args: { target: string; new_role: UserRole };
         Returns: undefined;
       };
+      set_account_status: {
+        // Phase 4: account lifecycle RPC. Enforces the full permission
+        // matrix server-side (super_admin -> admin/lecturer/student; admin
+        // -> lecturer/student; lecturer -> student ONLY if enrolled in a
+        // class the lecturer owns; nobody acts on self or an equal/higher
+        // role). Audit-logged. See 20260711000001_account_lifecycle.sql.
+        Args: { target_user_id: string; new_status: ProfileStatus };
+        Returns: undefined;
+      };
       start_proctor_session: {
         // Phase 1.5: gains claimed_index_number + attested. attested must be
         // true or the RPC raises (identity attestation gate); a mismatch
@@ -691,13 +707,16 @@ export interface Database {
       class_roster: {
         // Phase 3a: owner-or-lecturer-or-higher roster view with student
         // full_name/student_number/phone, for the class dashboard, roster
-        // export, and SMS send flow.
+        // export, and SMS send flow. Phase 4: gained `status` (account
+        // lifecycle) so the roster UI's suspend/reactivate/remove actions
+        // know each student's current state.
         Args: { class_id: string };
         Returns: {
           student_id: string;
           full_name: string | null;
           student_number: string | null;
           phone: string | null;
+          status: ProfileStatus;
           enrolled_at: string;
         }[];
       };

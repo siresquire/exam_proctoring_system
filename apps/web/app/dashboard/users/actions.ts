@@ -5,8 +5,9 @@ import { revalidatePath } from "next/cache";
 import { requireRole } from "@/lib/auth";
 import { createOrFindStaffUser } from "@/lib/onboarding/create-staff";
 import { createOrFindStudent } from "@/lib/onboarding/create-student";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
-import type { Json, UserRole } from "@/lib/supabase/types";
+import type { Json, ProfileStatus, UserRole } from "@/lib/supabase/types";
 
 const USERS_PATH = "/dashboard/users";
 
@@ -237,4 +238,103 @@ export async function createUserAccount(
     created: true,
     tempPassword: staffResult.tempPassword,
   };
+}
+
+const CLASSES_PATH = "/dashboard/lecturer/classes";
+
+/**
+ * Changes an account's lifecycle status (active/suspended/removed). Thin
+ * wrapper around the `set_account_status` RPC — the entire permission
+ * matrix (super_admin -> admin/lecturer/student; admin -> lecturer/student;
+ * lecturer -> student ONLY if enrolled in a class the lecturer owns; nobody
+ * acts on self or an equal/higher role) is enforced in Postgres
+ * (supabase/migrations/20260711000001_account_lifecycle.sql), NOT here —
+ * this function only gates "signed in as lecturer-or-higher" and
+ * revalidates the two pages that render account actions: the Users & roles
+ * table (admin/super_admin) and a lecturer's own class roster
+ * (components/onboarding/class-detail.tsx), which is why the allowed-roles
+ * list here is broader than this file's other admin-only actions.
+ */
+export async function setAccountStatus(
+  targetId: string,
+  newStatus: ProfileStatus,
+): Promise<ActionResult> {
+  await requireRole("lecturer", "admin", "super_admin");
+
+  const supabase = await createClient();
+  if (!supabase) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { error } = await supabase.rpc("set_account_status", {
+    target_user_id: targetId,
+    new_status: newStatus,
+  });
+  if (error) {
+    return { error: error.message };
+  }
+
+  revalidatePath(USERS_PATH);
+  revalidatePath(CLASSES_PATH);
+  return {};
+}
+
+/**
+ * Permanently (hard) deletes an account — super_admin only, and NOT
+ * offered for another super_admin or the caller's own account (mirrors
+ * set_account_status's "never self, never an equal/higher role" rule,
+ * re-checked here independently since this path never goes through that
+ * RPC). Audit-logged BEFORE the delete happens (via the service-role
+ * client's `log_audit` RPC — the only role log_audit grants EXECUTE to),
+ * so the record survives even though the target row it references is about
+ * to be gone. `admin.auth.admin.deleteUser` cascades: profiles (FK
+ * `references auth.users (id) on delete cascade`), and from there
+ * exam_attempts/class_members/proctor_sessions/etc. via their own FKs.
+ *
+ * Uses the service-role client throughout — deleting an auth.users row is
+ * an Admin API operation, not something any RLS-scoped client can do — but
+ * every check that decides WHETHER to delete (role gate, self/target
+ * checks) happens before the service-role client is ever touched.
+ */
+export async function permanentlyDeleteAccount(targetId: string): Promise<ActionResult> {
+  const session = await requireRole("super_admin");
+
+  if (targetId === session.user.id) {
+    return { error: "You cannot permanently delete your own account." };
+  }
+
+  const admin = createAdminClient();
+  if (!admin) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { data: target, error: targetError } = await admin
+    .from("profiles")
+    .select("role, full_name")
+    .eq("id", targetId)
+    .maybeSingle();
+  if (targetError || !target) {
+    return { error: "Account not found." };
+  }
+  if (target.role === "super_admin") {
+    return { error: "A super admin account cannot be permanently deleted." };
+  }
+
+  const { error: auditError } = await admin.rpc("log_audit", {
+    action: "permanently_delete_account",
+    target_type: "profile",
+    target_id: targetId,
+    metadata: { role: target.role, full_name: target.full_name },
+  });
+  if (auditError) {
+    return { error: `Could not record the audit entry — account was NOT deleted: ${auditError.message}` };
+  }
+
+  const { error: deleteError } = await admin.auth.admin.deleteUser(targetId);
+  if (deleteError) {
+    return { error: deleteError.message };
+  }
+
+  revalidatePath(USERS_PATH);
+  return {};
 }

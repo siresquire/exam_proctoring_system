@@ -123,6 +123,13 @@ async function getProfileRole(userId) {
   return data.role;
 }
 
+/** Phase 4: account lifecycle status ('active' | 'suspended' | 'removed'). */
+async function getProfileStatus(userId) {
+  const { data, error } = await admin.from("profiles").select("status").eq("id", userId).single();
+  if (error) throw error;
+  return data.status;
+}
+
 // --- main ----------------------------------------------------------------
 
 async function main() {
@@ -5509,6 +5516,372 @@ async function main() {
     );
     if (shortIndexUserId) {
       await admin.auth.admin.deleteUser(shortIndexUserId).catch(() => {});
+    }
+  }
+
+  // === (z) Phase 4: account lifecycle — status matrix =======================
+  // Covers the full permission matrix enforced by set_account_status
+  // (supabase/migrations/20260711000001_account_lifecycle.sql), mirroring
+  // set_user_role's escalation rules:
+  //   super_admin -> admin/lecturer/student   (not super_admin, not self)
+  //   admin       -> lecturer/student          (not admin/super_admin, not self)
+  //   lecturer    -> student ONLY, and ONLY a student enrolled in a class
+  //                  the lecturer OWNS                    (not self)
+  // Plus: the status column is gated behind its own usted.allow_status_change
+  // GUC (profiles_guard_update) so not even super_admin can direct-PATCH it;
+  // soft-remove ('removed') then reactivate ('active') round-trips; and
+  // class_roster() now surfaces `status` for the roster UI. The actual
+  // login/getSessionProfile BLOCK on a non-active account is an app-layer
+  // check this service-role/anon-key script cannot exercise directly (no
+  // Next.js session) — z14 only asserts the DB-level fact that block reads;
+  // the login round-trip itself is verified in the browser separately (see
+  // README.md "Verifying locally").
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const { client: adminClient } = sessions.admin;
+    const { client: superAdminClient } = sessions.super_admin;
+    const suffix = Date.now();
+
+    // z-setup: a class the lecturer owns with the seeded student enrolled,
+    // an "outsider" student the lecturer does NOT teach, a second admin
+    // account (so "admin cannot act on another admin" has a target that
+    // isn't the shared admin fixture used elsewhere in this suite), and a
+    // second super_admin account (same reason, for "super_admin cannot act
+    // on another super_admin" — this repo's seed data has exactly one).
+    const { data: zClassId, error: zClassErr } = await lecturerClient.rpc("create_class", {
+      name: `Smoke lifecycle class ${suffix}`,
+    });
+    record(
+      "z-setup1. lecturer create_class (lifecycle cohort) succeeds",
+      !zClassErr && typeof zClassId === "string",
+      zClassErr?.message,
+    );
+
+    if (zClassId) {
+      const { error: enrollErr } = await lecturerClient.rpc("enroll_existing_student", {
+        class_id: zClassId,
+        student_id: studentId,
+      });
+      record(
+        "z-setup2. lecturer enrolls the seeded student into the lifecycle class",
+        !enrollErr,
+        enrollErr?.message,
+      );
+    }
+
+    const outsiderEmail = `smoke-test-lifecycle-outsider-${suffix}@students.usted.local`;
+    const { data: outsiderUser, error: outsiderErr } = await admin.auth.admin.createUser({
+      email: outsiderEmail,
+      password: PASSWORD,
+      email_confirm: true,
+      user_metadata: { full_name: "Smoke Test Lifecycle Outsider" },
+    });
+    const outsiderId = outsiderUser?.user?.id;
+    record(
+      "z-setup3. outsider student account created (NOT enrolled in the lecturer's class)",
+      Boolean(outsiderId),
+      outsiderErr?.message ?? outsiderId,
+    );
+
+    const secondAdminEmail = `smoke-test-lifecycle-admin2-${suffix}@usted.test`;
+    const { data: secondAdminUser, error: secondAdminErr } = await admin.auth.admin.createUser({
+      email: secondAdminEmail,
+      password: PASSWORD,
+      email_confirm: true,
+      user_metadata: { full_name: "Smoke Test Lifecycle Second Admin" },
+    });
+    const secondAdminId = secondAdminUser?.user?.id;
+    if (secondAdminId) {
+      await superAdminClient.rpc("set_user_role", { target: secondAdminId, new_role: "admin" });
+    }
+    record("z-setup4. second admin account created", Boolean(secondAdminId), secondAdminErr?.message ?? secondAdminId);
+
+    const secondSuperAdminEmail = `smoke-test-lifecycle-superadmin2-${suffix}@usted.test`;
+    const { data: secondSuperAdminUser, error: secondSuperAdminErr } = await admin.auth.admin.createUser({
+      email: secondSuperAdminEmail,
+      password: PASSWORD,
+      email_confirm: true,
+      user_metadata: { full_name: "Smoke Test Lifecycle Second Super Admin" },
+    });
+    const secondSuperAdminId = secondSuperAdminUser?.user?.id;
+    if (secondSuperAdminId) {
+      await superAdminClient.rpc("set_user_role", { target: secondSuperAdminId, new_role: "super_admin" });
+    }
+    record(
+      "z-setup5. second super_admin account created",
+      Boolean(secondSuperAdminId),
+      secondSuperAdminErr?.message ?? secondSuperAdminId,
+    );
+
+    // z1. lecturer CAN suspend a student enrolled in a class they own.
+    if (zClassId) {
+      const { error: err } = await lecturerClient.rpc("set_account_status", {
+        target_user_id: studentId,
+        new_status: "suspended",
+      });
+      record("z1. lecturer set_account_status(suspend) on a student in their OWN class succeeds", !err, err?.message);
+
+      const status = await getProfileStatus(studentId);
+      record("z1b. seeded student's profiles.status is now 'suspended'", status === "suspended", `status=${status}`);
+    } else {
+      record("z1. lecturer set_account_status(suspend) on a student in their OWN class succeeds", false, "skipped — z-setup failed");
+      record("z1b. seeded student's profiles.status is now 'suspended'", false, "skipped — z-setup failed");
+    }
+
+    // z2. lecturer CANNOT suspend a student NOT enrolled in any class they own.
+    if (outsiderId) {
+      const { error: err } = await lecturerClient.rpc("set_account_status", {
+        target_user_id: outsiderId,
+        new_status: "suspended",
+      });
+      record(
+        "z2. lecturer set_account_status on a student NOT in their class FAILS",
+        Boolean(err),
+        err?.message ?? "no error raised — SECURITY: lecturer suspended a student outside their own class",
+      );
+    } else {
+      record("z2. lecturer set_account_status on a student NOT in their class FAILS", false, "skipped — z-setup failed");
+    }
+
+    // z3. lecturer CANNOT act on an admin/lecturer account — role check,
+    // independent of ownership.
+    {
+      const { error: err } = await lecturerClient.rpc("set_account_status", {
+        target_user_id: adminId,
+        new_status: "suspended",
+      });
+      record(
+        "z3. lecturer set_account_status on an admin account FAILS (role check)",
+        Boolean(err),
+        err?.message ?? "no error raised — SECURITY: a lecturer changed an admin's account status",
+      );
+    }
+
+    // z4. admin CAN suspend a lecturer.
+    {
+      const { error: err } = await adminClient.rpc("set_account_status", {
+        target_user_id: lecturerId,
+        new_status: "suspended",
+      });
+      record("z4. admin set_account_status(suspend) on a lecturer succeeds", !err, err?.message);
+    }
+
+    // z5. admin CAN suspend a student.
+    if (outsiderId) {
+      const { error: err } = await adminClient.rpc("set_account_status", {
+        target_user_id: outsiderId,
+        new_status: "suspended",
+      });
+      record("z5. admin set_account_status(suspend) on a student succeeds", !err, err?.message);
+    } else {
+      record("z5. admin set_account_status(suspend) on a student succeeds", false, "skipped — z-setup failed");
+    }
+
+    // z6. admin CANNOT act on ANOTHER admin.
+    if (secondAdminId) {
+      const { error: err } = await adminClient.rpc("set_account_status", {
+        target_user_id: secondAdminId,
+        new_status: "suspended",
+      });
+      record(
+        "z6. admin set_account_status on ANOTHER admin FAILS",
+        Boolean(err),
+        err?.message ?? "no error raised — SECURITY: an admin suspended another admin's account",
+      );
+    } else {
+      record("z6. admin set_account_status on ANOTHER admin FAILS", false, "skipped — z-setup failed");
+    }
+
+    // z7. admin CANNOT act on super_admin.
+    {
+      const { error: err } = await adminClient.rpc("set_account_status", {
+        target_user_id: superAdminId,
+        new_status: "suspended",
+      });
+      record(
+        "z7. admin set_account_status on super_admin FAILS",
+        Boolean(err),
+        err?.message ?? "no error raised — SECURITY: an admin suspended a super_admin's account",
+      );
+    }
+
+    // z8. super_admin CAN act on an admin, a lecturer, and a student —
+    // reactivating the lecturer/student back to 'active' here doubles as
+    // the "reversible" half of the suspend/reactivate round-trip for them.
+    if (secondAdminId) {
+      const { error: err } = await superAdminClient.rpc("set_account_status", {
+        target_user_id: secondAdminId,
+        new_status: "suspended",
+      });
+      record("z8a. super_admin set_account_status(suspend) on an admin succeeds", !err, err?.message);
+    } else {
+      record("z8a. super_admin set_account_status(suspend) on an admin succeeds", false, "skipped — z-setup failed");
+    }
+
+    {
+      const { error: err } = await superAdminClient.rpc("set_account_status", {
+        target_user_id: lecturerId,
+        new_status: "active",
+      });
+      record("z8b. super_admin set_account_status(reactivate) on a lecturer succeeds", !err, err?.message);
+    }
+
+    {
+      const { error: err } = await superAdminClient.rpc("set_account_status", {
+        target_user_id: studentId,
+        new_status: "active",
+      });
+      record("z8c. super_admin set_account_status(reactivate) on a student succeeds", !err, err?.message);
+    }
+
+    // z9. super_admin CANNOT act on ANOTHER super_admin.
+    if (secondSuperAdminId) {
+      const { error: err } = await superAdminClient.rpc("set_account_status", {
+        target_user_id: secondSuperAdminId,
+        new_status: "suspended",
+      });
+      record(
+        "z9. super_admin set_account_status on ANOTHER super_admin FAILS",
+        Boolean(err),
+        err?.message ?? "no error raised — SECURITY: a super_admin suspended another super_admin's account",
+      );
+    } else {
+      record("z9. super_admin set_account_status on ANOTHER super_admin FAILS", false, "skipped — z-setup failed");
+    }
+
+    // z10. NOBODY may act on themselves — every seeded role, own account.
+    for (const [role, { client, userId }] of Object.entries(sessions)) {
+      const { error: err } = await client.rpc("set_account_status", {
+        target_user_id: userId,
+        new_status: "suspended",
+      });
+      record(
+        `z10-${role}. ${role} set_account_status on THEIR OWN account FAILS`,
+        Boolean(err),
+        err?.message ?? `no error raised — SECURITY: ${role} changed their own account status`,
+      );
+    }
+
+    // z11. soft-remove ('removed') then reactivate ('active') round-trips.
+    if (outsiderId) {
+      const { error: removeErr } = await adminClient.rpc("set_account_status", {
+        target_user_id: outsiderId,
+        new_status: "removed",
+      });
+      record("z11a. admin set_account_status('removed') on a student succeeds", !removeErr, removeErr?.message);
+
+      const removedStatus = await getProfileStatus(outsiderId);
+      record(
+        "z11b. profiles.status is 'removed' after the soft-remove",
+        removedStatus === "removed",
+        `status=${removedStatus}`,
+      );
+
+      const { error: reactivateErr } = await adminClient.rpc("set_account_status", {
+        target_user_id: outsiderId,
+        new_status: "active",
+      });
+      record("z11c. admin set_account_status('active') reactivates a removed account", !reactivateErr, reactivateErr?.message);
+
+      const reactivatedStatus = await getProfileStatus(outsiderId);
+      record(
+        "z11d. profiles.status round-trips back to 'active'",
+        reactivatedStatus === "active",
+        `status=${reactivatedStatus}`,
+      );
+    } else {
+      record("z11a. admin set_account_status('removed') on a student succeeds", false, "skipped — z-setup failed");
+      record("z11b. profiles.status is 'removed' after the soft-remove", false, "skipped — z-setup failed");
+      record("z11c. admin set_account_status('active') reactivates a removed account", false, "skipped — z-setup failed");
+      record("z11d. profiles.status round-trips back to 'active'", false, "skipped — z-setup failed");
+    }
+
+    // z12. a direct client PATCH of profiles.status is rejected even for the
+    // row's own owner and even for super_admin — status is gated behind
+    // usted.allow_status_change (profiles_guard_update), exactly like
+    // usted.allow_role_change gates role: it may ONLY change via
+    // set_account_status.
+    {
+      // Must target a DIFFERENT value than the current one (studentId is
+      // 'active' at this point, after z8c) — the guard's `new.status IS
+      // DISTINCT FROM old.status` check (like every other guarded column)
+      // only fires on an actual change; a same-value "update" is a no-op
+      // that never reaches the check at all, which would make this
+      // assertion pass for the wrong reason.
+      const { error: selfPatchErr } = await studentClient
+        .from("profiles")
+        .update({ status: "suspended" })
+        .eq("id", studentId);
+      record(
+        "z12a. student direct UPDATE of their OWN profiles.status FAILS (must go through set_account_status)",
+        isDenied(selfPatchErr) || Boolean(selfPatchErr),
+        selfPatchErr?.message ?? "no error raised — SECURITY: a user changed their own account status via a direct PATCH",
+      );
+
+      const { error: superAdminPatchErr } = await superAdminClient
+        .from("profiles")
+        .update({ status: "suspended" })
+        .eq("id", studentId);
+      record(
+        "z12b. even super_admin direct UPDATE of profiles.status FAILS (outside the universal-role carve-out, same as must_change_password)",
+        isDenied(superAdminPatchErr) || Boolean(superAdminPatchErr),
+        superAdminPatchErr?.message ?? "no error raised — SECURITY: status is settable via a direct PATCH",
+      );
+    }
+
+    // z13. class_roster() now surfaces `status` for the lecturer's own
+    // class roster UI to gate its suspend/reactivate/remove actions.
+    if (zClassId) {
+      const { data: rosterRows, error: rosterErr } = await lecturerClient.rpc("class_roster", { class_id: zClassId });
+      const studentRow = (rosterRows ?? []).find((r) => r.student_id === studentId);
+      record(
+        "z13. class_roster() returns a `status` field reflecting the account's current lifecycle state",
+        !rosterErr && Boolean(studentRow) && studentRow.status === "active",
+        rosterErr?.message ?? `status=${studentRow?.status}`,
+      );
+    } else {
+      record("z13. class_roster() returns a `status` field reflecting the account's current lifecycle state", false, "skipped — z-setup failed");
+    }
+
+    // z14. the app-layer login/getSessionProfile block reads exactly this
+    // column — assert the DB-level fact it depends on (this script has no
+    // Next.js session to exercise the actual sign-in/redirect through; the
+    // login round-trip itself is verified in the browser, see README.md
+    // "Verifying locally").
+    {
+      const target = outsiderId ?? studentId;
+      const { error: suspendErr } = await adminClient.rpc("set_account_status", {
+        target_user_id: target,
+        new_status: "suspended",
+      });
+      const status = await getProfileStatus(target);
+      record(
+        "z14. a suspended profiles.status persists and is readable — the value the app-layer login/session block reads (browser-verified separately)",
+        !suspendErr && status === "suspended",
+        suspendErr?.message ?? `status=${status}`,
+      );
+      // restore to active so cleanup below doesn't have to special-case it
+      await adminClient.rpc("set_account_status", { target_user_id: target, new_status: "active" });
+    }
+
+    // Cleanup: delete the throwaway accounts + class this section created.
+    if (outsiderId) await admin.auth.admin.deleteUser(outsiderId).catch(() => {});
+    if (secondAdminId) await admin.auth.admin.deleteUser(secondAdminId).catch(() => {});
+    if (secondSuperAdminId) await admin.auth.admin.deleteUser(secondSuperAdminId).catch(() => {});
+    if (zClassId) await admin.from("classes").delete().eq("id", zClassId);
+
+    // Defensive: ensure the shared seeded fixtures end this section back at
+    // 'active' regardless of whether every step above ran to completion.
+    // super_admin can restore student/lecturer/admin (never its own row —
+    // but no assertion above ever successfully changes super_admin's own
+    // status, since the self-check always rejects that attempt first).
+    for (const role of ["student", "lecturer", "admin"]) {
+      const uid = sessions[role].userId;
+      const current = await getProfileStatus(uid);
+      if (current !== "active") {
+        await superAdminClient.rpc("set_account_status", { target_user_id: uid, new_status: "active" });
+      }
     }
   }
 

@@ -1713,6 +1713,71 @@ to the browser as raw service-role data beyond the resolved email string.
   and a horizontal-scroll container around the table body so it never
   overflows the page at 375px (verified).
 
+### Account lifecycle: suspend, remove, permanently delete
+
+`profiles.status` adds a three-state lifecycle on top of role, so an account
+can be disabled without touching its role or deleting its history:
+
+| Status | Meaning | Reversible? |
+|---|---|---|
+| `active` | Normal — the default | — |
+| `suspended` | Reversible disable — blocked from signing in, nothing deleted | Yes, back to `active` |
+| `removed` | Soft delete — archived: blocked, but every record (attempts, proctoring sessions, class enrollment) is kept | Yes, back to `active` |
+
+**Permanent delete** is a separate, fourth action (not a `status` value): it
+hard-deletes the `auth.users` row via the Admin API, cascading to `profiles`
+and everything that references it. It is **super_admin only** and never
+offered against another `super_admin` or the caller's own account.
+
+**Permission matrix** — who may change whose status, enforced entirely
+inside `set_account_status`
+(`supabase/migrations/20260711000001_account_lifecycle.sql`), mirroring
+`set_user_role`'s escalation rules:
+
+| Caller | May act on | Notes |
+|---|---|---|
+| `super_admin` | `admin`, `lecturer`, `student` | never another `super_admin`, never self |
+| `admin` | `lecturer`, `student` | never `admin`/`super_admin`, never self |
+| `lecturer` | `student` **only** | only a student enrolled in a class the lecturer **owns** (`classes.owner_id = auth.uid()`) — re-checked with a live `exists (... class_members ...)` query, not trusted from the caller; never self |
+
+`status` is gated behind its own transaction-local
+`usted.allow_status_change` GUC in `profiles_guard_update`, flipped only by
+`set_account_status` around its own `UPDATE` — the exact same pattern
+`usted.allow_role_change` uses for `role`. This closes a real hole: without
+it, RLS's `profiles_update_own` policy would let a user PATCH their *own*
+`status` back to `active` directly via PostgREST, or let super_admin's "any
+column" carve-out silently include `status`. Neither is possible — checked
+*before* the super_admin passthrough, so not even `super_admin` can
+direct-PATCH `status`, only via the RPC. Every change is audit-logged with
+`{old_status, new_status}`.
+
+**Login + session enforcement**: `app/login/actions.ts#signIn` checks
+`profiles.status` immediately after a successful password check — a
+non-`active` account is signed back out on the spot and shown "Your account
+has been suspended. Please contact your administrator." (or the "removed"
+equivalent), so a blocked account can never complete login even for one
+request. `lib/auth.ts#getSessionProfile` performs the same check on every
+subsequent navigation, so a user suspended/removed mid-session is bounced to
+`/login` the next time `requireRole` runs — both are UI-layer routing; RLS
+plus every RPC re-deriving authority from `auth.uid()` remain the actual
+security boundary regardless.
+
+**UI**: the Users & roles table gained a Status column (icon + text badge —
+Active/Suspended/Removed, never color alone) and a per-row Actions menu
+(shadcn `DropdownMenu`) offering Suspend/Reactivate/Remove, gated by
+`lib/admin/role-labels.ts#canActOnAccountRole` (the role axis of the
+matrix — shared with the class roster below) plus a "not self" check; only
+`super_admin` additionally sees "Permanently delete", with a `notify.confirm`
+spelling out that it erases the account's exam records and cannot be
+undone. A lecturer's own class roster (`components/onboarding/class-detail.tsx`)
+gained the same three actions per student, labeled distinctly from the
+pre-existing "Remove from class" (unenroll — the account is untouched)
+action; they're only rendered when the viewer is admin/super_admin or a
+lecturer who owns that class (`page.tsx` computes this from `classes.owner_id`),
+so a lecturer never sees a control against a roster they can view (per the
+"any lecturer can see any roster" simplification) but don't own — the RPC
+enforces the real ownership check regardless.
+
 ### Audit log (`/dashboard/audit`, admin + super_admin)
 
 Paginated (50/page), newest-first browser over `audit_log` — the flagship
@@ -1766,6 +1831,23 @@ accommodations updates via the admin-or-higher policy persist the exact
 writes; and a `lecturer` cannot update another user's `accommodations`
 (0 rows affected, value unchanged — PostgREST doesn't raise for this case,
 it just filters the UPDATE's matched rows via RLS).
+
+Section `z` covers the account-lifecycle permission matrix against
+`set_account_status`: a `lecturer` CAN suspend a student enrolled in a class
+they own, but CANNOT suspend a student outside their class or a
+lecturer/admin/super_admin account; an `admin` CAN suspend a
+lecturer/student but CANNOT act on another `admin` or a `super_admin`; a
+`super_admin` CAN act on `admin`/`lecturer`/`student` but CANNOT act on
+another `super_admin`; nobody may act on their own account (every role,
+asserted in one loop); soft-remove (`'removed'`) then reactivate
+(`'active'`) round-trips; a direct client `PATCH` of `profiles.status` is
+rejected even for the row's own owner and even for `super_admin` (the
+`usted.allow_status_change` gate); and `class_roster()` now surfaces
+`status`. The actual login/session BLOCK on a non-`active` account is an
+app-layer check (`signIn`/`getSessionProfile`) this service-role/anon-key
+script has no Next.js session to exercise directly — that round-trip
+(suspend → blocked with the exact message → reactivate → sign-in works
+again) was verified in the browser instead.
 
 ## Design system review
 

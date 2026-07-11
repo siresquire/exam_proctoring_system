@@ -2,9 +2,25 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { Search, Settings2, ShieldAlert, UserPlus } from "lucide-react";
+import {
+  MoreHorizontal,
+  Search,
+  Settings2,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldOff,
+  Trash2,
+  UserPlus,
+  UserX,
+} from "lucide-react";
 
-import { changeUserRole, updateAccommodations, type AccommodationsInput } from "@/app/dashboard/users/actions";
+import {
+  changeUserRole,
+  permanentlyDeleteAccount,
+  setAccountStatus,
+  updateAccommodations,
+  type AccommodationsInput,
+} from "@/app/dashboard/users/actions";
 import { Breadcrumbs } from "@/components/layout/breadcrumbs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,6 +33,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -32,9 +55,9 @@ import {
 } from "@/components/ui/table";
 import { CreateUserDialog } from "@/components/admin/create-user-dialog";
 import { notify } from "@/lib/notify";
-import { ALL_ROLES, ROLE_LABELS } from "@/lib/admin/role-labels";
+import { ALL_ROLES, ROLE_LABELS, canActOnAccountRole } from "@/lib/admin/role-labels";
 import type { AdminUserRow } from "@/lib/admin/users";
-import type { UserRole } from "@/lib/supabase/types";
+import type { ProfileStatus, UserRole } from "@/lib/supabase/types";
 
 const ROLE_BADGE_VARIANT: Record<UserRole, "default" | "secondary" | "outline"> = {
   super_admin: "default",
@@ -42,6 +65,36 @@ const ROLE_BADGE_VARIANT: Record<UserRole, "default" | "secondary" | "outline"> 
   lecturer: "outline",
   student: "outline",
 };
+
+/**
+ * Account-lifecycle status badge (DESIGN.md §1: "never conveyed by color
+ * alone" — every state pairs a distinct icon with its own text label, not
+ * just a color swap).
+ */
+function AccountStatusBadge({ status }: { status: ProfileStatus }) {
+  if (status === "suspended") {
+    return (
+      <Badge variant="secondary">
+        <ShieldOff aria-hidden className="size-3.5" />
+        Suspended
+      </Badge>
+    );
+  }
+  if (status === "removed") {
+    return (
+      <Badge variant="destructive">
+        <UserX aria-hidden className="size-3.5" />
+        Removed
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="text-success border-success/40">
+      <ShieldCheck aria-hidden className="size-3.5" />
+      Active
+    </Badge>
+  );
+}
 
 interface UsersTableProps {
   users: AdminUserRow[];
@@ -106,6 +159,65 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
         return;
       }
       await notify.toast({ title: `Role changed to ${ROLE_LABELS[newRole]}` });
+      router.refresh();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleSetStatus(user: AdminUserRow, newStatus: ProfileStatus) {
+    const name = user.full_name ?? user.email ?? "This account";
+    const verb = newStatus === "active" ? "Reactivate" : newStatus === "suspended" ? "Suspend" : "Remove";
+    const text =
+      newStatus === "active"
+        ? `${name} regains normal access immediately and can sign in again.`
+        : newStatus === "suspended"
+          ? `${name} is blocked from signing in until reactivated. This is reversible.`
+          : `${name} is archived: blocked from signing in, but their records are kept. Reversible by reactivating later.`;
+
+    const confirmed = await notify.confirm({
+      title: `${verb} ${name}?`,
+      text,
+      confirmButtonText: verb,
+      destructive: newStatus !== "active",
+    });
+    if (!confirmed) return;
+
+    setBusyId(user.id);
+    try {
+      const result = await setAccountStatus(user.id, newStatus);
+      if (result.error) {
+        await notify.error(`Could not ${verb.toLowerCase()} account`, result.error);
+        return;
+      }
+      await notify.toast({
+        title: newStatus === "active" ? "Account reactivated" : newStatus === "suspended" ? "Account suspended" : "Account removed",
+      });
+      router.refresh();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handlePermanentDelete(user: AdminUserRow) {
+    const name = user.full_name ?? user.email ?? "this account";
+    const confirmed = await notify.confirm({
+      title: `Permanently delete ${name}?`,
+      text: `This erases ${name}'s account entirely — including their exam attempts, proctoring sessions, and class enrollments. There is no undo.`,
+      confirmButtonText: "Delete permanently",
+      cancelButtonText: "Cancel",
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    setBusyId(user.id);
+    try {
+      const result = await permanentlyDeleteAccount(user.id);
+      if (result.error) {
+        await notify.error("Could not delete account", result.error);
+        return;
+      }
+      await notify.toast({ title: "Account permanently deleted" });
       router.refresh();
     } finally {
       setBusyId(null);
@@ -207,6 +319,8 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
                       : options.length === 0
                         ? "Only a super admin can change an admin or super admin's role."
                         : null;
+                    const canActOnAccount = !isSelf && canActOnAccountRole(viewerRole, user.role);
+                    const name = user.full_name ?? user.email ?? "user";
 
                     return (
                       <TableRow key={user.id}>
@@ -243,21 +357,76 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
                           )}
                         </TableCell>
                         <TableCell>
-                          {user.must_change_password ? (
-                            <Badge variant="outline">Must set password</Badge>
-                          ) : (
-                            <span className="text-muted-foreground text-sm">Active</span>
-                          )}
+                          <div className="flex flex-col items-start gap-1">
+                            <AccountStatusBadge status={user.status} />
+                            {user.must_change_password ? (
+                              <Badge variant="outline" className="text-xs">
+                                Must set password
+                              </Badge>
+                            ) : null}
+                          </div>
                         </TableCell>
                         <TableCell className="text-right">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => setAccommodationsTarget(user)}
-                          >
-                            <Settings2 aria-hidden className="size-4" />
-                            Accommodations
-                          </Button>
+                          <div className="flex flex-wrap justify-end gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setAccommodationsTarget(user)}
+                            >
+                              <Settings2 aria-hidden className="size-4" />
+                              Accommodations
+                            </Button>
+                            {canActOnAccount ? (
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={busyId === user.id}
+                                    aria-label={`Account actions for ${name}`}
+                                  >
+                                    <MoreHorizontal aria-hidden className="size-4" />
+                                    Actions
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end">
+                                  {user.status !== "active" ? (
+                                    <DropdownMenuItem onSelect={() => handleSetStatus(user, "active")}>
+                                      <ShieldCheck aria-hidden />
+                                      Reactivate
+                                    </DropdownMenuItem>
+                                  ) : null}
+                                  {user.status === "active" ? (
+                                    <DropdownMenuItem onSelect={() => handleSetStatus(user, "suspended")}>
+                                      <ShieldOff aria-hidden />
+                                      Suspend
+                                    </DropdownMenuItem>
+                                  ) : null}
+                                  {user.status !== "removed" ? (
+                                    <DropdownMenuItem
+                                      variant="destructive"
+                                      onSelect={() => handleSetStatus(user, "removed")}
+                                    >
+                                      <UserX aria-hidden />
+                                      Remove (soft delete)
+                                    </DropdownMenuItem>
+                                  ) : null}
+                                  {viewerRole === "super_admin" ? (
+                                    <>
+                                      <DropdownMenuSeparator />
+                                      <DropdownMenuItem
+                                        variant="destructive"
+                                        onSelect={() => handlePermanentDelete(user)}
+                                      >
+                                        <Trash2 aria-hidden />
+                                        Permanently delete
+                                      </DropdownMenuItem>
+                                    </>
+                                  ) : null}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            ) : null}
+                          </div>
                         </TableCell>
                       </TableRow>
                     );

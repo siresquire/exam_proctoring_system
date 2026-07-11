@@ -70,9 +70,25 @@ export async function signIn(identifier: string, password: string): Promise<Sign
 
   const { data: profile } = await supabase
     .from("profiles")
-    .select("role")
+    .select("role, status")
     .eq("id", data.user.id)
     .single();
+
+  // Phase 4: the password matched, so the identity is already proven —
+  // unlike the generic sign-in error above, telling a suspended/removed
+  // user WHY they're blocked here isn't an enumeration risk. Sign them back
+  // out immediately (the password check above already wrote a session
+  // cookie) so a blocked account never completes login, even for the one
+  // request that follows this redirect.
+  if (profile && profile.status !== "active") {
+    await supabase.auth.signOut();
+    return {
+      error:
+        profile.status === "removed"
+          ? "This account has been removed. Please contact your administrator."
+          : "Your account has been suspended. Please contact your administrator.",
+    };
+  }
 
   redirect(profile ? DASHBOARD_BY_ROLE[profile.role] : "/dashboard");
 }

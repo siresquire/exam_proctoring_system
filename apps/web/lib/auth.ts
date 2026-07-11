@@ -56,6 +56,16 @@ export interface SessionProfile {
  * below uses a plain `fetch` against PostgREST with that same token as an
  * explicit bearer header, bypassing the query-builder's internal
  * `getSession()` call for the same reason.
+ *
+ * Phase 4: a profile whose `status` is not `'active'` (suspended or
+ * removed) is treated as signed-out here — returns null just like "no
+ * session" — so `requireRole` (below) bounces an already-logged-in user to
+ * `/login` the next time they navigate after an admin/lecturer suspends or
+ * removes their account mid-session. This is UI routing only; the real
+ * block against a still-valid JWT making direct PostgREST/RPC calls is
+ * `profiles_guard_update`'s status GUC gate (a suspended/removed user can no
+ * longer flip their own status back) plus every sensitive RPC re-deriving
+ * the caller's role/ownership from `auth.uid()` regardless of this cache.
  */
 export const getSessionProfile = cache(async (): Promise<SessionProfile | null> => {
   const env = getSupabaseEnv();
@@ -69,6 +79,7 @@ export const getSessionProfile = cache(async (): Promise<SessionProfile | null> 
 
   const profile = await fetchProfile(env, token, user.id);
   if (!profile) return null;
+  if (profile.status !== "active") return null;
 
   return { user, profile };
 });
