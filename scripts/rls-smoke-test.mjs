@@ -5314,6 +5314,204 @@ async function main() {
     );
   }
 
+  // === (y) Task 2: createUserAccount escalation & creation invariants ======
+  // createUserAccount (apps/web/app/dashboard/users/actions.ts) is a
+  // Next.js server action gated by requireRole('admin','super_admin') plus
+  // an in-app escalation check that mirrors set_user_role's rules exactly,
+  // then — for staff roles — the actual role assignment goes through
+  // set_user_role itself (never a direct profiles.role write). This script
+  // talks to Postgres/Auth directly (it has no Next.js session to call the
+  // server action through), so it asserts the two things that action's
+  // correctness actually depends on: (1) the set_user_role RPC — which is
+  // what stops a request-crafted admin call from ever landing an
+  // admin/super_admin promotion, even if the in-app check were bypassed —
+  // enforces the exact same escalation rule against a BRAND NEW account,
+  // the shape a create-user flow actually produces; (2) the invariants the
+  // action's own code (and createOrFindStaffUser/createOrFindStudent) is
+  // responsible for: must_change_password=true on every newly created
+  // account, no duplicate account for an existing email/index number, and
+  // the 10-digit index CHECK. (d)/(e)/(f)/(v) above already cover the
+  // equivalent escalation assertions against the long-lived seeded users;
+  // this section repeats the critical ones against a FRESH account so
+  // they're self-contained and not masked by any pre-existing role drift on
+  // the shared fixtures.
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: lecturerClient } = sessions.lecturer;
+    const { client: adminClient } = sessions.admin;
+    const { client: superAdminClient } = sessions.super_admin;
+    const suffix = Date.now();
+
+    // y1. Simulate createOrFindStaffUser: create a brand-new staff-shaped
+    // account via the service role (email_confirm + generated temp
+    // password), then apply the same must_change_password=true update
+    // createOrFindStaffUser performs. This is the exact account shape
+    // createUserAccount hands to set_user_role next.
+    const freshEmail = `smoke-test-createuser-${suffix}@usted.test`;
+    const freshPassword = "TempPass!23456";
+    const { data: freshUser, error: freshUserErr } = await admin.auth.admin.createUser({
+      email: freshEmail,
+      password: freshPassword,
+      email_confirm: true,
+      user_metadata: { full_name: "Smoke Test Fresh Staff" },
+    });
+    const freshUserId = freshUser?.user?.id;
+    if (freshUserId) {
+      await admin.from("profiles").update({ must_change_password: true }).eq("id", freshUserId);
+    }
+    record(
+      "y1. fresh staff-shaped account created via Admin API (createUserAccount's staff path)",
+      Boolean(freshUserId),
+      freshUserErr?.message ?? freshUserId,
+    );
+
+    const { data: freshProfile, error: freshProfileErr } = await admin
+      .from("profiles")
+      .select("role, must_change_password")
+      .eq("id", freshUserId)
+      .maybeSingle();
+    record(
+      "y2. fresh account defaults to role=student (handle_new_user) with must_change_password=true",
+      !freshProfileErr && freshProfile?.role === "student" && freshProfile?.must_change_password === true,
+      freshProfileErr?.message ?? JSON.stringify(freshProfile),
+    );
+
+    // y3. student calling the createUserAccount-equivalent set_user_role
+    // path FAILS — a student can never create/promote any account this way.
+    const { error: studentCreateErr } = await studentClient.rpc("set_user_role", {
+      target: freshUserId,
+      new_role: "lecturer",
+    });
+    record(
+      "y3. student calling the createUserAccount-equivalent path FAILS",
+      isDenied(studentCreateErr),
+      studentCreateErr?.message ?? "no error raised — SECURITY: student created/promoted an account",
+    );
+
+    // y4. lecturer calling the same path FAILS.
+    const { error: lecturerCreateErr } = await lecturerClient.rpc("set_user_role", {
+      target: freshUserId,
+      new_role: "lecturer",
+    });
+    record(
+      "y4. lecturer calling the createUserAccount-equivalent path FAILS",
+      isDenied(lecturerCreateErr),
+      lecturerCreateErr?.message ?? "no error raised — SECURITY: lecturer created/promoted an account",
+    );
+
+    // y5. admin creating a lecturer (set_user_role student -> lecturer) succeeds.
+    const { error: adminLecturerErr } = await adminClient.rpc("set_user_role", {
+      target: freshUserId,
+      new_role: "lecturer",
+    });
+    record(
+      "y5. admin createUserAccount(lecturer) succeeds (set_user_role student -> lecturer)",
+      !adminLecturerErr,
+      adminLecturerErr?.message,
+    );
+
+    // y6. admin creating/promoting the SAME fresh account to admin FAILS —
+    // the critical escalation-denial assertion: an admin must not be able
+    // to create an admin account by any request-crafting, even against an
+    // account they just legitimately created themselves.
+    const { error: adminEscalateErr } = await adminClient.rpc("set_user_role", {
+      target: freshUserId,
+      new_role: "admin",
+    });
+    record(
+      "y6. admin createUserAccount(admin) FAILS (escalation blocked — CRITICAL)",
+      isDenied(adminEscalateErr),
+      adminEscalateErr?.message ?? "no error raised — SECURITY: admin created/escalated an admin account",
+    );
+
+    // y7. admin creating/promoting to super_admin FAILS too.
+    const { error: adminSuperEscalateErr } = await adminClient.rpc("set_user_role", {
+      target: freshUserId,
+      new_role: "super_admin",
+    });
+    record(
+      "y7. admin createUserAccount(super_admin) FAILS (escalation blocked — CRITICAL)",
+      isDenied(adminSuperEscalateErr),
+      adminSuperEscalateErr?.message ??
+        "no error raised — SECURITY: admin created/escalated a super_admin account",
+    );
+
+    // y8. super_admin CAN promote the same fresh account to admin.
+    const { error: superAdminPromoteErr } = await superAdminClient.rpc("set_user_role", {
+      target: freshUserId,
+      new_role: "admin",
+    });
+    record(
+      "y8. super_admin createUserAccount(admin) succeeds",
+      !superAdminPromoteErr,
+      superAdminPromoteErr?.message,
+    );
+
+    // Cleanup: delete the fresh throwaway account entirely (it was never a
+    // seeded fixture, so there's nothing to "revert" — just remove it).
+    if (freshUserId) {
+      await admin.auth.admin.deleteUser(freshUserId).catch(() => {});
+    }
+
+    // y9. duplicate email: createOrFindStaffUser's existence check relies on
+    // the Auth admin API itself rejecting a second createUser for an email
+    // already registered — confirm that rejection directly against one of
+    // the long-lived seeded users (this never actually creates a duplicate).
+    const { data: dupUser, error: dupErr } = await admin.auth.admin.createUser({
+      email: USERS.lecturer,
+      password: "AnotherPass!234",
+      email_confirm: true,
+    });
+    record(
+      "y9. Admin API createUser with an already-registered email FAILS (no duplicate account)",
+      Boolean(dupErr) && !dupUser?.user,
+      dupErr?.message ??
+        "no error raised — SECURITY: a duplicate auth user was created for an existing email",
+    );
+
+    // y10. duplicate student index number: profiles.student_number is a
+    // UNIQUE column — attempting to give a second profile the seeded
+    // student's index number fails at the DB layer, which is what backs
+    // createOrFindStudent's/createUserAccount's "no duplicate on an
+    // existing index" guarantee for the student branch.
+    const { error: dupIndexErr } = await admin
+      .from("profiles")
+      .update({ student_number: "5201040845" })
+      .eq("id", lecturerId);
+    record(
+      "y10. profiles.student_number UNIQUE constraint rejects a duplicate index number",
+      Boolean(dupIndexErr),
+      dupIndexErr?.message ?? "no error raised — SECURITY: two profiles share the same student_number",
+    );
+
+    // y11. creating a student requires a valid 10-digit index: reuses (k5)'s
+    // CHECK constraint assertion, restated here against a FRESH account (not
+    // the shared student fixture) so it's self-contained with this section.
+    const shortIndexEmail = `smoke-test-shortindex-${suffix}@students.usted.local`;
+    const { data: shortIndexUser } = await admin.auth.admin.createUser({
+      email: shortIndexEmail,
+      password: freshPassword,
+      email_confirm: true,
+    });
+    const shortIndexUserId = shortIndexUser?.user?.id;
+    let badIndexErr = null;
+    if (shortIndexUserId) {
+      const { error } = await admin
+        .from("profiles")
+        .update({ student_number: "123" })
+        .eq("id", shortIndexUserId);
+      badIndexErr = error;
+    }
+    record(
+      "y11. creating a student with a non-10-digit index number FAILS (CHECK constraint)",
+      Boolean(shortIndexUserId) && Boolean(badIndexErr),
+      badIndexErr?.message ?? "no error raised — SECURITY: a non-10-digit student_number was accepted",
+    );
+    if (shortIndexUserId) {
+      await admin.auth.admin.deleteUser(shortIndexUserId).catch(() => {});
+    }
+  }
+
   // === cleanup / idempotency: restore original roles ========================
   // set_user_role needs auth.uid(), so cleanup must go through an
   // authenticated session's RPC call, not the service role directly (the

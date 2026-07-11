@@ -61,9 +61,9 @@ is free tier.
    ```
 
 5. **Create the first user.** Dashboard → **Authentication → Users → Add
-   user** (email + password, check "auto confirm"). Or run `pnpm dev`, open
-   `http://localhost:3000/login`, and use the magic-link tab. Either way a
-   `profiles` row is created automatically (role `student`).
+   user** (email + password, check "auto confirm"). A `profiles` row is
+   created automatically (role `student`) by the `handle_new_user` trigger.
+   There is no self-signup page — see "Self-signup is disabled" below.
 
 6. **Promote it to super_admin.** Dashboard → **SQL Editor**, run the
    snippet from [`supabase/seed.sql`](supabase/seed.sql) with your email:
@@ -102,22 +102,60 @@ client is never trusted): `super_admin`, `admin`, `lecturer`, `student`.
   may grant or revoke `admin`/`super_admin`; nobody may change their own
   role. All role changes go through the `set_user_role` RPC and land in the
   append-only `audit_log`.
+- **Users & roles → Create user** (`/dashboard/users`, admin/super_admin
+  only) creates an account directly with a chosen role, instead of only via
+  the class-roster path. The role you're allowed to hand out mirrors
+  `set_user_role`'s escalation rules exactly: an `admin` may create
+  `lecturer`/`student` accounts only; a `super_admin` may create any of the
+  four. That check runs server-side in `createUserAccount`
+  (`apps/web/app/dashboard/users/actions.ts`) **before** any account is
+  created, and — for staff roles — the actual role assignment still goes
+  through the `set_user_role` RPC (never a direct `profiles.role` write), so
+  Postgres re-enforces the same rule and audit-logs it. New accounts get a
+  server-generated, crypto-random temp password shown to the admin **once**
+  (never stored in plaintext) and `must_change_password = true`, exactly
+  like the roster-import flow.
 
 ### Sign-in: email or index number (Phase 1.6)
 
-The password tab accepts **either** a university email **or** a 10-digit USTED
-index number (e.g. `5201040845`). Index resolution happens entirely
-server-side in the `signIn` server action (`apps/web/app/login/actions.ts`):
-if the identifier is 10 digits it is looked up via a **service-role** client
-(`apps/web/lib/supabase/admin.ts`, server-only — the key is never shipped to
-the browser and the index→email mapping is never exposed) and the resolved
-email is used for the real password sign-in. Every failure returns one generic
-"Invalid email/index number or password" so the form is not an
-account-enumeration oracle. This exists because student onboarding must not
-depend on email deliverability before a domain is purchased (see PLAN.md
-"Student onboarding without a domain"): admins hand out index + temp password;
-the magic-link tab remains but is labelled as needing a configured sending
-domain.
+The login page accepts **either** a university email **or** a 10-digit USTED
+index number (e.g. `5201040845`), plus a password. Index resolution happens
+entirely server-side in the `signIn` server action
+(`apps/web/app/login/actions.ts`): if the identifier is 10 digits it is
+looked up via a **service-role** client (`apps/web/lib/supabase/admin.ts`,
+server-only — the key is never shipped to the browser and the index→email
+mapping is never exposed) and the resolved email is used for the real
+password sign-in. Every failure returns one generic "Invalid email/index
+number or password" so the form is not an account-enumeration oracle. This
+exists because student onboarding must not depend on email deliverability
+before a domain is purchased (see PLAN.md "Student onboarding without a
+domain"): admins hand out index + temp password (roster import) or a real
+email + temp password (the "Create user" console below).
+
+### Self-signup is disabled
+
+There is no way to create an account from the login page. This is
+deliberate, at both layers:
+
+1. **App layer.** No code path calls `supabase.auth.signUp()` or
+   `supabase.auth.signInWithOtp()`. Accounts are created only server-side,
+   via the service-role Admin API, from two places: the class-roster
+   import/"Add student" flow (`apps/web/lib/onboarding/create-student.ts`,
+   students only) and the **Users & roles → Create user** console
+   (`apps/web/app/dashboard/users/actions.ts`'s `createUserAccount`, any
+   role an admin/super_admin is allowed to grant — see "Roles" above).
+   The login page used to have an "Email me a link" magic-link tab; it was
+   removed because `signInWithOtp()` without `shouldCreateUser: false`
+   silently creates a brand-new account for **any** email address that
+   doesn't already exist — i.e. it was an open self-signup form (this is
+   exactly how an uninvited account got created on the live deployment).
+2. **Supabase project layer**, belt-and-braces in case the app layer is ever
+   bypassed: `enable_signup = false` in `supabase/config.toml` (local dev —
+   note this does **not** affect the service-role Admin API, so admin/
+   lecturer/student account creation above still works). On the **hosted**
+   project, the equivalent is a manual dashboard step the project owner
+   must perform: **Authentication → Sign In / Providers → Email → "Allow new
+   users to sign up"** → **OFF**.
 
 ### Regenerating DB types
 
@@ -164,7 +202,7 @@ status`):
 | API (`NEXT_PUBLIC_SUPABASE_URL`) | http://127.0.0.1:54321 |
 | Studio (browse/edit data) | http://127.0.0.1:54323 |
 | Postgres | postgresql://postgres:postgres@127.0.0.1:54322/postgres |
-| Mailpit (magic-link emails) | http://127.0.0.1:54324 |
+| Mailpit (local outbound-email catcher, currently unused — self-signup/magic-link is disabled) | http://127.0.0.1:54324 |
 
 The anon key and service_role key change per machine/checkout — copy them
 from `supabase status -o env` into `apps/web/.env.local` (see

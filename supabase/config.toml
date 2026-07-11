@@ -168,7 +168,13 @@ enable_refresh_token_rotation = true
 # Requires enable_refresh_token_rotation = true.
 refresh_token_reuse_interval = 10
 # Allow/disallow new user signups to your project.
-enable_signup = true
+# Disabled: this app has no self-signup flow (see README.md "Self-signup is
+# disabled" and apps/web/components/auth/login-form.tsx's doc comment) — every
+# account is created server-side via the service-role Admin API, which is
+# NOT gated by this setting, so admin/lecturer onboarding still works with
+# this set to false. Mirrors the "Allow new users to sign up" toggle that
+# must also be turned OFF in the hosted project's dashboard.
+enable_signup = false
 # Allow/disallow anonymous sign-ins to your project.
 enable_anonymous_sign_ins = false
 # Allow/disallow testing manual linking of accounts
@@ -213,7 +219,8 @@ web3 = 30
 
 [auth.email]
 # Allow/disallow new user signups via email to your project.
-enable_signup = true
+# Disabled — see the top-level enable_signup comment above.
+enable_signup = false
 # If enabled, a user will be required to confirm any email change on both the old, and new email
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true

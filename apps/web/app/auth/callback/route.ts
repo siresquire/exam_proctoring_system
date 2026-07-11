@@ -13,6 +13,21 @@ import { createClient } from "@/lib/supabase/server";
  * On success, sends the user to `next` (default /dashboard, which routes
  * them to their role's dashboard). On failure, back to /login with an
  * error code the login page surfaces via notify.error.
+ *
+ * SECURITY NOTE (self-signup removal): the login page's "Email me a link"
+ * tab — the only code path that ever produced a link pointing here — has
+ * been removed (components/auth/login-form.tsx), because
+ * `supabase.auth.signInWithOtp()` without `shouldCreateUser: false` silently
+ * creates a new account for ANY email, i.e. open self-signup. Nothing in
+ * this app calls `signInWithOtp` or `signUp` anymore, so this route is
+ * currently unreachable in practice. It is intentionally left in place
+ * (not deleted) as dead-but-harmless: it does nothing unless Supabase
+ * actually sends a request here, which it now never does from this app's
+ * own flows, and it's the natural landing point for a future, deliberately
+ * re-added flow (e.g. an admin-triggered password-reset email) that would
+ * reuse the same `code`/`token_hash` handling. Self-signup itself is
+ * disabled at the Supabase project layer too — see README.md "Self-signup
+ * is disabled" and supabase/config.toml's `enable_signup = false`.
  */
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);

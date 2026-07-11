@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { Search, Settings2, ShieldAlert } from "lucide-react";
+import { Search, Settings2, ShieldAlert, UserPlus } from "lucide-react";
 
 import { changeUserRole, updateAccommodations, type AccommodationsInput } from "@/app/dashboard/users/actions";
 import { Breadcrumbs } from "@/components/layout/breadcrumbs";
@@ -30,16 +30,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { CreateUserDialog } from "@/components/admin/create-user-dialog";
 import { notify } from "@/lib/notify";
+import { ALL_ROLES, ROLE_LABELS } from "@/lib/admin/role-labels";
 import type { AdminUserRow } from "@/lib/admin/users";
 import type { UserRole } from "@/lib/supabase/types";
-
-const ROLE_LABELS: Record<UserRole, string> = {
-  super_admin: "Super admin",
-  admin: "Admin",
-  lecturer: "Lecturer",
-  student: "Student",
-};
 
 const ROLE_BADGE_VARIANT: Record<UserRole, "default" | "secondary" | "outline"> = {
   super_admin: "default",
@@ -47,8 +42,6 @@ const ROLE_BADGE_VARIANT: Record<UserRole, "default" | "secondary" | "outline"> 
   lecturer: "outline",
   student: "outline",
 };
-
-const ALL_ROLES: UserRole[] = ["super_admin", "admin", "lecturer", "student"];
 
 interface UsersTableProps {
   users: AdminUserRow[];
@@ -80,6 +73,7 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
   const [roleFilter, setRoleFilter] = React.useState<string>("all");
   const [busyId, setBusyId] = React.useState<string | null>(null);
   const [accommodationsTarget, setAccommodationsTarget] = React.useState<AdminUserRow | null>(null);
+  const [createOpen, setCreateOpen] = React.useState(false);
 
   const filtered = React.useMemo(() => {
     return users.filter((u) => {
@@ -121,13 +115,19 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
   return (
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
       <Breadcrumbs items={[{ label: "Dashboard", href: "/dashboard" }, { label: "Users & roles" }]} />
-      <header className="mb-8">
-        <h1 className="text-2xl font-semibold tracking-tight">Users & roles</h1>
-        <p className="text-muted-foreground mt-2 max-w-2xl">
-          Every account on the platform. Role changes are enforced server-side (nobody can change
-          their own role; only a super admin can grant admin or super admin). Accommodations edits
-          apply immediately.
-        </p>
+      <header className="mb-8 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Users & roles</h1>
+          <p className="text-muted-foreground mt-2 max-w-2xl">
+            Every account on the platform. Role changes are enforced server-side (nobody can change
+            their own role; only a super admin can grant admin or super admin). Accommodations edits
+            apply immediately.
+          </p>
+        </div>
+        <Button type="button" onClick={() => setCreateOpen(true)} className="min-h-11">
+          <UserPlus aria-hidden />
+          Create user
+        </Button>
       </header>
 
       {loadError ? (
@@ -276,6 +276,13 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
           setAccommodationsTarget(null);
           router.refresh();
         }}
+      />
+
+      <CreateUserDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        viewerRole={viewerRole}
+        onCreated={() => router.refresh()}
       />
     </div>
   );
