@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { AlertCircle, Copy, UserPlus } from "lucide-react";
+import { AlertCircle, UserPlus } from "lucide-react";
 
 import { addStudentToClass, type AddStudentResult } from "@/app/dashboard/lecturer/classes/actions";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { TempPasswordReveal } from "@/components/admin/temp-password-reveal";
 import { notify } from "@/lib/notify";
 
 interface AddStudentDialogProps {
@@ -113,10 +114,11 @@ export function AddStudentDialog({ open, onOpenChange, classId, className, onAdd
           `${trimmedName} is already on this class's roster — nothing changed.`,
         );
       } else if (result.created) {
-        await notify.success(
-          "Student added",
-          "A new account was created. Copy the one-time temp password below.",
-        );
+        // A toast, not notify.success: the temp-password reveal panel below
+        // (TempPasswordReveal) is already on screen — a centered
+        // SweetAlert2 modal would render at a higher stacking context and
+        // cover it. See TempPasswordReveal's doc comment.
+        await notify.toast({ title: "Student added" });
       } else {
         await notify.success(
           "Existing student enrolled",
@@ -126,12 +128,6 @@ export function AddStudentDialog({ open, onOpenChange, classId, className, onAdd
     } finally {
       setSaving(false);
     }
-  }
-
-  async function handleCopy() {
-    if (!outcome?.tempPassword) return;
-    await navigator.clipboard.writeText(outcome.tempPassword);
-    await notify.toast({ title: "Temp password copied" });
   }
 
   const hasErrors = Object.keys(errors).length > 0;
@@ -237,20 +233,7 @@ export function AddStudentDialog({ open, onOpenChange, classId, className, onAdd
         ) : (
           <div className="space-y-4">
             {outcome?.created && outcome.tempPassword ? (
-              <div className="space-y-2 rounded-md border p-3">
-                <p className="text-sm">
-                  New account created. This temp password is shown <strong>once</strong> — copy it now.
-                </p>
-                <div className="flex items-center gap-2">
-                  <code className="bg-muted flex-1 rounded px-2 py-1.5 font-mono text-sm">
-                    {outcome.tempPassword}
-                  </code>
-                  <Button type="button" variant="outline" size="sm" onClick={handleCopy} className="min-h-11">
-                    <Copy aria-hidden />
-                    Copy
-                  </Button>
-                </div>
-              </div>
+              <TempPasswordReveal title="New account created" password={outcome.tempPassword} />
             ) : outcome?.alreadyEnrolled ? (
               <p className="text-sm">
                 {outcome.fullName ?? "This student"} was already enrolled in {className} — nothing changed.

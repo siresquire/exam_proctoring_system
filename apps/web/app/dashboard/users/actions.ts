@@ -3,8 +3,10 @@
 import { revalidatePath } from "next/cache";
 
 import { requireRole } from "@/lib/auth";
+import { canActOnAccountRole } from "@/lib/admin/role-labels";
 import { createOrFindStaffUser } from "@/lib/onboarding/create-staff";
 import { createOrFindStudent } from "@/lib/onboarding/create-student";
+import { regenerateTempPassword } from "@/lib/onboarding/regenerate-password";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import type { Json, ProfileStatus, UserRole } from "@/lib/supabase/types";
@@ -277,6 +279,92 @@ export async function setAccountStatus(
   revalidatePath(USERS_PATH);
   revalidatePath(CLASSES_PATH);
   return {};
+}
+
+export interface ResetPasswordResult {
+  error?: string;
+  /** Present only on success — shown to the caller exactly once, never persisted. */
+  tempPassword?: string;
+}
+
+/**
+ * Reset-on-demand: issues a FRESH temp password for an existing account and
+ * forces a password change on the account's next sign-in
+ * (`must_change_password = true`). This is the owner-decided replacement for
+ * "email a reset link" — the platform never stores a plaintext password, so
+ * there is nothing to recover; a super_admin/admin re-sets it instead, hands
+ * the new temp password to the account holder out of band, and the account
+ * is forced through /onboarding/set-password on next login, exactly like a
+ * brand-new account.
+ *
+ * Admin/super_admin only, gated by the SAME escalation matrix as
+ * `setAccountStatus`/`permanentlyDeleteAccount` (`canActOnAccountRole` —
+ * lib/admin/role-labels.ts, which itself mirrors `set_account_status`'s SQL
+ * rules): super_admin may reset admin/lecturer/student; admin may reset
+ * lecturer/student only; nobody resets their own account or an equal/higher
+ * role. Unlike setAccountStatus, there is no RPC backing this specific
+ * operation (setting an Auth user's password is only available through the
+ * service-role Admin API, which has no RLS to fall back on), so this
+ * in-app check — re-derived from the target's CURRENT role, read fresh from
+ * `profiles` right before acting, not trusted from client input — is the
+ * entire security boundary. It runs, and the audit entry is written, BEFORE
+ * the privileged Admin API call, mirroring permanentlyDeleteAccount's
+ * ordering below so a failed audit write can never leave an unaudited
+ * password change behind.
+ *
+ * Reuses `regenerateTempPassword` (lib/onboarding/regenerate-password.ts) —
+ * the same primitive the lecturer class-roster's "Regenerate password"
+ * action uses for students — since nothing about it is actually
+ * student-specific: it just re-sets an Auth user's password via
+ * `updateUserById` and flips `must_change_password`. The new password is
+ * generated fresh, set directly via the service-role Admin API, and
+ * returned to the caller in memory ONLY — never written to any table, and
+ * never included in the audit metadata (the audit entry records that a
+ * reset happened, not what the new password is).
+ */
+export async function resetUserPassword(targetUserId: string): Promise<ResetPasswordResult> {
+  const session = await requireRole("admin", "super_admin");
+
+  if (targetUserId === session.user.id) {
+    return { error: "You cannot reset your own password this way." };
+  }
+
+  const admin = createAdminClient();
+  if (!admin) {
+    return { error: "Supabase is not configured in this environment." };
+  }
+
+  const { data: target, error: targetError } = await admin
+    .from("profiles")
+    .select("role")
+    .eq("id", targetUserId)
+    .maybeSingle();
+  if (targetError || !target) {
+    return { error: "Account not found." };
+  }
+
+  const callerRole = session.profile.role as UserRole;
+  if (!canActOnAccountRole(callerRole, target.role)) {
+    return { error: "You are not allowed to reset this account's password." };
+  }
+
+  const { error: auditError } = await admin.rpc("log_audit", {
+    action: "reset_password",
+    target_type: "profile",
+    target_id: targetUserId,
+    metadata: {},
+  });
+  if (auditError) {
+    return { error: `Could not record the audit entry — password was NOT reset: ${auditError.message}` };
+  }
+
+  const result = await regenerateTempPassword(targetUserId);
+  if (!result.ok) {
+    return { error: result.error };
+  }
+
+  revalidatePath(USERS_PATH);
+  return { tempPassword: result.tempPassword };
 }
 
 /**

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { AlertCircle, Copy, UserPlus } from "lucide-react";
+import { AlertCircle, UserPlus } from "lucide-react";
 
 import { createUserAccount, type CreateUserAccountResult } from "@/app/dashboard/users/actions";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { TempPasswordReveal } from "@/components/admin/temp-password-reveal";
 import { notify } from "@/lib/notify";
 import { ROLE_LABELS } from "@/lib/admin/role-labels";
 import type { UserRole } from "@/lib/supabase/types";
@@ -129,10 +130,13 @@ export function CreateUserDialog({ open, onOpenChange, viewerRole, onCreated }: 
       onCreated();
 
       if (result.created) {
-        await notify.success(
-          "Account created",
-          `${trimmedName} was added as ${ROLE_LABELS[role].toLowerCase()}. Copy the one-time temp password below.`,
-        );
+        // A toast, not notify.success: the temp-password reveal panel below
+        // (TempPasswordReveal) is already on screen at this point, and
+        // notify.success renders a centered SweetAlert2 modal at a much
+        // higher stacking context than this dialog — it would completely
+        // cover the very panel it's describing. See TempPasswordReveal's
+        // doc comment for the full story.
+        await notify.toast({ title: `Account created — ${ROLE_LABELS[role].toLowerCase()}` });
       } else {
         await notify.info(
           "Account already exists",
@@ -142,12 +146,6 @@ export function CreateUserDialog({ open, onOpenChange, viewerRole, onCreated }: 
     } finally {
       setSaving(false);
     }
-  }
-
-  async function handleCopy() {
-    if (!outcome?.tempPassword) return;
-    await navigator.clipboard.writeText(outcome.tempPassword);
-    await notify.toast({ title: "Temp password copied" });
   }
 
   const hasErrors = Object.keys(errors).length > 0;
@@ -295,24 +293,11 @@ export function CreateUserDialog({ open, onOpenChange, viewerRole, onCreated }: 
         ) : (
           <div className="space-y-4">
             {outcome?.created && outcome.tempPassword ? (
-              <div className="space-y-2 rounded-md border p-3">
-                <p className="text-sm">
-                  New {ROLE_LABELS[role].toLowerCase()} account created. This temp password is shown{" "}
-                  <strong>once</strong> — copy it now.
-                </p>
-                <div className="flex items-center gap-2">
-                  <code className="bg-muted flex-1 rounded px-2 py-1.5 font-mono text-sm break-all">
-                    {outcome.tempPassword}
-                  </code>
-                  <Button type="button" variant="outline" size="sm" onClick={handleCopy} className="min-h-11">
-                    <Copy aria-hidden />
-                    Copy
-                  </Button>
-                </div>
-                <p className="text-muted-foreground text-xs">
-                  They must change this password the first time they sign in.
-                </p>
-              </div>
+              <TempPasswordReveal
+                title={`New ${ROLE_LABELS[role].toLowerCase()} account created`}
+                password={outcome.tempPassword}
+                description="They must change this password the first time they sign in."
+              />
             ) : (
               <p className="text-sm">
                 {isStudent ? "That index number" : "That email"} already has an account — nothing was

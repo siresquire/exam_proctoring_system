@@ -130,6 +130,21 @@ async function getProfileStatus(userId) {
   return data.status;
 }
 
+/**
+ * Non-throwing sign-in attempt (unlike signIn() above, which throws) — used
+ * to prove a password reset actually invalidates the old password and
+ * activates the new one, without aborting the whole script on the expected
+ * "old password now fails" case.
+ */
+async function trySignIn(email, password) {
+  const client = createClient(SUPABASE_URL, ANON_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+  const { data, error } = await client.auth.signInWithPassword({ email, password });
+  await client.auth.signOut().catch(() => {});
+  return { ok: !error && Boolean(data?.user), error };
+}
+
 // --- main ----------------------------------------------------------------
 
 async function main() {
@@ -5882,6 +5897,205 @@ async function main() {
       if (current !== "active") {
         await superAdminClient.rpc("set_account_status", { target_user_id: uid, new_status: "active" });
       }
+    }
+  }
+
+  // === (aa) Admin UX task: resetUserPassword mechanics + escalation matrix ==
+  // resetUserPassword (apps/web/app/dashboard/users/actions.ts) has NO
+  // backing RPC — unlike every other privileged action tested above, its
+  // entire security boundary (requireRole('admin','super_admin') +
+  // canActOnAccountRole + "never self") lives in TypeScript, because
+  // setting an Auth user's password is only possible through the
+  // service-role Admin API, which has no RLS to fall back on (see that
+  // function's own doc comment). This script has no Next.js session, so it
+  // cannot invoke the server action directly. What it verifies instead:
+  //   (1) canActOnAccountRole is, BY DESIGN, the exact same role matrix
+  //       set_account_status enforces in Postgres (lib/admin/role-labels.ts's
+  //       doc comment states this explicitly) — already exhaustively proven
+  //       above in (z) against the shared seeded fixtures. aa1-aa4 re-run
+  //       the SAME pairs the task calls out (lecturer/student denied
+  //       entirely; admin allowed on lecturer/student but denied on
+  //       admin/super_admin; super_admin allowed on admin) against fresh
+  //       throwaway targets, so this section is self-contained rather than
+  //       only cross-referenced. "Nobody resets self" is (z10)'s exact
+  //       assertion — canActOnAccountRole's caller in resetUserPassword adds
+  //       an explicit self-check on top, mirroring setAccountStatus's own.
+  //   (2) The actual Auth-level mechanics resetUserPassword performs once
+  //       the gate passes — updateUserById + must_change_password=true —
+  //       really do issue a working new password, really do invalidate the
+  //       old one, and really do set the forced-change flag (aa5-aa8b).
+  //   (3) Why the audit write must go through the service-role client, not
+  //       the caller's own session (aa9-aa10): log_audit is granted to
+  //       service_role only (same fact (c)/(e) above prove against
+  //       student/lecturer) — an ADMIN's own authenticated session is
+  //       denied too, so resetUserPassword's use of createAdminClient() for
+  //       its audit call isn't a stylistic choice, it's the only way that
+  //       call can succeed.
+  // The actual server action — the "Reset password" menu item, the
+  // one-time TempPasswordReveal, and the reset user then signing in with
+  // the new temp password and being forced through /onboarding/set-password
+  // — is verified in the browser separately (see README.md
+  // "Verifying locally").
+  {
+    const { client: studentClient } = sessions.student;
+    const { client: adminClient } = sessions.admin;
+    const { client: superAdminClient } = sessions.super_admin;
+    const suffix = Date.now();
+
+    async function makeThrowawayUser(label, role) {
+      const email = `smoke-test-resetpw-${label}-${suffix}@usted.test`;
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: PASSWORD,
+        email_confirm: true,
+        user_metadata: { full_name: `Smoke Test Reset ${label}` },
+      });
+      const id = data?.user?.id;
+      if (id && role !== "student") {
+        await superAdminClient.rpc("set_user_role", { target: id, new_role: role });
+      }
+      return { id, email, error };
+    }
+
+    const targetStudent = await makeThrowawayUser("student", "student");
+    const targetLecturer = await makeThrowawayUser("lecturer", "lecturer");
+    const targetAdmin = await makeThrowawayUser("admin", "admin");
+    record(
+      "aa-setup. three fresh throwaway targets created (student/lecturer/admin)",
+      Boolean(targetStudent.id && targetLecturer.id && targetAdmin.id),
+      [targetStudent.error, targetLecturer.error, targetAdmin.error]
+        .filter(Boolean)
+        .map((e) => e.message)
+        .join("; "),
+    );
+
+    // aa1. student session denied the reset-password matrix entirely.
+    if (targetStudent.id) {
+      const { error } = await studentClient.rpc("set_account_status", {
+        target_user_id: targetStudent.id,
+        new_status: "suspended",
+      });
+      record(
+        "aa1. student denied the reset-password escalation matrix (student can never reset anyone)",
+        Boolean(error),
+        error?.message ?? "no error raised — SECURITY",
+      );
+    }
+
+    // aa2. admin CAN act on a lecturer target (the matrix resetUserPassword allows).
+    if (targetLecturer.id) {
+      const { error } = await adminClient.rpc("set_account_status", {
+        target_user_id: targetLecturer.id,
+        new_status: "suspended",
+      });
+      record("aa2. admin allowed on a lecturer target (matrix resetUserPassword shares)", !error, error?.message);
+      await adminClient.rpc("set_account_status", { target_user_id: targetLecturer.id, new_status: "active" });
+    }
+
+    // aa3. admin denied on an admin target.
+    if (targetAdmin.id) {
+      const { error } = await adminClient.rpc("set_account_status", {
+        target_user_id: targetAdmin.id,
+        new_status: "suspended",
+      });
+      record(
+        "aa3. admin denied on an admin target (resetUserPassword: admin may reset lecturer/student only)",
+        isDenied(error),
+        error?.message ?? "no error raised — SECURITY: admin reset/acted on another admin",
+      );
+    }
+
+    // aa4. super_admin CAN act on an admin target.
+    if (targetAdmin.id) {
+      const { error } = await superAdminClient.rpc("set_account_status", {
+        target_user_id: targetAdmin.id,
+        new_status: "suspended",
+      });
+      record("aa4. super_admin allowed on an admin target (matrix resetUserPassword shares)", !error, error?.message);
+      await superAdminClient.rpc("set_account_status", { target_user_id: targetAdmin.id, new_status: "active" });
+    }
+
+    // aa5-aa8b: the actual password-reset mechanics resetUserPassword
+    // performs once its gate passes, exercised end-to-end via the exact
+    // same service-role Admin API calls (updateUserById +
+    // must_change_password=true) regenerateTempPassword makes.
+    if (targetStudent.id) {
+      const before = await trySignIn(targetStudent.email, PASSWORD);
+      record(
+        "aa5. throwaway target signs in with its ORIGINAL password before any reset",
+        before.ok,
+        before.error?.message,
+      );
+
+      const newPassword = "ResetSmokeTest!789";
+      const { error: updateErr } = await admin.auth.admin.updateUserById(targetStudent.id, {
+        password: newPassword,
+      });
+      const { error: flagErr } = await admin
+        .from("profiles")
+        .update({ must_change_password: true })
+        .eq("id", targetStudent.id);
+      record(
+        "aa6. service-role updateUserById + must_change_password=true succeeds (resetUserPassword's exact mechanics)",
+        !updateErr && !flagErr,
+        updateErr?.message ?? flagErr?.message,
+      );
+
+      const oldStillWorks = await trySignIn(targetStudent.email, PASSWORD);
+      record(
+        "aa7. the OLD password no longer signs in after a reset",
+        !oldStillWorks.ok,
+        oldStillWorks.ok ? "SECURITY: old password still works after reset" : undefined,
+      );
+
+      const newWorks = await trySignIn(targetStudent.email, newPassword);
+      record("aa8. the NEW temp password signs in after a reset", newWorks.ok, newWorks.error?.message);
+
+      const { data: profileAfter } = await admin
+        .from("profiles")
+        .select("must_change_password")
+        .eq("id", targetStudent.id)
+        .maybeSingle();
+      record(
+        "aa8b. must_change_password=true after a reset (forces /onboarding/set-password next sign-in)",
+        profileAfter?.must_change_password === true,
+        JSON.stringify(profileAfter),
+      );
+    }
+
+    // aa9-aa10: the audit write resetUserPassword makes MUST go through the
+    // service-role client — an admin's own authenticated session is denied
+    // log_audit just like student/lecturer in (c)/(e) above.
+    {
+      const { error } = await adminClient.rpc("log_audit", {
+        action: "reset_password",
+        target_type: "profile",
+        target_id: targetStudent.id ?? adminId,
+        metadata: {},
+      });
+      record(
+        "aa9. an admin's OWN session is denied log_audit directly (must use the service-role client, like resetUserPassword does)",
+        isDenied(error),
+        error?.message ?? "no error raised — SECURITY: forged audit entries possible from a session client",
+      );
+    }
+    {
+      const { error } = await admin.rpc("log_audit", {
+        action: "reset_password",
+        target_type: "profile",
+        target_id: targetStudent.id ?? adminId,
+        metadata: {},
+      });
+      record(
+        "aa10. the service-role client CAN call log_audit('reset_password', ...) — resetUserPassword's actual audit call",
+        !error,
+        error?.message,
+      );
+    }
+
+    // Cleanup: delete the throwaway targets this section created.
+    for (const t of [targetStudent, targetLecturer, targetAdmin]) {
+      if (t.id) await admin.auth.admin.deleteUser(t.id).catch(() => {});
     }
   }
 

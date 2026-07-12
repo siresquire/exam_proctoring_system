@@ -1,27 +1,37 @@
 import Link from "next/link";
+import { Suspense } from "react";
 import { BookOpen, FileSpreadsheet, FileText, Users } from "lucide-react";
 
 import { DashboardShell } from "@/components/dashboard-shell";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { LecturerAnalyticsSection } from "@/components/lecturer/lecturer-analytics-section";
+import { AnalyticsSkeleton } from "@/components/charts/analytics-skeleton";
 import { createClient } from "@/lib/supabase/server";
 import type { LecturerDashboardStats } from "@/lib/supabase/types";
 
-export default async function LecturerDashboard() {
+/**
+ * Isolated in its own async component (own Supabase client, own query) so
+ * the Suspense boundary below can stream it in separately — the
+ * lecturer_dashboard_stats() RPC aggregates across every one of the
+ * lecturer's exams/attempts/flags and is the slow part of this page; the
+ * nav cards below must not wait on it.
+ */
+async function LecturerAnalytics() {
   const supabase = await createClient();
   let stats: LecturerDashboardStats | null = null;
   if (supabase) {
     const { data } = await supabase.rpc("lecturer_dashboard_stats");
     stats = (data as LecturerDashboardStats | null) ?? null;
   }
+  return stats ? <LecturerAnalyticsSection stats={stats} /> : null;
+}
 
+export default async function LecturerDashboard() {
   return (
     <div>
-      {stats ? (
-        <div className="pt-10">
-          <LecturerAnalyticsSection stats={stats} />
-        </div>
-      ) : null}
+      <Suspense fallback={<AnalyticsSkeleton className="mx-auto max-w-6xl px-4 pt-10 sm:px-6" />}>
+        <LecturerAnalytics />
+      </Suspense>
       <div className="mx-auto grid max-w-6xl gap-4 px-4 pt-6 first:pt-10 sm:grid-cols-2 sm:px-6 lg:grid-cols-3">
         <Link href="/dashboard/lecturer/classes" className="block">
           <Card className="hover:bg-muted/50 h-full transition-colors">

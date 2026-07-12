@@ -68,6 +68,15 @@ export function RosterImportDialog({ open, onOpenChange, classId, className, onI
   const [imported, setImported] = React.useState<RosterImportOutcomeRow[]>([]);
   const [smsResults, setSmsResults] = React.useState<SmsSendOutcome[] | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const resultsRef = React.useRef<HTMLDivElement>(null);
+
+  // Move focus to the results panel — which lists every newly-created
+  // student's one-time temp password — as soon as the import completes, so
+  // keyboard/screen-reader users land directly on it instead of wherever
+  // focus was on the "Confirm import" button.
+  React.useEffect(() => {
+    if (step === "done") resultsRef.current?.focus();
+  }, [step]);
 
   function reset() {
     setStep("upload");
@@ -125,10 +134,14 @@ export function RosterImportDialog({ open, onOpenChange, classId, className, onI
       setImported(result.imported ?? []);
       setStep("done");
       onImported(result.imported ?? []);
-      await notify.success(
-        "Import complete",
-        `${result.imported?.length ?? 0} student(s) enrolled${result.skipped ? `, ${result.skipped} row(s) skipped` : ""}.`,
-      );
+      // A toast, not notify.success: the results table below (one-time temp
+      // passwords for every newly-created student) is already on screen — a
+      // centered SweetAlert2 modal renders at a higher stacking context than
+      // this dialog and would cover it (see TempPasswordReveal's doc
+      // comment for the same bug in the single-student flows).
+      await notify.toast({
+        title: `${result.imported?.length ?? 0} student(s) enrolled${result.skipped ? `, ${result.skipped} skipped` : ""}`,
+      });
     } finally {
       setLoading(false);
     }
@@ -265,7 +278,7 @@ export function RosterImportDialog({ open, onOpenChange, classId, className, onI
         ) : null}
 
         {step === "done" ? (
-          <div className="space-y-4">
+          <div ref={resultsRef} tabIndex={-1} role="status" className="space-y-4 outline-none">
             <p className="text-sm">
               {imported.length} student(s) enrolled. Temp passwords below are shown{" "}
               <strong>once</strong> — export the roster from the class page or copy them now.

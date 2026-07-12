@@ -3,6 +3,9 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 import {
+  ChevronLeft,
+  ChevronRight,
+  KeyRound,
   MoreHorizontal,
   Search,
   Settings2,
@@ -17,6 +20,7 @@ import {
 import {
   changeUserRole,
   permanentlyDeleteAccount,
+  resetUserPassword,
   setAccountStatus,
   updateAccommodations,
   type AccommodationsInput,
@@ -54,6 +58,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { CreateUserDialog } from "@/components/admin/create-user-dialog";
+import { TempPasswordReveal } from "@/components/admin/temp-password-reveal";
 import { notify } from "@/lib/notify";
 import { ALL_ROLES, ROLE_LABELS, canActOnAccountRole } from "@/lib/admin/role-labels";
 import type { AdminUserRow } from "@/lib/admin/users";
@@ -65,6 +70,93 @@ const ROLE_BADGE_VARIANT: Record<UserRole, "default" | "secondary" | "outline"> 
   lecturer: "outline",
   student: "outline",
 };
+
+/** Rows shown per page (Task 3: pagination). */
+const PAGE_SIZE = 20;
+
+/**
+ * Windowed page numbers for accessible pagination controls: always shows
+ * page 1 and the last page, plus a small window around the current page,
+ * collapsing gaps into an ellipsis marker instead of rendering every page
+ * number for large rosters.
+ */
+function getPageWindow(current: number, total: number): (number | "ellipsis")[] {
+  if (total <= 1) return total === 1 ? [1] : [];
+  const pages: (number | "ellipsis")[] = [1];
+  const windowStart = Math.max(2, current - 1);
+  const windowEnd = Math.min(total - 1, current + 1);
+  if (windowStart > 2) pages.push("ellipsis");
+  for (let p = windowStart; p <= windowEnd; p++) pages.push(p);
+  if (windowEnd < total - 1) pages.push("ellipsis");
+  pages.push(total);
+  return pages;
+}
+
+interface PaginationControlsProps {
+  page: number;
+  pageCount: number;
+  onPageChange: (page: number) => void;
+}
+
+/**
+ * Accessible pagination: labeled Previous/Next buttons, numbered page
+ * buttons with `aria-current="page"` on the active one, native `<button>`s
+ * (fully keyboard-operable, no custom key handling needed), and 44px touch
+ * targets (DESIGN.md §3 "Operable").
+ */
+function PaginationControls({ page, pageCount, onPageChange }: PaginationControlsProps) {
+  if (pageCount <= 1) return null;
+  const pages = getPageWindow(page, pageCount);
+
+  return (
+    <nav aria-label="Users table pages" className="mt-4 flex flex-wrap items-center justify-center gap-2">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="min-h-11 min-w-11"
+        disabled={page === 1}
+        onClick={() => onPageChange(page - 1)}
+        aria-label="Previous page"
+      >
+        <ChevronLeft aria-hidden className="size-4" />
+        Previous
+      </Button>
+      {pages.map((p, i) =>
+        p === "ellipsis" ? (
+          <span key={`ellipsis-${i}`} aria-hidden className="text-muted-foreground px-1 text-sm">
+            …
+          </span>
+        ) : (
+          <Button
+            key={p}
+            type="button"
+            variant={p === page ? "default" : "outline"}
+            size="sm"
+            className="min-h-11 min-w-11"
+            aria-current={p === page ? "page" : undefined}
+            aria-label={`Page ${p}${p === page ? " (current)" : ""}`}
+            onClick={() => onPageChange(p)}
+          >
+            {p}
+          </Button>
+        ),
+      )}
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="min-h-11 min-w-11"
+        disabled={page === pageCount}
+        onClick={() => onPageChange(page + 1)}
+        aria-label="Next page"
+      >
+        Next
+        <ChevronRight aria-hidden className="size-4" />
+      </Button>
+    </nav>
+  );
+}
 
 /**
  * Account-lifecycle status badge (DESIGN.md §1: "never conveyed by color
@@ -127,6 +219,8 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
   const [busyId, setBusyId] = React.useState<string | null>(null);
   const [accommodationsTarget, setAccommodationsTarget] = React.useState<AdminUserRow | null>(null);
   const [createOpen, setCreateOpen] = React.useState(false);
+  const [page, setPage] = React.useState(1);
+  const [resetReveal, setResetReveal] = React.useState<{ name: string; tempPassword: string } | null>(null);
 
   const filtered = React.useMemo(() => {
     return users.filter((u) => {
@@ -139,6 +233,35 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
       return true;
     });
   }, [users, roleFilter, search]);
+
+  // Task 3: pagination. Server-side pagination isn't practical here without
+  // a new endpoint — email lives only in `auth.users` (no PostgREST access),
+  // the Admin API's `listUsers` has no search/role filter, and "Search"
+  // above matches on email too — so preserving "search/filter across the
+  // WHOLE roster" requires the full joined list client-side first, same as
+  // today (see lib/admin/users.ts's listUsersWithEmail). This slices the
+  // already-filtered list for DISPLAY, which is still a real win: only 20
+  // rows render/hydrate at a time instead of the entire roster's DOM.
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  // Derived, not synced back into state via an effect: `page` itself may
+  // transiently point past the end (e.g. a search narrows the result set),
+  // but every render and every Previous/Next click below is computed off
+  // `clampedPage`, so there's nothing to reconcile — writing the clamped
+  // value back into `page` would just be a same-render setState-in-effect
+  // for no behavioral difference.
+  const clampedPage = Math.min(page, pageCount);
+  const pageStart = (clampedPage - 1) * PAGE_SIZE;
+  const pageItems = filtered.slice(pageStart, pageStart + PAGE_SIZE);
+
+  function handleSearchChange(value: string) {
+    setSearch(value);
+    setPage(1);
+  }
+
+  function handleRoleFilterChange(value: string) {
+    setRoleFilter(value);
+    setPage(1);
+  }
 
   async function handleRoleChange(user: AdminUserRow, newRole: UserRole) {
     if (newRole === user.role) return;
@@ -159,6 +282,31 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
         return;
       }
       await notify.toast({ title: `Role changed to ${ROLE_LABELS[newRole]}` });
+      router.refresh();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleResetPassword(user: AdminUserRow) {
+    const name = user.full_name ?? user.email ?? "this account";
+    const confirmed = await notify.confirm({
+      title: `Issue a new temporary password for ${name}?`,
+      text: "Their current password stops working immediately. Reset-on-demand only — nothing is emailed automatically.",
+      confirmButtonText: "Reset password",
+    });
+    if (!confirmed) return;
+
+    setBusyId(user.id);
+    try {
+      const result = await resetUserPassword(user.id);
+      if (result.error) {
+        await notify.error("Could not reset password", result.error);
+        return;
+      }
+      if (result.tempPassword) {
+        setResetReveal({ name, tempPassword: result.tempPassword });
+      }
       router.refresh();
     } finally {
       setBusyId(null);
@@ -257,7 +405,14 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
       <Card>
         <CardHeader>
           <CardTitle className="text-lg">All users</CardTitle>
-          <CardDescription>{users.length} account{users.length === 1 ? "" : "s"} total.</CardDescription>
+          <CardDescription>
+            {filtered.length === users.length
+              ? `${users.length} account${users.length === 1 ? "" : "s"} total.`
+              : `${filtered.length} of ${users.length} account${users.length === 1 ? "" : "s"} match.`}
+            {filtered.length > 0
+              ? ` Showing ${pageStart + 1}–${Math.min(pageStart + PAGE_SIZE, filtered.length)}.`
+              : ""}
+          </CardDescription>
           <div className="grid gap-4 pt-2 sm:grid-cols-[1fr_12rem]">
             <div className="space-y-2">
               <Label htmlFor="user-search">Search</Label>
@@ -266,7 +421,7 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
                 <Input
                   id="user-search"
                   value={search}
-                  onChange={(e) => setSearch(e.target.value)}
+                  onChange={(e) => handleSearchChange(e.target.value)}
                   placeholder="Name, email, or index number"
                   className="min-h-11 pl-8"
                 />
@@ -277,7 +432,7 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
               <select
                 id="role-filter"
                 value={roleFilter}
-                onChange={(e) => setRoleFilter(e.target.value)}
+                onChange={(e) => handleRoleFilterChange(e.target.value)}
                 className="border-input h-11 w-full rounded-lg border bg-transparent px-2.5 py-1 text-sm dark:bg-input/30"
               >
                 <option value="all">All roles</option>
@@ -310,7 +465,7 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filtered.map((user) => {
+                  {pageItems.map((user) => {
                     const options = assignableRoles(viewerRole, user.role);
                     const isSelf = user.id === currentUserId;
                     const canEditRole = !isSelf && options.length > 0;
@@ -390,6 +545,11 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
                                   </Button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="end">
+                                  <DropdownMenuItem onSelect={() => handleResetPassword(user)}>
+                                    <KeyRound aria-hidden />
+                                    Reset password
+                                  </DropdownMenuItem>
+                                  <DropdownMenuSeparator />
                                   {user.status !== "active" ? (
                                     <DropdownMenuItem onSelect={() => handleSetStatus(user, "active")}>
                                       <ShieldCheck aria-hidden />
@@ -435,6 +595,7 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
               </Table>
             </div>
           )}
+          <PaginationControls page={clampedPage} pageCount={pageCount} onPageChange={setPage} />
         </CardContent>
       </Card>
 
@@ -453,6 +614,29 @@ export function UsersTable({ users, loadError, currentUserId, viewerRole }: User
         viewerRole={viewerRole}
         onCreated={() => router.refresh()}
       />
+
+      <Dialog open={resetReveal !== null} onOpenChange={(open) => !open && setResetReveal(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Password reset</DialogTitle>
+            <DialogDescription>
+              {resetReveal ? `A new temporary password was issued for ${resetReveal.name}.` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          {resetReveal ? (
+            <TempPasswordReveal
+              title="Password reset"
+              password={resetReveal.tempPassword}
+              description="Their previous password no longer works. They must change this one the first time they sign in."
+            />
+          ) : null}
+          <DialogFooter>
+            <Button type="button" onClick={() => setResetReveal(null)}>
+              Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

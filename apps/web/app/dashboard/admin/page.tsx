@@ -1,8 +1,10 @@
 import Link from "next/link";
+import { Suspense } from "react";
 import { FileClock, ShieldCheck, Users } from "lucide-react";
 
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PlatformAnalyticsSection } from "@/components/admin/platform-analytics-section";
+import { AnalyticsSkeleton } from "@/components/charts/analytics-skeleton";
 import { getPlatformAnalytics } from "@/lib/admin/platform-analytics";
 
 const CARDS = [
@@ -27,9 +29,19 @@ const CARDS = [
   },
 ];
 
-export default async function AdminDashboard() {
+/**
+ * Isolated in its own async component so the Suspense boundary below can
+ * stream it in separately — the service-role aggregate queries behind
+ * getPlatformAnalytics (30-day activity, counts across users/exams/attempts/
+ * sessions) are the slow part of this page; the header and nav cards must
+ * not wait on them.
+ */
+async function PlatformAnalytics() {
   const analytics = await getPlatformAnalytics();
+  return analytics ? <PlatformAnalyticsSection analytics={analytics} /> : null;
+}
 
+export default async function AdminDashboard() {
   return (
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
       <header className="mb-8">
@@ -39,7 +51,9 @@ export default async function AdminDashboard() {
         </p>
       </header>
 
-      {analytics ? <PlatformAnalyticsSection analytics={analytics} /> : null}
+      <Suspense fallback={<AnalyticsSkeleton className="mb-10" />}>
+        <PlatformAnalytics />
+      </Suspense>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {CARDS.map(({ href, icon: Icon, title, description }) => (
